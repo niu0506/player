@@ -1,0 +1,16 @@
+<resources>
+    <!-- 应用名称 -->
+    <string name="app_name">影音盒</string>
+    <!-- 扫描本地媒体按钮文案 -->
+    <string name="scan_local">扫描</string>
+    <!-- 进入画中画按钮文案 -->
+    <string name="pip">小窗</string>
+    <!-- 播放列表项的删除操作无障碍描述 -->
+    <string name="delete">删除</string>
+    <!-- 列表项序号 %1$d -->
+    <string name="list_item_index">%1$d</string>
+    <!-- 正在播放项显示：播放中 %1$s（当前已播时长） -->
+    <string name="playing_progress">播放中 %1$s</string>
+    <!-- 已存进度项显示区间：已播 %1$s / 总时长 %2$s -->
+    <string name="progress_range">%1$s / %2$s</string>
+</resources>

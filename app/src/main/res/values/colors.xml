@@ -1,0 +1,19 @@
+<resources>
+    <!-- 品牌紫 -->
+    <color name="purple_500">#FF6200EE</color>
+    <color name="accent">#FFA78BFA</color>
+    <color name="accent_deep">#FF7C5CFF</color>
+
+    <!-- 深色沉浸式背景层次 -->
+    <color name="bg_dark">#FF0E0E13</color>
+    <color name="surface_1">#FF17171F</color>
+    <color name="surface_2">#FF23232E</color>
+    <color name="divider">#FF2A2A36</color>
+
+    <!-- 文字 -->
+    <color name="text_primary">#FFF2F2F7</color>
+    <color name="text_secondary">#FF8E8E99</color>
+
+    <!-- 半透明遮罩（视频页浮层用） -->
+    <color name="scrim_40">#66000000</color>
+</resources>

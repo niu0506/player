@@ -1,0 +1,104 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 单个播放列表项的布局：主行(序号/播放动画 + 名称 + 时长 + 删除) + 进度行 -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/item_root"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:layout_marginTop="8dp"
+    android:paddingHorizontal="14dp"
+    android:paddingVertical="12dp"
+    android:background="@drawable/bg_item_ripple">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:gravity="center_vertical">
+
+        <!-- 序号与正在播放动画，两者互斥（播放时显示动画） -->
+        <FrameLayout
+            android:layout_width="24dp"
+            android:layout_height="24dp">
+
+            <TextView
+                android:id="@+id/tv_index"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:gravity="center"
+                android:textSize="13sp"
+                android:fontFamily="sans-serif-medium"
+                android:textColor="@color/text_secondary" />
+
+            <ImageView
+                android:id="@+id/img_playing"
+                android:layout_width="16dp"
+                android:layout_height="16dp"
+                android:layout_gravity="center"
+                android:src="@drawable/ic_equalizer"
+                android:visibility="gone"
+                android:contentDescription="正在播放" />
+        </FrameLayout>
+
+        <!-- 媒体名称（超长时从中间省略） -->
+        <TextView
+            android:id="@+id/tv_name"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:layout_marginStart="10dp"
+            android:layout_marginEnd="8dp"
+            android:maxLines="1"
+            android:ellipsize="middle"
+            android:textSize="15sp"
+            android:textColor="@color/text_primary" />
+
+        <TextView
+            android:id="@+id/tv_duration"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:textSize="12sp"
+            android:textColor="@color/text_secondary" />
+
+        <!-- 删除按钮 -->
+        <ImageView
+            android:id="@+id/btn_delete"
+            android:layout_width="32dp"
+            android:layout_height="32dp"
+            android:layout_marginStart="6dp"
+            android:padding="7dp"
+            android:src="@drawable/ic_delete"
+            android:background="?selectableItemBackgroundBorderless"
+            android:contentDescription="@string/delete" />
+    </LinearLayout>
+
+    <!-- 进度行：进度条 + 进度文本（仅在已存有 progress 时由代码显示） -->
+    <LinearLayout
+        android:id="@+id/progress_row"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
+        android:layout_marginTop="9dp"
+        android:layout_marginStart="34dp">
+
+        <ProgressBar
+            android:id="@+id/pb_item"
+            style="?android:attr/progressBarStyleHorizontal"
+            android:layout_width="0dp"
+            android:layout_height="4dp"
+            android:layout_weight="1"
+            android:max="100"
+            android:progressDrawable="@drawable/pb_item_progress" />
+
+        <TextView
+            android:id="@+id/tv_progress"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="10dp"
+            android:textSize="11sp"
+            android:textColor="@color/text_secondary"
+            android:visibility="gone" />
+    </LinearLayout>
+
+</LinearLayout>
