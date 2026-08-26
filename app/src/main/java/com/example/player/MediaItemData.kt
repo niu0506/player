@@ -1,6 +1,7 @@
 package com.example.player
 
 import android.net.Uri
+import android.util.LruCache
 import java.util.Locale
 
 /**
@@ -24,12 +25,20 @@ data class MediaItemData(
  * 把毫秒格式化为播放时长文本。
  * 不足 1 小时显示「分:秒」（如 12:34），满 1 小时显示「时:分:秒」（如 1:02:03）。
  * 供播放列表时长、手势进度预览等共用，替代原先分散的格式化方法。
+ *
+ * 格式化结果按毫秒值做有界缓存：列表滚动绑定（时长/进度不断重复格式化）与
+ * 进度条刷新场景中相同数值会被反复请求，缓存可直接命中避免重复构造字符串。
  */
+private val timeFormatCache = LruCache<Long, String>(512)
+
 fun formatTime(ms: Long): String {
+    timeFormatCache.get(ms)?.let { return it }
     val totalSec = ms / 1000
     val h = totalSec / 3600
     val m = totalSec % 3600 / 60
     val s = totalSec % 60
-    return if (h > 0) String.format(Locale.US, "%d:%02d:%02d", h, m, s)
+    val result = if (h > 0) String.format(Locale.US, "%d:%02d:%02d", h, m, s)
     else String.format(Locale.US, "%02d:%02d", m, s)
+    timeFormatCache.put(ms, result)
+    return result
 }

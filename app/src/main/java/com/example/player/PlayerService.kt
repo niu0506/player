@@ -10,6 +10,7 @@ import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
+import androidx.media3.common.Timeline
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.session.MediaSession
@@ -92,15 +93,20 @@ class PlayerService : MediaSessionService() {
             if (!isPlaying) persistProgress()
         }
 
-        /** 位置发生不连续跳变（通常是用户拖动进度条 seek）时立即落盘 */
+        /** 位置发生不连续跳变（用户拖动进度条 seek，或切到别的条目）时立即落盘 */
         override fun onPositionDiscontinuity(
             oldPosition: Player.PositionInfo,
             newPosition: Player.PositionInfo,
             reason: Int
         ) {
-            if (reason == Player.DISCONTINUITY_REASON_SEEK) {
-                persistProgress()
+            if (reason == Player.DISCONTINUITY_REASON_SEEK && oldPosition.mediaItemIndex != newPosition.mediaItemIndex) {
+                // 切到别的条目(点列表/播放器"下一集"/通知栏下一条)时，
+                // onMediaItemTransition 触发后 player.currentMediaItem 已指向新项，
+                // 只有 oldPosition 还记着被换掉旧项的最终位置。先精确抓取旧项进度再落盘，
+                // 避免「正在播放的进度丢失」。
+                cacheOldPosition(oldPosition)
             }
+            persistProgress()
         }
     }
 
@@ -171,6 +177,21 @@ class PlayerService : MediaSessionService() {
         }
         if (position <= 0 && (progressCache[uri] ?: 0L) > 0L) return
         progressCache[uri] = position
+    }
+
+    /**
+     * 切换前被换掉的那一项的精确进度写入缓存。
+     * 因为在 seek 到另一个条目后，player.currentMediaItem 已指向新项，常规读取抓不到旧项位置；
+     * 而切换前的 [oldPosition] 仍记录着旧项的 mediaItemIndex 与 positionMs，据此精确保存。
+     */
+    private fun cacheOldPosition(oldPosition: Player.PositionInfo) {
+        val player = mediaSession?.player ?: return
+        if (oldPosition.positionMs <= 0) return
+        if (oldPosition.mediaItemIndex !in 0 until player.currentTimeline.windowCount) return
+        val window = Timeline.Window()
+        player.currentTimeline.getWindow(oldPosition.mediaItemIndex, window)
+        val uri = window.mediaItem.localConfiguration?.uri?.toString() ?: return
+        progressCache[uri] = oldPosition.positionMs
     }
 
     /**
@@ -252,6 +273,19 @@ class PlayerService : MediaSessionService() {
             val svc = instance ?: return
             svc.progressCache.remove(uri)
             svc.removedUris.add(uri)
+        }
+
+        /**
+         * 供前端在「切到别的条目」之前调用，把当前正在播放项的精确进度立即落盘。
+         * 背景：onMediaItemTransition 触发时播放器已经切到新条目，此时按 currentItem 读取
+         * 拿到的是新条目位置，旧的正在播放项进度会因此丢失（只能靠 2 秒周期上报兜底）。
+         * 因此在 seekTo 切换前先同步抓取当前项位置并立即持久化。
+         */
+        fun flushCurrentPosition() {
+            val svc = instance ?: return
+            val player = svc.mediaSession?.player ?: return
+            svc.cacheCurrentPosition(player)
+            svc.persistProgress(sync = true)
         }
 
         /** 从 SharedPreferences 读出《uri -> 播放进度毫秒》映射 */

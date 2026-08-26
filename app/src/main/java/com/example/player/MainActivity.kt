@@ -6,6 +6,7 @@ import android.content.ComponentName
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.content.res.Configuration
+import android.database.ContentObserver
 import android.media.AudioManager
 import android.net.Uri
 import android.os.Build
@@ -23,6 +24,7 @@ import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.OptIn
+import androidx.annotation.RequiresApi
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.content.edit
@@ -34,6 +36,7 @@ import androidx.media3.common.C
 import androidx.media3.common.Player
 import androidx.media3.common.util.RepeatModeUtil
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.common.VideoSize
 import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
 import androidx.media3.ui.AspectRatioFrameLayout
@@ -152,6 +155,27 @@ class MainActivity : AppCompatActivity() {
     }
     /** 是否正在扫描（防止重复触发导致重复添加） */
     private var isScanning = false
+
+    /**
+     * MediaStore 内容观察器：监听本地视频/音频集合的变化。
+     * 媒体库有新增/修改/删除时系统会通知，触发一次「去重增量扫描」，
+     * 避免每次点扫描都对整库全量重查，也免去手动点击的维护负担。
+     */
+    private val mediaChangeObserver = object : ContentObserver(Handler(Looper.getMainLooper())) {
+        @Deprecated("Deprecated in Java")
+        override fun onChange(selfChange: Boolean, uri: Uri?) {
+            // MediaStore 常常连发多次通知，合并到一次延时扫描
+            scanHandler.removeCallbacks(debouncedScanRunnable)
+            scanHandler.postDelayed(debouncedScanRunnable, 800)
+        }
+    }
+    /** 用于合并 MediaStore 多次通知的 Handler */
+    private val scanHandler = Handler(Looper.getMainLooper())
+    /** 延时的增量扫描任务（先校验权限，避免无权限时白白查询） */
+    private val debouncedScanRunnable = Runnable {
+        if (hasStoragePermission()) scanLocalMedia()
+    }
+
 
     /** 扫描本地音视频并加入播放列表（在 IO 线程执行，带重入保护） */
     private fun scanLocalMedia() {
@@ -373,6 +397,28 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
+
+        /**
+         * 视频尺寸变化时，若当前处于 PiP 小窗，则同步更新小窗宽高比例。
+         * 这样进入小窗后如果画质/分辨率切换（含第一次取到真实分辨率），
+         * 小窗会跟着视频比例自适应伸缩，避免出现黑边。
+         */
+        @RequiresApi(Build.VERSION_CODES.O)
+        @OptIn(UnstableApi::class)
+        override fun onVideoSizeChanged(videoSize: VideoSize) {
+            if (isInPipMode) updatePipAspectRatio()
+        }
+    }
+
+    /**
+     * 统一的续播位置来源：以磁盘(Service 后台写入的唯一事实来源)为优先，
+     * 磁盘无该 uri 的记录时才回退到内存 lastPosition。
+     * 用于 fix「播放中切到别的条目，旧条目进度丢失」：内存 lastPosition 只在少数字段
+     * 更新、易过期，而磁盘进度由 Service 周期+切换时精确落盘，更可靠。
+     */
+    private fun resolveResumePosition(item: MediaItemData): Long {
+        val disk = PlayerService.readProgressMap(playerPrefs)[item.uri.toString()]
+        return if (disk != null && disk > 0) disk else item.lastPosition
     }
 
     /** 若当前项有保存过的进度（>0）则跳转到该位置，实现断点续播 */
@@ -380,7 +426,7 @@ class MainActivity : AppCompatActivity() {
         val ctrl = controller ?: return
         val index = ctrl.currentMediaItemIndex
         if (index < 0 || index >= playlist.size) return
-        val savedPos = playlist[index].lastPosition
+        val savedPos = resolveResumePosition(playlist[index])
         if (savedPos > 0) {
             ctrl.seekTo(savedPos)
         }
@@ -398,7 +444,7 @@ class MainActivity : AppCompatActivity() {
         val idx = playlist.indexOfFirst { it.uri.toString() == lastUri }
         if (idx !in playlist.indices) return
         if (ctrl.currentMediaItemIndex == idx) return
-        val pos = playlist[idx].lastPosition.takeIf { it > 0 } ?: 0
+        val pos = resolveResumePosition(playlist[idx])
         if (pos > 0) ctrl.seekTo(idx, pos) else ctrl.seekToDefaultPosition(idx)
         currentIndex = idx
         adapter.setCurrentPlaying(idx, ctrl.isPlaying)
@@ -731,12 +777,12 @@ class MainActivity : AppCompatActivity() {
         applyPipVideoSurface(true)
         try {
             // 以视频宽高比作为小窗比例，解析失败时回退 16:9
-            val aspectRatio = try {
-                Rational(vs.width, vs.height)
-            } catch (_: Exception) {
-                Rational(16, 9)
-            }
-            val builder = PictureInPictureParams.Builder().setAspectRatio(aspectRatio)
+            val builder = PictureInPictureParams.Builder()
+                .setAspectRatio(try {
+                    Rational(vs.width, vs.height)
+                } catch (_: Exception) {
+                    Rational(16, 9)
+                })
             // seamless resize 仅 API 31+ 支持；低版本省略该选项即可(此前误用 TODO 抛异常崩溃)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                 builder.setSeamlessResizeEnabled(true)
@@ -753,6 +799,31 @@ class MainActivity : AppCompatActivity() {
         Toast.makeText(this, "无法进入小窗模式", Toast.LENGTH_SHORT).show()
     }
 
+    /**
+     * 用当前视频的真实宽高比动态更新 PiP 小窗比例，使小窗贴合视频、避免黑边。
+     * 在 [enterPipMode] 之后由 onVideoSizeChanged 触发：视频分辨率在进入小窗后
+     * 才确定（或中途切换清晰度）时，窗口会跟随比例平滑伸缩。
+     */
+    @RequiresApi(Build.VERSION_CODES.O)
+    private fun updatePipAspectRatio() {
+        val vs = controller?.videoSize ?: return
+        if (vs.width <= 0 || vs.height <= 0) return
+        if (!isInPipMode) return
+        val ratio = try {
+            Rational(vs.width, vs.height)
+        } catch (_: Exception) {
+            return
+        }
+        val builder = PictureInPictureParams.Builder().setAspectRatio(ratio)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            builder.setSeamlessResizeEnabled(true)
+        }
+        try {
+            setPictureInPictureParams(builder.build())
+        } catch (_: Exception) {
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
@@ -762,11 +833,16 @@ class MainActivity : AppCompatActivity() {
         adapter = MediaListAdapter(
             onClick = { index ->
                 if (index in playlist.indices) {
+                    // 切走前先把当前播放项(A)的精确进度同时记录到内存与磁盘(saveCurrentProgress 更新
+                    // 续播所读的内存值；flushCurrentPosition 同步落盘)。因 onMediaItemTransition 触发
+                    // 时 controller 已切到新条目、读不到旧项位置，必须在 seekTo 之前记录。
+                    saveCurrentProgress()
+                    PlayerService.flushCurrentPosition()
                     val item = playlist[index]
-                    val resume = item.lastPosition > 0 &&
-                        (item.duration <= 0 || item.lastPosition < item.duration)
-                    if (resume) {
-                        controller?.seekTo(index, item.lastPosition)
+                    // 统一续播位置：优先磁盘权威进度，磁盘无记录才回退内存
+                    val pos = resolveResumePosition(item)
+                    if (pos > 0 && (item.duration !in 1..pos)) {
+                        controller?.seekTo(index, pos)
                     } else {
                         controller?.seekToDefaultPosition(index)
                     }
@@ -824,6 +900,13 @@ class MainActivity : AppCompatActivity() {
 
     override fun onStart() {
         super.onStart()
+        // 监听本地媒体库变化，实现新增/修改时的去重增量自动扫描
+        contentResolver.registerContentObserver(
+            MediaStore.Video.Media.EXTERNAL_CONTENT_URI, true, mediaChangeObserver
+        )
+        contentResolver.registerContentObserver(
+            MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, true, mediaChangeObserver
+        )
         // 通过 SessionToken 异步连接后台服务中的播放器
         val sessionToken = SessionToken(this, ComponentName(this, PlayerService::class.java))
         val future = MediaController.Builder(this, sessionToken).buildAsync()
@@ -872,6 +955,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onStop() {
+        // 停止监听媒体库变化，并取消尚未触发的延时扫描
+        contentResolver.unregisterContentObserver(mediaChangeObserver)
+        scanHandler.removeCallbacks(debouncedScanRunnable)
         // PiP 关闭返回前台时暂停播放，并复位 PiP 状态
         if (isInPipMode) {
             controller?.pause()
