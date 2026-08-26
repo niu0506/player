@@ -415,6 +415,8 @@ class MainActivity : AppCompatActivity() {
             RepeatModeUtil.REPEAT_TOGGLE_MODE_ONE or RepeatModeUtil.REPEAT_TOGGLE_MODE_ALL
         )
         binding.playerView.setShowShuffleButton(true)
+        // 播放时保持屏幕常亮，防止系统屏幕超时自动变暗/熄灭
+        binding.playerView.keepScreenOn = true
 
         val speedBtn = binding.playerView.findViewById<TextView>(R.id.btn_speed)
         speedBtn?.setOnClickListener {
