@@ -189,12 +189,14 @@ class MainActivity : AppCompatActivity() {
                 val scanned = mutableListOf<MediaItemData>()
                 scanned.addAll(videos)
                 scanned.addAll(audios)
+                // 对账移除「文件已被外部删除」的条目，保证列表与实际文件一致
+                val removedCount = pruneDeletedMedia(videos, audios)
                 val existingKeys = playlist.map { normalizeUri(it.uri) }.toSet()
                 // 过滤掉时长过短(<5秒)与已存在(去重)的条目
                 val newItems = scanned.filter {
                     it.duration >= 5000 && normalizeUri(it.uri) !in existingKeys
                 }
-                if (newItems.isEmpty()) {
+                if (newItems.isEmpty() && removedCount == 0) {
                     Toast.makeText(this@MainActivity, "没有新文件", Toast.LENGTH_SHORT).show()
                     return@withContext
                 }
@@ -204,7 +206,35 @@ class MainActivity : AppCompatActivity() {
                 }
                 refreshPlaylist()
                 savePlaylist()
-                Toast.makeText(this@MainActivity, "已添加 ${newItems.size} 个文件", Toast.LENGTH_SHORT).show()
+                val parts = mutableListOf<String>()
+                if (removedCount > 0) parts.add("删除 $removedCount 个已消失文件")
+                if (newItems.isNotEmpty()) parts.add("添加 ${newItems.size} 个文件")
+                Toast.makeText(this@MainActivity, parts.joinToString("，"), Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    /**
+     * 回前台时静默对账：移除「后台期间被外部删除」的文件。
+     * 后台时 onStop 已取消 MediaStore 观察者、删除通知会错过，因此回到前台主动对账一次；
+     * 只删除已消失的文件，不自动新增，也不弹提示，避免打扰用户。
+     */
+    private fun pruneDeletedMediaOnResume() {
+        if (isScanning) return
+        isScanning = true
+        lifecycleScope.launch(Dispatchers.IO) {
+            if (!hasStoragePermission()) {
+                isScanning = false
+                return@launch
+            }
+            val videos = queryMediaStore(MediaStore.Video.Media.EXTERNAL_CONTENT_URI)
+            val audios = queryMediaStore(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI)
+            withContext(Dispatchers.Main) {
+                isScanning = false
+                if (pruneDeletedMedia(videos, audios) > 0) {
+                    refreshPlaylist()
+                    savePlaylist()
+                }
             }
         }
     }
@@ -241,6 +271,61 @@ class MainActivity : AppCompatActivity() {
         } catch (_: Exception) {
         }
         return items
+    }
+
+    /**
+     * 用 MediaStore 扫描结果对账播放列表，移除「文件已从系统媒体库删除」的条目
+     * （同时清理其播放进度与控制器队列中的对应项）。
+     *
+     * 权限保护：API 34+ 用户可能只授予「仅选中的照片/视频」(READ_MEDIA_VISUAL_USER_SELECTED)，
+     * 此时 MediaStore 查询结果只含被选中的文件，若会把……「误删未授权但
+     * 仍存在的文件。因此仅当拿到对应媒体类型的完整读取权限时才执行该类型的删除对账。
+     *
+     * @param scannedVideos 本次扫描到的视频集合
+     * @param scannedAudios 本次扫描到的音频集合
+     * @return 被移除的条数
+     */
+    private fun pruneDeletedMedia(
+        scannedVideos: List<MediaItemData>,
+        scannedAudios: List<MediaItemData>
+    ): Int {
+        val videoKeys = if (hasFullMediaAccess(android.Manifest.permission.READ_MEDIA_VIDEO)) {
+            scannedVideos.map { normalizeUri(it.uri) }.toSet()
+        } else null
+        val audioKeys = if (hasFullMediaAccess(android.Manifest.permission.READ_MEDIA_AUDIO)) {
+            scannedAudios.map { normalizeUri(it.uri) }.toSet()
+        } else null
+        val videoPrefix = MediaStore.Video.Media.EXTERNAL_CONTENT_URI.toString()
+        val audioPrefix = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI.toString()
+        var removed = 0
+        // 逆序遍历，保证删除过程下标不失效（playlist 与控制器队列保持同步）
+        for (i in playlist.indices.reversed()) {
+            val item = playlist[i]
+            val uriStr = item.uri.toString()
+            val keys = when {
+                uriStr.startsWith(videoPrefix) -> videoKeys
+                uriStr.startsWith(audioPrefix) -> audioKeys
+                else -> null
+            }
+            if (keys != null && normalizeUri(item.uri) !in keys) {
+                clearProgress(item.uri)
+                playlist.removeAt(i)
+                controller?.removeMediaItem(i)
+                if (i < currentIndex) currentIndex--
+                removed++
+            }
+        }
+        return removed
+    }
+
+    /** 是否具备指定媒体类型的「全量」读取权限（API 34+ 的「仅选中」授权不算全量） */
+    private fun hasFullMediaAccess(permission: String): Boolean {
+        if (Build.VERSION.SDK_INT < 33) {
+            return ContextCompat.checkSelfPermission(
+                this, android.Manifest.permission.READ_EXTERNAL_STORAGE
+            ) == PackageManager.PERMISSION_GRANTED
+        }
+        return ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
     }
 
     /** 把当前播放列表序列化为 JSON 存到 SharedPreferences（含各条目的上次进度） */
@@ -907,6 +992,8 @@ class MainActivity : AppCompatActivity() {
         contentResolver.registerContentObserver(
             MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, true, mediaChangeObserver
         )
+        // 回前台对账：后台期间文件被外部删除时 MediaStore 通知已错过，主动移除已消失的条目
+        pruneDeletedMediaOnResume()
         // 通过 SessionToken 异步连接后台服务中的播放器
         val sessionToken = SessionToken(this, ComponentName(this, PlayerService::class.java))
         val future = MediaController.Builder(this, sessionToken).buildAsync()
