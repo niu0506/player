@@ -21,7 +21,7 @@ jobs:
           java-version: '17'
 
       - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@v6
 
       # 从 Secrets 还原签名密钥（base64 编码的 keystore 文件 + 密码）
       - name: Decode keystore
@@ -46,7 +46,7 @@ jobs:
           echo "APK_NAME=player-v${VERSION}-release.apk" >> "$GITHUB_ENV"
 
       - name: Upload release APK
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-apk
           path: ${{ env.APK_NAME }}
@@ -59,12 +59,12 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: release-apk
           path: apk
 
       - name: Create Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: apk/player-*-release.apk
