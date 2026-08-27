@@ -19,11 +19,13 @@ local.properties
 # 构建输出（模块级）
 app/build/
 
-# 签名相关（含密钥，禁止提交）
-keystore.properties
-keystore/
-
 # Capture/说明文件
 captures/
 .externalNativeBuild/
 .cxx/
+
+# 签名密钥与密码（绝不提交）
+keystore/
+keystore.properties
+*.keystore
+*.jks

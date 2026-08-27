@@ -23,37 +23,33 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      # 仅打 tag (v*) 且配置了签名密钥时注入正式签名；未配置密钥时回退 debug 签名出包
-      - name: Decode signing keystore
-        if: startsWith(github.ref, 'refs/tags/v')
+      # 从 Secrets 还原签名密钥（base64 编码的 keystore 文件 + 密码）
+      - name: Decode keystore
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
         run: |
-          if [ -n "$KEYSTORE_BASE64" ]; then
-            mkdir -p keystore
-            echo "$KEYSTORE_BASE64" | base64 -d > keystore/release.jks
-          fi
+          echo "$KEYSTORE_BASE64" | base64 --decode > $RUNNER_TEMP/release.keystore
 
-      - name: Write keystore.properties (CI)
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Build signed release APK
         env:
+          KEYSTORE_FILE: ${{ runner.temp }}/release.keystore
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
-        run: |
-          if [ -f keystore/release.jks ]; then
-            printf 'storeFile=keystore/release.jks\nstorePassword=%s\nkeyAlias=%s\nkeyPassword=%s\n' \
-              "$KEYSTORE_PASSWORD" "$KEY_ALIAS" "$KEY_PASSWORD" > keystore.properties
-          fi
-
-      - name: Build release APK
         run: ./gradlew assembleRelease --no-daemon
+
+      # 重命名为 player-v{版本}-release.apk，替代默认的 app-release.apk
+      - name: Rename APK
+        run: |
+          VERSION=$(grep -oP 'versionName\s*=\s*"\K[^"]+' app/build.gradle.kts)
+          cp app/build/outputs/apk/release/app-release.apk "player-v${VERSION}-release.apk"
+          echo "APK_NAME=player-v${VERSION}-release.apk" >> "$GITHUB_ENV"
 
       - name: Upload release APK
         uses: actions/upload-artifact@v4
         with:
-          name: app-release-apk
-          path: app/build/outputs/apk/release/app-release.apk
+          name: release-apk
+          path: ${{ env.APK_NAME }}
 
   release:
     # 仅打 tag (v*) 时发布到 GitHub Releases
@@ -65,10 +61,10 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: app-release-apk
+          name: release-apk
           path: apk
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: apk/app-release.apk
+          files: apk/player-*-release.apk

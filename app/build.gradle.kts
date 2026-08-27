@@ -5,22 +5,19 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
-// 读取 release 签名配置：
-// - 本地构建：读取根目录 keystore.properties（已被 gitignore，不会提交）
-// - CI 构建：读取 GitHub Secrets 注入的环境变量（见 .github/workflows/build.yml）
+/**
+ * 签名配置来源（二选一，优先级从高到低）：
+ * 1. 环境变量：CI(GitHub Actions) 通过 Secrets 注入，本地也可以 export 后覆盖
+ * 2. 本地文件 keystore.properties（已加入 .gitignore，不会提交）
+ * 两者都没有时 release 构建回退为无签名（输出 *-unsigned.apk）。
+ */
 val keystoreProperties = Properties().apply {
-    val localFile = rootProject.file("keystore.properties")
-    if (localFile.exists()) {
-        localFile.inputStream().use { load(it) }
-    } else {
-        setProperty("storeFile", System.getenv("KEYSTORE_FILE") ?: "")
-        setProperty("storePassword", System.getenv("KEYSTORE_PASSWORD") ?: "")
-        setProperty("keyAlias", System.getenv("KEY_ALIAS") ?: "")
-        setProperty("keyPassword", System.getenv("KEY_PASSWORD") ?: "")
-    }
+    val f = rootProject.file("keystore.properties")
+    if (f.exists()) f.inputStream().use { load(it) }
 }
-val hasReleaseSigning =
-    !keystoreProperties.getProperty("storeFile").isNullOrBlank()
+
+fun envOrProp(envKey: String, propKey: String): String? =
+    System.getenv(envKey) ?: keystoreProperties.getProperty(propKey)
 
 android {
     namespace = "com.example.player"
@@ -32,25 +29,31 @@ android {
         versionCode = 2
         versionName = "1.1"
     }
+
     signingConfigs {
         create("release") {
-            if (hasReleaseSigning) {
-                storeFile = rootProject.file(keystoreProperties.getProperty("storeFile"))
-                storePassword = keystoreProperties.getProperty("storePassword")
-                keyAlias = keystoreProperties.getProperty("keyAlias")
-                keyPassword = keystoreProperties.getProperty("keyPassword")
-            }
+            // 环境变量优先(CI 注入)，其次本地 keystore.properties
+            storeFile = System.getenv("KEYSTORE_FILE")?.let { file(it) }
+                ?: keystoreProperties.getProperty("storeFile")?.let { rootProject.file(it) }
+            storePassword = envOrProp("KEYSTORE_PASSWORD", "storePassword")
+            keyAlias = envOrProp("KEY_ALIAS", "keyAlias")
+            keyPassword = envOrProp("KEY_PASSWORD", "keyPassword")
         }
     }
+
     buildTypes {
         release {
-            // 有签名配置则用正式签名；否则回退 debug 签名保证本地也能出可安装包
-            signingConfig = if (hasReleaseSigning) {
-                signingConfigs.getByName("release")
-            } else {
-                signingConfigs.getByName("debug")
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
+            signingConfig = signingConfigs.getByName("release")
+            // 签名四要素齐备才生效；否则 AGP 回退为无签名产物（构建不失败，便于无密钥环境编译验证）
+            if (signingConfigs.getByName("release").storeFile == null) {
+                signingConfig = null
             }
-            isMinifyEnabled = false
         }
     }
     buildFeatures { viewBinding = true }
