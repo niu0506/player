@@ -1,8 +1,13 @@
 package com.example.player
 
 import android.annotation.SuppressLint
+import android.app.DownloadManager
 import android.app.PictureInPictureParams
+import android.content.BroadcastReceiver
 import android.content.ComponentName
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.content.res.Configuration
@@ -11,14 +16,17 @@ import android.media.AudioManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.provider.BaseColumns
 import android.provider.MediaStore
+import android.provider.Settings
 import android.util.Rational
 import android.view.GestureDetector
 import android.view.MotionEvent
 import android.view.View
+import android.widget.PopupMenu
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
@@ -27,6 +35,7 @@ import androidx.annotation.OptIn
 import androidx.annotation.RequiresApi
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import androidx.core.content.edit
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
@@ -49,9 +58,11 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
 import kotlin.math.abs
 import kotlin.math.max
 import androidx.media3.common.MediaItem as M3MediaItem
+import androidx.core.net.toUri
 
 /**
  * 主界面：播放器 + 播放列表面板。
@@ -89,6 +100,7 @@ class MainActivity : AppCompatActivity() {
         const val GESTURE_SEEK = 1 // 左右滑动快进/快退
         const val GESTURE_BRIGHTNESS = 2 // 左半屏上下滑动调亮度
         const val GESTURE_VOLUME = 3 // 右半屏上下滑动调音量
+        const val MENU_ID_CHECK_UPDATE = 100 // 溢出菜单里的「检查更新」项
     }
 
     /** 主线程 Handler，用于手势提示的延时隐藏 */
@@ -119,6 +131,27 @@ class MainActivity : AppCompatActivity() {
     ) { grants: Map<String, Boolean> ->
         if (grants.values.any { it }) {
             Toast.makeText(this, "权限已授予，请点击扫描", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    // ===== 应用内更新（GitHub Releases） =====
+    /** 更新检查器 */
+    private val updateChecker = UpdateChecker()
+    /** 系统下载管理器（懒加载，更新包下载用它，自带通知栏进度与重试） */
+    private val downloadManager by lazy { getSystemService(DOWNLOAD_SERVICE) as DownloadManager }
+    /** 最近一次发起的下载 id，用于过滤广播 */
+    private var lastDownloadId = -1L
+    /** 等待用户授予「安装未知应用」权限后再安装的 APK 文件 */
+    private var pendingInstallFile: File? = null
+
+    /** 下载完成监听：更新包下载成功后自动调起系统安装器 */
+    private val downloadCompleteReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action != DownloadManager.ACTION_DOWNLOAD_COMPLETE) return
+            val id = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1L)
+            if (id != lastDownloadId) return
+            val file = downloadedApkFile() ?: return
+            installApk(file)
         }
     }
 
@@ -909,6 +942,106 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // ===== 应用内更新（GitHub Releases） =====
+
+    /** 检查更新：请求 GitHub latest Release 并与本地版本比较。失败时仅手动触发给提示 */
+    private fun checkForUpdate(manual: Boolean) {
+        lifecycleScope.launch(Dispatchers.IO) {
+            val release = try {
+                updateChecker.checkLatest()
+            } catch (_: Exception) {
+                null
+            }
+            withContext(Dispatchers.Main) {
+                if (isFinishing || isDestroyed) return@withContext
+                val current = try {
+                    packageManager.getPackageInfo(packageName, 0).versionName ?: ""
+                } catch (_: Exception) {
+                    ""
+                }
+                when {
+                    release == null -> if (manual) {
+                        Toast.makeText(this@MainActivity, "检查更新失败，请稍后重试", Toast.LENGTH_SHORT).show()
+                    }
+                    !UpdateChecker.isNewer(release.version, current) -> if (manual) {
+                        Toast.makeText(this@MainActivity, "已是最新版本 v$current", Toast.LENGTH_SHORT).show()
+                    }
+                    else -> showUpdateDialog(release)
+                }
+            }
+        }
+    }
+
+    /** 弹出更新确认框：新版本号 + Release Notes，确认后下载 */
+    private fun showUpdateDialog(release: UpdateChecker.Release) {
+        val notes = release.notes.trim().ifEmpty { "优化体验并修复已知问题" }
+        androidx.appcompat.app.AlertDialog.Builder(this)
+            .setTitle("发现新版本 v${release.version}")
+            .setMessage(notes)
+            .setPositiveButton("立即更新") { _, _ -> downloadApk(release) }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    /** 用系统 DownloadManager 把更新包下载到应用专属目录（无需存储权限，通知栏自带进度） */
+    private fun downloadApk(release: UpdateChecker.Release) {
+        val fileName = "player-v${release.version}-release.apk"
+        val dir = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
+        if (dir == null) {
+            Toast.makeText(this, "存储不可用，下载失败", Toast.LENGTH_SHORT).show()
+            return
+        }
+        // 清掉旧的同名包，避免 DownloadManager 因目标文件已存在而拒绝覆盖
+        File(dir, fileName).delete()
+        val request = DownloadManager.Request(release.apkUrl.toUri())
+            .setTitle("影音盒 v${release.version}")
+            .setDescription("正在下载更新包")
+            .setMimeType("application/vnd.android.package-archive")
+            .setDestinationInExternalFilesDir(this, Environment.DIRECTORY_DOWNLOADS, fileName)
+            .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+        lastDownloadId = downloadManager.enqueue(request)
+        Toast.makeText(this, "开始下载，完成后自动弹出安装", Toast.LENGTH_SHORT).show()
+    }
+
+    /** 取回刚下载完成的更新包文件（应用专属下载目录里最新的 .apk） */
+    private fun downloadedApkFile(): File? {
+        val dir = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: return null
+        return dir.listFiles { f -> f.isFile && f.name.endsWith(".apk") }
+            ?.maxByOrNull { it.lastModified() }
+    }
+
+    /** 安装更新包：FileProvider 暴露 APK 给系统安装器；Android 8+ 需「安装未知应用」授权 */
+    private fun installApk(file: File) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+            && !packageManager.canRequestPackageInstalls()
+        ) {
+            // 未授权：跳到设置页，用户授权返回前台后自动继续安装
+            pendingInstallFile = file
+            try {
+                startActivity(
+                    Intent(
+                        Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                        "package:$packageName".toUri()
+                    )
+                )
+            } catch (_: Exception) {
+            }
+            Toast.makeText(this, "请允许本应用安装未知应用，返回后将自动继续", Toast.LENGTH_LONG).show()
+            return
+        }
+        val uri = FileProvider.getUriForFile(this, "$packageName.file provider", file)
+        val intent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(uri, "application/vnd.android.package-archive")
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        try {
+            startActivity(intent)
+        } catch (_: Exception) {
+            Toast.makeText(this, "无法启动安装器，请在下载通知中手动安装", Toast.LENGTH_SHORT).show()
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
@@ -957,6 +1090,20 @@ class MainActivity : AppCompatActivity() {
             }
         }
         binding.btnPip.setOnClickListener { enterPipMode() }
+        // 溢出菜单（⋮）：手动检查更新
+        binding.btnMore.setOnClickListener { anchor ->
+            val popup = PopupMenu(this, anchor)
+            popup.menu.add(0, MENU_ID_CHECK_UPDATE, 0, R.string.check_update)
+            popup.setOnMenuItemClickListener { item ->
+                if (item.itemId == MENU_ID_CHECK_UPDATE) {
+                    checkForUpdate(manual = true)
+                    true
+                } else {
+                    false
+                }
+            }
+            popup.show()
+        }
         binding.playerView.setFullscreenButtonClickListener { enabled ->
             setFullscreen(enabled)
         }
@@ -981,10 +1128,28 @@ class MainActivity : AppCompatActivity() {
         if (Build.VERSION.SDK_INT >= 33) {
             notifPermission.launch(android.Manifest.permission.POST_NOTIFICATIONS)
         }
+
+        // 监听更新包下载完成（API 33+ 需 RECEIVER_NOT_EXPORTED 标志）
+        ContextCompat.registerReceiver(
+            this, downloadCompleteReceiver,
+            IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE),
+            ContextCompat.RECEIVER_NOT_EXPORTED
+        )
+        // 冷启动静默检查一次新版本（失败不打扰）
+        checkForUpdate(manual = false)
     }
 
     override fun onStart() {
         super.onStart()
+        // 用户已在设置页授权「安装未知应用」：继续完成被挂起的更新安装
+        pendingInstallFile?.let { file ->
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O
+                || packageManager.canRequestPackageInstalls()
+            ) {
+                pendingInstallFile = null
+                installApk(file)
+            }
+        }
         // 监听本地媒体库变化，实现新增/修改时的去重增量自动扫描
         contentResolver.registerContentObserver(
             MediaStore.Video.Media.EXTERNAL_CONTENT_URI, true, mediaChangeObserver
@@ -1064,6 +1229,15 @@ class MainActivity : AppCompatActivity() {
     override fun onPause() {
         super.onPause()
         saveCurrentProgress()
+    }
+
+    override fun onDestroy() {
+        // 注销更新包下载完成监听
+        try {
+            unregisterReceiver(downloadCompleteReceiver)
+        } catch (_: Exception) {
+        }
+        super.onDestroy()
     }
 
     /** 是否已获得存储读取权限（API 33+ 检查媒体权限，旧版本检查外部存储权限） */

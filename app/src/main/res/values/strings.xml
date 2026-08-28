@@ -13,4 +13,6 @@
     <string name="playing_progress">播放中 %1$s</string>
     <!-- 已存进度项显示区间：已播 %1$s / 总时长 %2$s -->
     <string name="progress_range">%1$s / %2$s</string>
+    <!-- 溢出菜单：检查更新 -->
+    <string name="check_update">检查更新</string>
 </resources>

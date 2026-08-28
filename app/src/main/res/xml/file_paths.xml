@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- FileProvider 路径声明：应用专属外部目录下的 Download 子目录（更新包下载位置） -->
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <external-files-path
+        name="update_downloads"
+        path="Download/" />
+</paths>
