@@ -219,7 +219,7 @@ class PlayerService : MediaSessionService() {
         // 读出磁盘进度 → 剔除待删除项 → 合并本次进度(仅>0)，保证不覆盖非零旧值
         val merged = mergeProgress(prefs, progress, removedUris)
         val editor = prefs.edit().putString("progress", writeProgressMap(merged))
-        if (sync) editor.apply() else editor.apply()
+        if (sync) editor.commit() else editor.apply()
         // 3. 同步更新 playlist 中各条目的 lastPosition，保证前端与磁盘一致
         val playlistJson = prefs.getString("playlist", null)
         if (playlistJson != null) {
@@ -233,7 +233,7 @@ class PlayerService : MediaSessionService() {
                     newArr.put(obj)
                 }
                 val playlistEditor = prefs.edit().putString("playlist", newArr.toString())
-                if (sync) playlistEditor.apply() else playlistEditor.apply()
+                if (sync) playlistEditor.commit() else playlistEditor.apply()
             } catch (_: Exception) {
             }
         }

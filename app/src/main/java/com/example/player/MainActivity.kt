@@ -841,6 +841,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     /** 切换全屏：隐藏/显示顶栏与播放列表，横屏/竖屏，隐藏/显示系统栏 */
+    @OptIn(UnstableApi::class)
     private fun setFullscreen(enabled: Boolean) {
         isFullscreen = enabled
         if (enabled) {
@@ -988,31 +989,6 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
-    /** 内置下载代理项：label 供显示，url 为代理前缀，null 表示直连 */
-    private data class ProxyOption(val label: String, val url: String?)
-
-    /** 内置代理列表（用户只能从预设里选，不能填自定义地址） */
-    private val builtInProxies = listOf(
-        ProxyOption("直连", null),
-        ProxyOption("ghproxy.com", "https://ghproxy.com/"),
-        ProxyOption("mirror.ghproxy.com", "https://mirror.ghproxy.com/"),
-        ProxyOption("gh-proxy.com", "https://gh-proxy.com/"),
-    )
-
-    /** 当前选中的内置代理下标（默认直连） */
-    private fun selectedProxyIndex(): Int =
-        playerPrefs.getInt("download_proxy_index", 0).coerceIn(0, builtInProxies.lastIndex)
-
-    /** 按当前所选的代理前缀拼接 GitHub 直链，得到最终下载地址；直连时原样返回 */
-    private fun buildDownloadUrl(apkUrl: String): Uri {
-        val proxy = builtInProxies[selectedProxyIndex()].url
-        val url = if (proxy.isNullOrEmpty()) apkUrl else {
-            val p = if (proxy.endsWith("/")) proxy else "$proxy/"
-            p + apkUrl
-        }
-        return url.toUri()
-    }
-
     /** 用系统 DownloadManager 把更新包下载到应用专属目录（无需存储权限，通知栏自带进度） */
     private fun downloadApk(release: UpdateChecker.Release) {
         val fileName = "player-v${release.version}-release.apk"
@@ -1023,7 +999,7 @@ class MainActivity : AppCompatActivity() {
         }
         // 清掉旧的同名包，避免 DownloadManager 因目标文件已存在而拒绝覆盖
         File(dir, fileName).delete()
-        val request = DownloadManager.Request(buildDownloadUrl(release.apkUrl))
+        val request = DownloadManager.Request(release.apkUrl.toUri())
             .setTitle("影音盒 v${release.version}")
             .setDescription("正在下载更新包")
             .setMimeType("application/vnd.android.package-archive")

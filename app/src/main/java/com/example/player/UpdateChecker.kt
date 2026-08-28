@@ -34,57 +34,50 @@ class UpdateChecker {
         return fetchFromGitHubApi()
     }
 
-    /** 从 data.jsdelivr.com 获取当前 main 分支的最新提交 hash；失败返回 null */
-    private fun getLatestCommitHash(): String? = try {
-        val conn = URL(JS_LATEST_COMMIT).openConnection() as HttpURLConnection
-        try {
-            conn.connectTimeout = 8_000
-            conn.readTimeout = 8_000
-            if (conn.responseCode != 200) null
-            else JSONObject(conn.inputStream.bufferedReader().use { it.readText() })
-                .optString("default").takeIf { it.isNotBlank() }
-        } finally {
-            conn.disconnect()
-        }
-    } catch (_: Exception) {
-        null
-    }
-
-    /** 请求 jsDelivr 上的 version.json 并解析；失败返回 null */
-    private fun fetchVersionJson(url: String): Release? {
+    /** 发起 GET 请求并返回响应体字符串；非 200 或异常时返回 null */
+    private fun httpGet(url: String, vararg headers: Pair<String, String>): String? {
         val conn = URL(url).openConnection() as HttpURLConnection
         return try {
-            conn.connectTimeout = 10_000
-            conn.readTimeout = 20_000
+            conn.connectTimeout = CONNECT_TIMEOUT_MS
+            conn.readTimeout = READ_TIMEOUT_MS
+            for ((name, value) in headers) conn.setRequestProperty(name, value)
             if (conn.responseCode != 200) null
-            else parseVersionJson(conn.inputStream.bufferedReader().use { it.readText() })
+            else conn.inputStream.bufferedReader().use { it.readText() }
+        } catch (_: Exception) {
+            null
         } finally {
             conn.disconnect()
         }
     }
+
+    /** 从 data.jsdelivr.com 获取当前 main 分支的最新提交 hash；失败返回 null */
+    private fun getLatestCommitHash(): String? =
+        httpGet(JS_LATEST_COMMIT)?.let { body ->
+            try {
+                JSONObject(body).optString("default").takeIf { it.isNotBlank() }
+            } catch (_: Exception) {
+                null
+            }
+        }
+
+    /** 请求 jsDelivr 上的 version.json 并解析；失败返回 null */
+    private fun fetchVersionJson(url: String): Release? =
+        httpGet(url)?.let { parseVersionJson(it) }
 
     /** 兜底：GitHub Releases latest 接口 */
     private fun fetchFromGitHubApi(): Release? {
-        val conn = URL(GITHUB_API_LATEST).openConnection() as HttpURLConnection
-        return try {
-            conn.connectTimeout = 10_000
-            conn.readTimeout = 20_000
-            conn.setRequestProperty("Accept", "application/vnd.github+json")
-            if (conn.responseCode != 200) return null
-            val body = conn.inputStream.bufferedReader().use { it.readText() }
-            // 解析时把 version.json 的字段与 GitHub API 的字段都兼容掉
-            val obj = JSONObject(body)
-            val version = obj.optString("version").ifBlank {
-                obj.optString("tag_name").removePrefix("v").removePrefix("V")
-            }.trim().removePrefix("v").removePrefix("V").ifBlank { return null }
-            val apkUrl = obj.optString("apkUrl").ifBlank {
-                findApkUrl(obj.optJSONArray("assets"))
-            }.ifBlank { return null }
-            val notes = obj.optString("notes").ifBlank { obj.optString("body") }
-            Release(version, apkUrl, notes)
-        } finally {
-            conn.disconnect()
-        }
+        val body = httpGet(GITHUB_API_LATEST, "Accept" to "application/vnd.github+json")
+            ?: return null
+        // 解析时把 version.json 的字段与 GitHub API 的字段都兼容掉
+        val obj = JSONObject(body)
+        val version = obj.optString("version").ifBlank {
+            obj.optString("tag_name").removePrefix("v").removePrefix("V")
+        }.trim().removePrefix("v").removePrefix("V").ifBlank { return null }
+        val apkUrl = obj.optString("apkUrl").ifBlank {
+            findApkUrl(obj.optJSONArray("assets"))
+        }.ifBlank { return null }
+        val notes = obj.optString("notes").ifBlank { obj.optString("body") }
+        return Release(version, apkUrl, notes)
     }
 
     /** 解析 version.json 的固定字段 */
@@ -115,6 +108,8 @@ class UpdateChecker {
         private const val JS_CDN = "https://cdn.jsdelivr.net/gh/niu0506/player"
         private const val JS_LATEST_COMMIT = "https://data.jsdelivr.com/v1/package/gh/niu0506/player@main"
         private const val GITHUB_API_LATEST = "https://api.github.com/repos/niu0506/player/releases/latest"
+        private const val CONNECT_TIMEOUT_MS = 10_000
+        private const val READ_TIMEOUT_MS = 20_000
 
         /** 语义化版本比较：remote > current 时返回 true（如 1.1.3 > 1.1.2） */
         fun isNewer(remote: String, current: String): Boolean {

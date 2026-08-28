@@ -26,8 +26,8 @@ android {
         applicationId = "com.example.player"
         minSdk = 24
         targetSdk = 35
-        versionCode = 7
-        versionName = "1.2.3"
+        versionCode = 8
+        versionName = "1.2.4"
     }
 
     signingConfigs {
