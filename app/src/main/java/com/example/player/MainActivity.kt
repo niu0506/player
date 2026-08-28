@@ -132,6 +132,16 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, "权限已授予，请点击扫描", Toast.LENGTH_SHORT).show()
         }
     }
+    /** 写外部存储权限（仅 Android 9 及以下需要，用于把更新包存到公共 Download） */
+    private val writePermission = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) {
+            pendingDownloadUrls.removeFirstOrNull()?.let { enqueueDownload(it) }
+        } else {
+            Toast.makeText(this, "缺少存储权限，无法保存到下载目录", Toast.LENGTH_SHORT).show()
+        }
+    }
 
     // ===== 应用内更新（GitHub Releases） =====
     /** 更新检查器 */
@@ -148,6 +158,12 @@ class MainActivity : AppCompatActivity() {
     private var pendingDownloadVersion = ""
     /** 剩余待尝试的下载源队列（CDN 加速在前，GitHub 直连兜底） */
     private var pendingDownloadUrls: ArrayDeque<String> = ArrayDeque()
+    /** 应用被新版本替换后清理公共 Download 里的更新包 */
+    private val packageReplacedReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action == Intent.ACTION_MY_PACKAGE_REPLACED) deleteInstalledUpdateApk()
+        }
+    }
 
     /** 下载完成监听：成功则调起系统安装器；失败且有备用下载源则换源重试 */
     private val downloadCompleteReceiver = object : BroadcastReceiver() {
@@ -1039,18 +1055,21 @@ class MainActivity : AppCompatActivity() {
     }
 
     /** 用系统 DownloadManager 把更新包下载到应用专属目录；CDN 加速，失败自动换源 */
+    @Suppress("DEPRECATION")
     private fun downloadApk(release: UpdateChecker.Release) {
-        val dir = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
-        if (dir == null) {
-            Toast.makeText(this, "存储不可用，下载失败", Toast.LENGTH_SHORT).show()
-            return
-        }
+        val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
         pendingDownloadFile = File(dir, "player-v${release.version}-release.apk")
         pendingDownloadVersion = release.version
         // CDN 加速在前，GitHub 直连兜底
         pendingDownloadUrls = ArrayDeque(
             downloadSources.map { prefix -> prefix + release.apkUrl }
         )
+        // Android 9 及以下需 WRITE_EXTERNAL_STORAGE 才能写入公共 Download
+        if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P && !hasWritePermission()) {
+            writePermission.launch(android.Manifest.permission.WRITE_EXTERNAL_STORAGE)
+            Toast.makeText(this, "需要存储权限以保存更新包到下载目录", Toast.LENGTH_SHORT).show()
+            return
+        }
         enqueueDownload(pendingDownloadUrls.removeFirst())
         Toast.makeText(this, "开始下载，完成后自动弹出安装", Toast.LENGTH_SHORT).show()
     }
@@ -1064,7 +1083,7 @@ class MainActivity : AppCompatActivity() {
             .setTitle("影音盒 v$pendingDownloadVersion")
             .setDescription("正在下载更新包")
             .setMimeType("application/vnd.android.package-archive")
-            .setDestinationInExternalFilesDir(this, Environment.DIRECTORY_DOWNLOADS, file.name)
+            .setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, file.name)
             .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
         lastDownloadId = downloadManager.enqueue(request)
     }
@@ -1072,6 +1091,21 @@ class MainActivity : AppCompatActivity() {
     /** 取回刚下载实现的更新包文件：直接用启动下载时记下的目标文件，避免「按最新 .apk」误取历史版本包 */
     private fun downloadedApkFile(): File? =
         pendingDownloadFile?.takeIf { it.exists() }
+
+    /** 是否已具备写入公共 Download 的权限（Android 9 及以下需 WRITE_EXTERNAL_STORAGE） */
+    private fun hasWritePermission(): Boolean =
+        Build.VERSION.SDK_INT > Build.VERSION_CODES.P ||
+            ContextCompat.checkSelfPermission(
+                this, android.Manifest.permission.WRITE_EXTERNAL_STORAGE
+            ) == PackageManager.PERMISSION_GRANTED
+
+    /** 安装成功后清理公共 Download 下的更新包（含历史版本），避免堆积 */
+    @Suppress("DEPRECATION")
+    private fun deleteInstalledUpdateApk() {
+        val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+        dir.listFiles { f -> f.name.startsWith("player-v") && f.name.endsWith("-release.apk") }
+            ?.forEach { it.delete() }
+    }
 
     /** 安装更新包：FileProvider 暴露 APK 给系统安装器；Android 8+ 需「安装未知应用」授权 */
     private fun installApk(file: File) {
@@ -1196,6 +1230,12 @@ class MainActivity : AppCompatActivity() {
             IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE),
             ContextCompat.RECEIVER_NOT_EXPORTED
         )
+        // 本应用被新版本替换后清理公共 Download 里的更新包
+        ContextCompat.registerReceiver(
+            this, packageReplacedReceiver,
+            IntentFilter(Intent.ACTION_MY_PACKAGE_REPLACED),
+            ContextCompat.RECEIVER_NOT_EXPORTED
+        )
         // 冷启动静默检查一次新版本（失败不打扰）
         checkForUpdate(manual = false)
     }
@@ -1296,6 +1336,11 @@ class MainActivity : AppCompatActivity() {
         // 注销更新包下载完成监听
         try {
             unregisterReceiver(downloadCompleteReceiver)
+        } catch (_: Exception) {
+        }
+        // 注销应用替换监听
+        try {
+            unregisterReceiver(packageReplacedReceiver)
         } catch (_: Exception) {
         }
         super.onDestroy()

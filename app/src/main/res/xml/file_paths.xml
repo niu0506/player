@@ -4,4 +4,8 @@
     <external-files-path
         name="update_downloads"
         path="Download/" />
+    <!-- 公共 Download 目录：更新包改存于此，供系统安装器访问 -->
+    <external-path
+        name="public_downloads"
+        path="Download/" />
 </paths>
