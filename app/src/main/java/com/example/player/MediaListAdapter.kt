@@ -8,6 +8,7 @@ import androidx.recyclerview.widget.RecyclerView
 import com.example.player.databinding.ItemMediaBinding
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
@@ -42,6 +43,8 @@ class MediaListAdapter(
     private var isPlaying = false
     /** 后台线程作用域：用于把 DiffUtil 计算移出主线程，避免大列表掉帧 */
     private val diffScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    /** 正在进行的 diff 任务句柄，新的 submitList 会取消旧的，避免乱序 dispatch 覆盖 */
+    private var diffJob: Job? = null
 
     /**
      * 用新列表刷新数据，并借助 DiffUtil 计算增量后最小化刷新 UI。
@@ -50,9 +53,11 @@ class MediaListAdapter(
      * @param list 新的数据列表
      */
     fun submitList(list: List<MediaItemData>) {
-        // 先在主线程抓取旧列表快照（items 仅由主线程修改），后台计算时只读快照与入参，避免并发访问
-        val oldItems = synchronized(items) { ArrayList(items) }
-        diffScope.launch {
+        // 仅在主线程调用，此处无需加锁：items 只在下方 withContext(Main) 内修改
+        val oldItems = ArrayList(items)
+        diffJob?.cancel()
+        diffJob = diffScope.launch {
+            val myJob = coroutineContext[Job]
             val diff = DiffUtil.calculateDiff(object : DiffUtil.Callback() {
                 override fun getOldListSize(): Int = oldItems.size
                 override fun getNewListSize(): Int = list.size
@@ -62,6 +67,7 @@ class MediaListAdapter(
                     oldItems[oldItemPosition] == list[newItemPosition]
             })
             withContext(Dispatchers.Main) {
+                if (myJob?.isActive != true) return@withContext // 已被更新的提交取消，丢弃本次结果
                 items.clear()
                 items.addAll(list)
                 diff.dispatchUpdatesTo(this@MediaListAdapter)

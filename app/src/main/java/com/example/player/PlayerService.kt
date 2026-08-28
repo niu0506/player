@@ -224,6 +224,7 @@ class PlayerService : MediaSessionService() {
         val merged = mergeProgress(prefs, progress, removedUris)
         val editor = prefs.edit().putString("progress", writeProgressMap(merged))
         if (sync) editor.apply() else editor.apply()
+        // commit() 同步落盘返回后再清理，保证 onTaskRemoved/onDestroy 时「播完清理」记录不会丢失
         removedUris.clear()
         lastPersistedSnapshot = progress
     }

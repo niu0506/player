@@ -1,5 +1,5 @@
 {
-  "version": "1.2.7",
-  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.2.7/player-v1.2.7-release.apk",
-  "notes": "修复：播放进度仅存一份（去掉列表 lastPosition 冗余数据源），落盘改为真同步；FileProvider authority 改为规范无空格形式；修复 UpdateChecker 参数告警。"
+  "version": "1.2.8",
+  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.2.8/player-v1.2.8-release.apk",
+  "notes": "修复：writeToDisk 同步参数失效(两分支均 apply)改为 commit 真同步，避免任务移除时进度丢失；submitList 并发乱序改为取消旧 diff 任务；删除条目后同步校正播放高亮；更新包改用精确目标文件下载。"
 }

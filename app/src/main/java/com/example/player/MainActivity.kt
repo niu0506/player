@@ -216,6 +216,11 @@ class MainActivity : AppCompatActivity() {
         // 删除播放项之前的条目会使下标前移但不触发 transition，需手动校正 currentIndex，
         // 否则残留下标会绕过 AUTO 清理分支，把"播完进度"写回复活
         if (index < currentIndex) currentIndex--
+        // 同步校正适配器内的高亮下标，否则删除后高亮漂移，直到下次切换/播放状态变化才自愈
+        adapter.setCurrentPlaying(
+            currentIndex.takeIf { it in playlist.indices } ?: -1,
+            controller?.isPlaying == true
+        )
         refreshPlaylist()
         savePlaylist()
         Toast.makeText(this, "已删除", Toast.LENGTH_SHORT).show()
@@ -395,6 +400,13 @@ class MainActivity : AppCompatActivity() {
                 if (i < currentIndex) currentIndex--
                 removed++
             }
+        }
+        // 有删除时同步校正适配器高亮下标，避免删除后播放项高亮漂移
+        if (removed > 0) {
+            adapter.setCurrentPlaying(
+                currentIndex.takeIf { it in playlist.indices } ?: -1,
+                controller?.isPlaying == true
+            )
         }
         return removed
     }
@@ -1057,12 +1069,9 @@ class MainActivity : AppCompatActivity() {
         lastDownloadId = downloadManager.enqueue(request)
     }
 
-    /** 取回刚下载完成的更新包文件（应用专属下载目录里最新的 .apk） */
-    private fun downloadedApkFile(): File? {
-        val dir = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: return null
-        return dir.listFiles { f -> f.isFile && f.name.endsWith(".apk") }
-            ?.maxByOrNull { it.lastModified() }
-    }
+    /** 取回刚下载实现的更新包文件：直接用启动下载时记下的目标文件，避免「按最新 .apk」误取历史版本包 */
+    private fun downloadedApkFile(): File? =
+        pendingDownloadFile?.takeIf { it.exists() }
 
     /** 安装更新包：FileProvider 暴露 APK 给系统安装器；Android 8+ 需「安装未知应用」授权 */
     private fun installApk(file: File) {
