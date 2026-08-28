@@ -1,5 +1,5 @@
 {
-  "version": "1.2.8",
-  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.2.8/player-v1.2.8-release.apk",
+  "version": "1.2.9",
+  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.2.9/player-v1.2.9-release.apk",
   "notes": "修复：writeToDisk 同步参数失效(两分支均 apply)改为 commit 真同步，避免任务移除时进度丢失；submitList 并发乱序改为取消旧 diff 任务；删除条目后同步校正播放高亮；更新包改用精确目标文件下载。"
 }
