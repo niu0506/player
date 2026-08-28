@@ -6,6 +6,12 @@ import android.view.ViewGroup
 import androidx.recyclerview.widget.DiffUtil
 import androidx.recyclerview.widget.RecyclerView
 import com.example.player.databinding.ItemMediaBinding
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * 播放列表的 RecyclerView 适配器。
@@ -28,24 +34,33 @@ class MediaListAdapter(
     private var currentPlayingIndex = -1
     /** 当前是否处于播放状态（决定图标展示） */
     private var isPlaying = false
+    /** 后台线程作用域：用于把 DiffUtil 计算移出主线程，避免大列表掉帧 */
+    private val diffScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
 
     /**
      * 用新列表刷新数据，并借助 DiffUtil 计算增量后最小化刷新 UI。
+     * DiffUtil 计算在 [Dispatchers.Default] 后台线程执行，结果回主线程 dispatch，
+     * 避免列表较大时在主线程同步计算导致掉帧。
      * @param list 新的数据列表
      */
     fun submitList(list: List<MediaItemData>) {
-        // DiffUtil 通过 uri 判断「是否同一项」，通过 data class 判等判断「内容是否变化」
-        val diff = DiffUtil.calculateDiff(object : DiffUtil.Callback() {
-            override fun getOldListSize(): Int = items.size
-            override fun getNewListSize(): Int = list.size
-            override fun areItemsTheSame(oldItemPosition: Int, newItemPosition: Int): Boolean =
-                items[oldItemPosition].uri == list[newItemPosition].uri
-            override fun areContentsTheSame(oldItemPosition: Int, newItemPosition: Int): Boolean =
-                items[oldItemPosition] == list[newItemPosition]
-        })
-        items.clear()
-        items.addAll(list)
-        diff.dispatchUpdatesTo(this)
+        // 先在主线程抓取旧列表快照（items 仅由主线程修改），后台计算时只读快照与入参，避免并发访问
+        val oldItems = synchronized(items) { ArrayList(items) }
+        diffScope.launch {
+            val diff = DiffUtil.calculateDiff(object : DiffUtil.Callback() {
+                override fun getOldListSize(): Int = oldItems.size
+                override fun getNewListSize(): Int = list.size
+                override fun areItemsTheSame(oldItemPosition: Int, newItemPosition: Int): Boolean =
+                    oldItems[oldItemPosition].uri == list[newItemPosition].uri
+                override fun areContentsTheSame(oldItemPosition: Int, newItemPosition: Int): Boolean =
+                    oldItems[oldItemPosition] == list[newItemPosition]
+            })
+            withContext(Dispatchers.Main) {
+                items.clear()
+                items.addAll(list)
+                diff.dispatchUpdatesTo(this@MediaListAdapter)
+            }
+        }
     }
 
     /**
@@ -123,6 +138,11 @@ class MediaListAdapter(
     }
 
     override fun getItemCount() = items.size
+
+    override fun onDetachedFromRecyclerView(recyclerView: RecyclerView) {
+        super.onDetachedFromRecyclerView(recyclerView)
+        diffScope.cancel()
+    }
 
     /** 列表项视图持有者（inner 以便在 init 中绑定一次点击监听，避免每次绑定重建 lambda） */
     inner class VH(val binding: ItemMediaBinding) : RecyclerView.ViewHolder(binding.root) {

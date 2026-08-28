@@ -1,5 +1,5 @@
 {
-  "version": "1.2.1",
-  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.2.1/player-v1.2.1-release.apk",
-  "notes": "修复：补充 INTERNET 权限与 jsDelivr 加速，解决大陆检查更新失败的问题。"
+  "version": "1.2.2",
+  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.2.2/player-v1.2.2-release.apk",
+  "notes": "优化：修复 MediaController 回调节点线程、进度改为异步落盘、播放列表 DiffUtil 移至后台线程计算，并加固扫描重入保护。"
 }

@@ -52,7 +52,6 @@ import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.TrackSelectionDialogBuilder
 import androidx.recyclerview.widget.LinearLayoutManager
 import com.example.player.databinding.ActivityMainBinding
-import com.google.common.util.concurrent.MoreExecutors
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -101,7 +100,7 @@ class MainActivity : AppCompatActivity() {
         const val GESTURE_BRIGHTNESS = 2 // 左半屏上下滑动调亮度
         const val GESTURE_VOLUME = 3 // 右半屏上下滑动调音量
         const val MENU_ID_CHECK_UPDATE = 100 // 溢出菜单里的「检查更新」项
-        const val MENU_ID_PROXY_SETTINGS = 101 // 溢出菜单里的「下载代理设置」项
+        const val MENU_ID_PROXY_SETTINGS = 101 // 溢出菜单里的「下载代理」项
     }
 
     /** 主线程 Handler，用于手势提示的延时隐藏 */
@@ -216,34 +215,37 @@ class MainActivity : AppCompatActivity() {
         if (isScanning) return
         isScanning = true
         lifecycleScope.launch(Dispatchers.IO) {
-            val videos = queryMediaStore(MediaStore.Video.Media.EXTERNAL_CONTENT_URI)
-            val audios = queryMediaStore(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI)
-            withContext(Dispatchers.Main) {
+            try {
+                val videos = queryMediaStore(MediaStore.Video.Media.EXTERNAL_CONTENT_URI)
+                val audios = queryMediaStore(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI)
+                withContext(Dispatchers.Main) {
+                    val scanned = mutableListOf<MediaItemData>()
+                    scanned.addAll(videos)
+                    scanned.addAll(audios)
+                    // 对账移除「文件已被外部删除」的条目，保证列表与实际文件一致
+                    val removedCount = pruneDeletedMedia(videos, audios)
+                    val existingKeys = playlist.map { normalizeUri(it.uri) }.toSet()
+                    // 过滤掉时长过短(<5秒)与已存在(去重)的条目
+                    val newItems = scanned.filter {
+                        it.duration >= 5000 && normalizeUri(it.uri) !in existingKeys
+                    }
+                    if (newItems.isEmpty() && removedCount == 0) {
+                        Toast.makeText(this@MainActivity, "没有新文件", Toast.LENGTH_SHORT).show()
+                        return@withContext
+                    }
+                    playlist.addAll(newItems)
+                    for (item in newItems) {
+                        controller?.addMediaItem(M3MediaItem.fromUri(item.uri))
+                    }
+                    refreshPlaylist()
+                    savePlaylist()
+                    val parts = mutableListOf<String>()
+                    if (removedCount > 0) parts.add("删除 $removedCount 个已消失文件")
+                    if (newItems.isNotEmpty()) parts.add("添加 ${newItems.size} 个文件")
+                    Toast.makeText(this@MainActivity, parts.joinToString("，"), Toast.LENGTH_SHORT).show()
+                }
+            } finally {
                 isScanning = false
-                val scanned = mutableListOf<MediaItemData>()
-                scanned.addAll(videos)
-                scanned.addAll(audios)
-                // 对账移除「文件已被外部删除」的条目，保证列表与实际文件一致
-                val removedCount = pruneDeletedMedia(videos, audios)
-                val existingKeys = playlist.map { normalizeUri(it.uri) }.toSet()
-                // 过滤掉时长过短(<5秒)与已存在(去重)的条目
-                val newItems = scanned.filter {
-                    it.duration >= 5000 && normalizeUri(it.uri) !in existingKeys
-                }
-                if (newItems.isEmpty() && removedCount == 0) {
-                    Toast.makeText(this@MainActivity, "没有新文件", Toast.LENGTH_SHORT).show()
-                    return@withContext
-                }
-                playlist.addAll(newItems)
-                for (item in newItems) {
-                    controller?.addMediaItem(M3MediaItem.fromUri(item.uri))
-                }
-                refreshPlaylist()
-                savePlaylist()
-                val parts = mutableListOf<String>()
-                if (removedCount > 0) parts.add("删除 $removedCount 个已消失文件")
-                if (newItems.isNotEmpty()) parts.add("添加 ${newItems.size} 个文件")
-                Toast.makeText(this@MainActivity, parts.joinToString("，"), Toast.LENGTH_SHORT).show()
             }
         }
     }
@@ -257,18 +259,20 @@ class MainActivity : AppCompatActivity() {
         if (isScanning) return
         isScanning = true
         lifecycleScope.launch(Dispatchers.IO) {
-            if (!hasStoragePermission()) {
-                isScanning = false
-                return@launch
-            }
-            val videos = queryMediaStore(MediaStore.Video.Media.EXTERNAL_CONTENT_URI)
-            val audios = queryMediaStore(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI)
-            withContext(Dispatchers.Main) {
-                isScanning = false
-                if (pruneDeletedMedia(videos, audios) > 0) {
-                    refreshPlaylist()
-                    savePlaylist()
+            try {
+                if (!hasStoragePermission()) {
+                    return@launch
                 }
+                val videos = queryMediaStore(MediaStore.Video.Media.EXTERNAL_CONTENT_URI)
+                val audios = queryMediaStore(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI)
+                withContext(Dispatchers.Main) {
+                    if (pruneDeletedMedia(videos, audios) > 0) {
+                        refreshPlaylist()
+                        savePlaylist()
+                    }
+                }
+            } finally {
+                isScanning = false
             }
         }
     }
@@ -984,38 +988,42 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
-    /** 返回用户在「下载代理设置」里填的 GitHub 代理前缀，未配置时为空串 */
-    private fun downloadProxyPrefix(): String =
-        playerPrefs.getString("download_proxy", "")?.trim().orEmpty()
+    /** 内置下载代理项：label 供显示，url 为代理前缀，null 表示直连 */
+    private data class ProxyOption(val label: String, val url: String?)
 
-    /** 弹出「下载代理设置」对话框：填写用于下载更新包的 GitHub 代理前缀（可为空） */
+    /** 内置代理列表（用户只能从预设里选，不能填自定义地址） */
+    private val builtInProxies = listOf(
+        ProxyOption("直连", null),
+        ProxyOption("ghproxy.com", "https://ghproxy.com/"),
+        ProxyOption("mirror.ghproxy.com", "https://mirror.ghproxy.com/"),
+        ProxyOption("gh-proxy.com", "https://gh-proxy.com/"),
+    )
+
+    /** 当前选中的内置代理下标（默认直连） */
+    private fun selectedProxyIndex(): Int =
+        playerPrefs.getInt("download_proxy_index", 0).coerceIn(0, builtInProxies.lastIndex)
+
+    /** 弹出「下载代理」选择对话框：从内置代理里单选，点击即生效并持久化 */
     private fun showDownloadProxyDialog() {
-        val input = android.widget.EditText(this)
-        input.hint = "如 https://ghproxy.com/"
-        input.setText(downloadProxyPrefix())
         androidx.appcompat.app.AlertDialog.Builder(this)
-            .setTitle(R.string.download_proxy_settings)
-            .setMessage("填写后，下载更新 APK 时会在此代理前缀后面拼接 GitHub 直链，用于解决大陆无法直连 github.com 的问题。留空则走直连。")
-            .setView(input)
-            .setPositiveButton("保存") { _, _ ->
-                playerPrefs.edit { putString("download_proxy", input.text.toString().trim()) }
-                Toast.makeText(this, "已保存", Toast.LENGTH_SHORT).show()
+            .setTitle(R.string.download_proxy)
+            .setMessage("下载更新 APK 时，会用所选代理前缀拼接 GitHub 直链，用于解决大陆无法直连 github.com 的问题。")
+            .setItems(builtInProxies.map { it.label }.toTypedArray()) { _, which ->
+                playerPrefs.edit { putInt("download_proxy_index", which) }
+                Toast.makeText(this, "已选择下载代理：${builtInProxies[which].label}", Toast.LENGTH_SHORT).show()
             }
             .setNegativeButton("取消", null)
             .show()
     }
 
-    /**
-     * 拼接最终下载地址：若配置了代理前缀（如 https://ghproxy.com/），
-     * 则在 GitHub 直链前拼接，以绕过大陆对 github.com 下载的不稳定访问。
-     */
+    /** 按当前所选的代理前缀拼接 GitHub 直链，得到最终下载地址；直连时原样返回 */
     private fun buildDownloadUrl(apkUrl: String): Uri {
-        val prefix = downloadProxyPrefix()
-        val url = if (prefix.isEmpty()) apkUrl else {
-            val p = if (prefix.endsWith("/")) prefix else "$prefix/"
+        val proxy = builtInProxies[selectedProxyIndex()].url
+        val url = if (proxy.isNullOrEmpty()) apkUrl else {
+            val p = if (proxy.endsWith("/")) proxy else "$proxy/"
             p + apkUrl
         }
-        return Uri.parse(url)
+        return url.toUri()
     }
 
     /** 用系统 DownloadManager 把更新包下载到应用专属目录（无需存储权限，通知栏自带进度） */
@@ -1129,7 +1137,7 @@ class MainActivity : AppCompatActivity() {
         binding.btnMore.setOnClickListener { anchor ->
             val popup = PopupMenu(this, anchor)
             popup.menu.add(0, MENU_ID_CHECK_UPDATE, 0, R.string.check_update)
-            popup.menu.add(0, MENU_ID_PROXY_SETTINGS, 0, R.string.download_proxy_settings)
+            popup.menu.add(0, MENU_ID_PROXY_SETTINGS, 0, R.string.download_proxy)
             popup.setOnMenuItemClickListener { item ->
                 when (item.itemId) {
                     MENU_ID_CHECK_UPDATE -> {
@@ -1244,7 +1252,7 @@ class MainActivity : AppCompatActivity() {
             // 冷启动/服务重建后恢复上次播放项(仅定位 + 断点，等用户按播放)
             restoreLastPlayed()
             refreshPlaylist()
-        }, MoreExecutors.directExecutor())
+        }, ContextCompat.getMainExecutor(this))
     }
 
     override fun onStop() {

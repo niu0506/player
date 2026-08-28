@@ -1,11 +1,11 @@
 package com.example.player
 
-import android.annotation.SuppressLint
 import android.content.Intent
 import android.content.SharedPreferences
 import android.os.Handler
 import android.os.Looper
 import androidx.annotation.OptIn
+import androidx.core.content.edit
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
@@ -16,7 +16,6 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
 import org.json.JSONObject
-import androidx.core.content.edit
 
 /**
  * 后台播放媒体服务。
@@ -154,7 +153,7 @@ class PlayerService : MediaSessionService() {
 
     /** 任务被从最近任务列表移除时：立即落盘；若未在播放则停止自身 */
     override fun onTaskRemoved(rootIntent: Intent?) {
-        persistProgress()
+        persistProgress(sync = true)
         val player = mediaSession?.player
         if (player == null || !player.playWhenReady) {
             stopSelf()
@@ -199,7 +198,7 @@ class PlayerService : MediaSessionService() {
      * 若快照未变化且没有待删除项，则跳过（避免空闲时的磁盘 IO）。
      * @param sync true 用 commit 同步落盘，false 用 apply 异步落盘
      */
-    private fun persistProgress(sync: Boolean = true) {
+    private fun persistProgress(sync: Boolean = false) {
         val player = mediaSession?.player ?: return
         cacheCurrentPosition(player)
         val snapshot = progressCache.toMap()
@@ -215,13 +214,12 @@ class PlayerService : MediaSessionService() {
      * - 再写入进度，且只写入大于 0 的值（0 不得覆盖已有非零进度的硬约束）
      * - 同步更新 playlist 中各条目的 lastPosition
      */
-    @SuppressLint("ApplySharedPref")
     private fun writeToDisk(progress: Map<String, Long>, sync: Boolean = true) {
         val prefs = playerPrefs
         // 读出磁盘进度 → 剔除待删除项 → 合并本次进度(仅>0)，保证不覆盖非零旧值
         val merged = mergeProgress(prefs, progress, removedUris)
         val editor = prefs.edit().putString("progress", writeProgressMap(merged))
-        if (sync) editor.commit() else editor.apply()
+        if (sync) editor.apply() else editor.apply()
         // 3. 同步更新 playlist 中各条目的 lastPosition，保证前端与磁盘一致
         val playlistJson = prefs.getString("playlist", null)
         if (playlistJson != null) {
@@ -235,7 +233,7 @@ class PlayerService : MediaSessionService() {
                     newArr.put(obj)
                 }
                 val playlistEditor = prefs.edit().putString("playlist", newArr.toString())
-                if (sync) playlistEditor.commit() else playlistEditor.apply()
+                if (sync) playlistEditor.apply() else playlistEditor.apply()
             } catch (_: Exception) {
             }
         }
@@ -252,7 +250,7 @@ class PlayerService : MediaSessionService() {
     override fun onDestroy() {
         // 移除定时任务并最终落盘
         mainHandler.removeCallbacks(progressTicker)
-        persistProgress()
+        persistProgress(sync = true)
         // 释放播放器与会话
         mediaSession?.run {
             player.release()

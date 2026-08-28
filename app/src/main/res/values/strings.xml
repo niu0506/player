@@ -15,6 +15,6 @@
     <string name="progress_range">%1$s / %2$s</string>
     <!-- 溢出菜单：检查更新 -->
     <string name="check_update">检查更新</string>
-    <!-- 溢出菜单：下载代理设置 -->
-    <string name="download_proxy_settings">下载代理设置</string>
+    <!-- 溢出菜单：下载代理 -->
+    <string name="download_proxy">下载代理</string>
 </resources>
