@@ -1,5 +1,5 @@
 {
-  "version": "1.2.2",
-  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.2.2/player-v1.2.2-release.apk",
-  "notes": "优化：修复 MediaController 回调节点线程、进度改为异步落盘、播放列表 DiffUtil 移至后台线程计算，并加固扫描重入保护。"
+  "version": "1.2.4",
+  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.2.4/player-v1.2.4-release.apk",
+  "notes": "优化：全屏播放改为铺满无黑边、移除全屏返回键与下载代理设置 UI，并清理冗余代码（修复进度落盘 sync、抽取更新检查公共 HTTP 方法）。"
 }
