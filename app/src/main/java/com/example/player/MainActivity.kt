@@ -100,7 +100,6 @@ class MainActivity : AppCompatActivity() {
         const val GESTURE_BRIGHTNESS = 2 // 左半屏上下滑动调亮度
         const val GESTURE_VOLUME = 3 // 右半屏上下滑动调音量
         const val MENU_ID_CHECK_UPDATE = 100 // 溢出菜单里的「检查更新」项
-        const val MENU_ID_PROXY_SETTINGS = 101 // 溢出菜单里的「下载代理」项
     }
 
     /** 主线程 Handler，用于手势提示的延时隐藏 */
@@ -818,8 +817,8 @@ class MainActivity : AppCompatActivity() {
             lp.setMargins(0, 0, 0, 0)
             binding.playerCard.layoutParams = lp
         } else if (isFullscreen) {
-            // 全屏：平滑铺满屏幕，无圆角无边距
-            binding.playerView.setResizeMode(AspectRatioFrameLayout.RESIZE_MODE_FIT)
+            // 全屏：ZOOM 等比放大铺满屏幕，无圆角无边距，避免黑边
+            binding.playerView.setResizeMode(AspectRatioFrameLayout.RESIZE_MODE_ZOOM)
             binding.playerCard.radius = 0f
             val lp = binding.playerCard.layoutParams as android.view.ViewGroup.MarginLayoutParams
             lp.setMargins(0, 0, 0, 0)
@@ -844,7 +843,6 @@ class MainActivity : AppCompatActivity() {
     /** 切换全屏：隐藏/显示顶栏与播放列表，横屏/竖屏，隐藏/显示系统栏 */
     private fun setFullscreen(enabled: Boolean) {
         isFullscreen = enabled
-        binding.btnBackFs.visibility = if (enabled) View.VISIBLE else View.GONE
         if (enabled) {
             val lp = binding.playerCard.layoutParams as android.view.ViewGroup.MarginLayoutParams
             binding.toolbarLayout.visibility = View.GONE
@@ -852,6 +850,8 @@ class MainActivity : AppCompatActivity() {
             lp.setMargins(0, 0, 0, 0)
             binding.playerCard.radius = 0f
             binding.playerCard.layoutParams = lp
+            // 全屏：ZOOM 等比放大铺满屏幕，裁剪溢出部分，避免黑边
+            binding.playerView.setResizeMode(AspectRatioFrameLayout.RESIZE_MODE_ZOOM)
             requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
             hideSystemBars()
         } else {
@@ -1003,19 +1003,6 @@ class MainActivity : AppCompatActivity() {
     private fun selectedProxyIndex(): Int =
         playerPrefs.getInt("download_proxy_index", 0).coerceIn(0, builtInProxies.lastIndex)
 
-    /** 弹出「下载代理」选择对话框：从内置代理里单选，点击即生效并持久化 */
-    private fun showDownloadProxyDialog() {
-        androidx.appcompat.app.AlertDialog.Builder(this)
-            .setTitle(R.string.download_proxy)
-            .setMessage("下载更新 APK 时，会用所选代理前缀拼接 GitHub 直链，用于解决大陆无法直连 github.com 的问题。")
-            .setItems(builtInProxies.map { it.label }.toTypedArray()) { _, which ->
-                playerPrefs.edit { putInt("download_proxy_index", which) }
-                Toast.makeText(this, "已选择下载代理：${builtInProxies[which].label}", Toast.LENGTH_SHORT).show()
-            }
-            .setNegativeButton("取消", null)
-            .show()
-    }
-
     /** 按当前所选的代理前缀拼接 GitHub 直链，得到最终下载地址；直连时原样返回 */
     private fun buildDownloadUrl(apkUrl: String): Uri {
         val proxy = builtInProxies[selectedProxyIndex()].url
@@ -1137,15 +1124,10 @@ class MainActivity : AppCompatActivity() {
         binding.btnMore.setOnClickListener { anchor ->
             val popup = PopupMenu(this, anchor)
             popup.menu.add(0, MENU_ID_CHECK_UPDATE, 0, R.string.check_update)
-            popup.menu.add(0, MENU_ID_PROXY_SETTINGS, 0, R.string.download_proxy)
             popup.setOnMenuItemClickListener { item ->
                 when (item.itemId) {
                     MENU_ID_CHECK_UPDATE -> {
                         checkForUpdate(manual = true)
-                        true
-                    }
-                    MENU_ID_PROXY_SETTINGS -> {
-                        showDownloadProxyDialog()
                         true
                     }
                     else -> false
@@ -1155,9 +1137,6 @@ class MainActivity : AppCompatActivity() {
         }
         binding.playerView.setFullscreenButtonClickListener { enabled ->
             setFullscreen(enabled)
-        }
-        binding.btnBackFs.setOnClickListener {
-            if (isFullscreen) setFullscreen(false)
         }
         // 返回键：全屏时先退出全屏，否则退出界面
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {

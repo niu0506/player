@@ -35,20 +35,6 @@
             app:show_buffering="when_playing"
             app:controller_layout_id="@layout/custom_player_control_view" />
 
-        <!-- 全屏模式下的左上角返回按钮，默认隐藏 -->
-        <ImageButton
-            android:id="@+id/btn_back_fs"
-            android:layout_width="44dp"
-            android:layout_height="44dp"
-            android:layout_gravity="top|start"
-            android:layout_margin="10dp"
-            android:scaleType="centerInside"
-            android:src="@drawable/ic_back"
-            android:tint="#FFFFFF"
-            android:background="@drawable/bg_icon_circle"
-            android:visibility="gone"
-            android:contentDescription="退出全屏" />
-
         <!-- 手势反馈浮层：滑动调节亮度/音量/进度、双击快进快退时的提示 -->
         <TextView
             android:id="@+id/gesture_overlay"
