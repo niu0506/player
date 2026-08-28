@@ -61,24 +61,24 @@ class UpdateChecker {
             ?: return null
         // 解析时把 version.json 的字段与 GitHub API 的字段都兼容掉
         val obj = JSONObject(body)
-        val version = text("version").ifBlank {
-            text("tag_name").removePrefix("v").removePrefix("V")
+        val version = obj.text("version").ifBlank {
+            obj.text("tag_name").removePrefix("v").removePrefix("V")
         }.trim().removePrefix("v").removePrefix("V").ifBlank { return null }
-        val apkUrl = text("apkUrl").ifBlank {
+        val apkUrl = obj.text("apkUrl").ifBlank {
             findApkUrl(obj.optJSONArray("assets"))
         }.ifBlank { return null }
-        val notes = text("notes").ifBlank { text("body") }
+        val notes = obj.text("notes").ifBlank { obj.text("body") }
         return Release(version, apkUrl, notes)
     }
 
     /** 解析 version.json 的固定字段 */
     private fun parseVersionJson(body: String): Release? = try {
         val obj = JSONObject(body)
-        val version = text("version").trim()
+        val version = obj.text("version").trim()
             .removePrefix("v").removePrefix("V").trim()
-        val apkUrl = text("apkUrl").trim()
+        val apkUrl = obj.text("apkUrl").trim()
         if (version.isEmpty() || apkUrl.isEmpty()) null
-        else Release(version, apkUrl, text("notes"))
+        else Release(version, apkUrl, obj.text("notes"))
     } catch (_: Exception) {
         null
     }
