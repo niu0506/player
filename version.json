@@ -1,5 +1,5 @@
 {
-  "version": "1.2.9",
-  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.2.9/player-v1.2.9-release.apk",
-  "notes": "修复：writeToDisk 同步参数失效(两分支均 apply)改为 commit 真同步，避免任务移除时进度丢失；submitList 并发乱序改为取消旧 diff 任务；删除条目后同步校正播放高亮；更新包改用精确目标文件下载。"
+  "version": "1.2.10",
+  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.2.10/player-v1.2.10-release.apk",
+  "notes": "更新包改存到手机公共下载目录（可在系统「下载」中查看），并在安装成功后自动清理；修复更新说明显示为 null 的问题。"
 }
