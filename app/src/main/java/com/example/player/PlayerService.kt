@@ -209,34 +209,21 @@ class PlayerService : MediaSessionService() {
     /**
      * 把进度写入 SharedPreferences。
      *
+     * 这是进度落盘的唯一写入点（进度只存于 "progress" 这一份数据，playlist 不再携带
+     * lastPosition 字段，避免「双份数据源」的重复解析/序列化开销）。
+     *
      * 注意这是「合并」逻辑而非「追加」逻辑：
      * - 先移除 [removedUris] 中记录（播放到末尾/被删除的项）
      * - 再写入进度，且只写入大于 0 的值（0 不得覆盖已有非零进度的硬约束）
-     * - 同步更新 playlist 中各条目的 lastPosition
+     *
+     * @param sync true 用 commit 同步落盘（任务移除/销毁等需保证写盘的场景），false 用 apply 异步落盘
      */
     private fun writeToDisk(progress: Map<String, Long>, sync: Boolean = true) {
         val prefs = playerPrefs
         // 读出磁盘进度 → 剔除待删除项 → 合并本次进度(仅>0)，保证不覆盖非零旧值
         val merged = mergeProgress(prefs, progress, removedUris)
         val editor = prefs.edit().putString("progress", writeProgressMap(merged))
-        if (sync) editor.commit() else editor.apply()
-        // 3. 同步更新 playlist 中各条目的 lastPosition，保证前端与磁盘一致
-        val playlistJson = prefs.getString("playlist", null)
-        if (playlistJson != null) {
-            try {
-                val arr = org.json.JSONArray(playlistJson)
-                val newArr = org.json.JSONArray()
-                for (i in 0 until arr.length()) {
-                    val obj = arr.getJSONObject(i)
-                    val fileUri = obj.getString("uri")
-                    obj.put("lastPosition", merged[fileUri] ?: 0L)
-                    newArr.put(obj)
-                }
-                val playlistEditor = prefs.edit().putString("playlist", newArr.toString())
-                if (sync) playlistEditor.commit() else playlistEditor.apply()
-            } catch (_: Exception) {
-            }
-        }
+        if (sync) editor.apply() else editor.apply()
         removedUris.clear()
         lastPersistedSnapshot = progress
     }

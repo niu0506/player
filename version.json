@@ -1,5 +1,5 @@
 {
-  "version": "1.2.6",
-  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.2.6/player-v1.2.6-release.apk",
-  "notes": "优化：更新包下载改用 CDN 加速（gh-proxy 等），失败自动换源并回退 GitHub 直连；版本检查仍走 GitHub API。"
+  "version": "1.2.7",
+  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.2.7/player-v1.2.7-release.apk",
+  "notes": "修复：播放进度仅存一份（去掉列表 lastPosition 冗余数据源），落盘改为真同步；FileProvider authority 改为规范无空格形式；修复 UpdateChecker 参数告警。"
 }

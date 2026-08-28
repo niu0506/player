@@ -177,12 +177,10 @@ class MainActivity : AppCompatActivity() {
         } catch (_: Exception) {
             return DownloadManager.STATUS_FAILED
         } ?: return DownloadManager.STATUS_FAILED
-        return try {
+        return cursor.use { cursor ->
             if (cursor.moveToFirst()) {
                 cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS))
             } else DownloadManager.STATUS_FAILED
-        } finally {
-            cursor.close()
         }
     }
 
@@ -225,6 +223,8 @@ class MainActivity : AppCompatActivity() {
 
     /** 刷新列表与顶部计数 / 空态提示 */
     private fun refreshPlaylist() {
+        // 先把当前内存进度刷进适配器，保证进度条展示与 cachedProgress 一致
+        adapter.setProgress(cachedProgress)
         adapter.submitList(playlist.toList())
         binding.tvCount.text = if (playlist.isEmpty()) "空" else "${playlist.size} 个"
         binding.tvEmpty.visibility = if (playlist.isEmpty()) View.VISIBLE else View.GONE
@@ -409,7 +409,7 @@ class MainActivity : AppCompatActivity() {
         return ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
     }
 
-    /** 把当前播放列表序列化为 JSON 存到 SharedPreferences（含各条目的上次进度） */
+    /** 把当前播放列表序列化为 JSON 存到 SharedPreferences（进度存于独立的 "progress" 映射） */
     private fun savePlaylist() {
         // 先把内存进度按与 Service 一致的「合并非覆盖」语义落盘，统一两侧来源，避免互相覆盖
         PlayerService.writeProgressBatch(
@@ -421,12 +421,10 @@ class MainActivity : AppCompatActivity() {
             obj.put("uri", item.uri.toString())
             obj.put("name", item.name)
             obj.put("duration", item.duration)
-            obj.put("lastPosition", cachedProgress[item.uri.toString()] ?: item.lastPosition)
             arr.put(obj)
         }
-        val snapshot = arr.toString()
         playerPrefs.edit {
-            putString("playlist", snapshot)
+            putString("playlist", arr.toString())
         }
     }
 
@@ -454,16 +452,17 @@ class MainActivity : AppCompatActivity() {
                 existingKeys.add(key)
                 val name = obj.getString("name")
                 val duration = obj.optLong("duration", 0L)
-                // 优先取 UUID 独立的进度存储，其次回退到 playlist 内记录
-                val lastPos = progressMap[uri.toString()] ?: obj.optLong("lastPosition", 0L)
-                playlist.add(MediaItemData(uri, name, duration, lastPos))
+                // 进度只取独立的 "progress" 映射（唯一数据源）；有进度则同步进内存缓存
+                val lastPos = progressMap[uri.toString()] ?: 0L
+                if (lastPos > 0) cachedProgress[uri.toString()] = lastPos
+                playlist.add(MediaItemData(uri, name, duration))
             }
         } catch (_: Exception) {
         }
     }
 
     /**
-     * 用磁盘进度(Service 清理后的权威值)校正内存中的 cachedProgress / playlist.lastPosition。
+     * 用磁盘进度(Service 清理后的权威值)校正内存中的 cachedProgress 与列表进度条。
      * 背景：后台自动播完切集时 MainActivity 监听器已解绑，内存会残留"播完进度"；
      * 回前台若不校正，该残留值将在下次 savePlaylist 时被写回磁盘导致进度复活。
      */
@@ -473,20 +472,17 @@ class MainActivity : AppCompatActivity() {
         for (i in playlist.indices) {
             val uri = playlist[i].uri.toString()
             val diskVal = diskMap[uri]
+            val memVal = cachedProgress[uri]
             if (diskVal != null && diskVal > 0) {
                 // 磁盘有有效进度，以磁盘为权威对齐内存
-                cachedProgress[uri] = diskVal
-                if (playlist[i].lastPosition != diskVal) {
-                    playlist[i] = playlist[i].copy(lastPosition = diskVal)
+                if (memVal != diskVal) {
+                    cachedProgress[uri] = diskVal
                     adapter.updateProgress(i, diskVal)
                 }
-            } else if (cachedProgress[uri] != null) {
+            } else if (memVal != null) {
                 // 磁盘已无该进度(后台播完被清理/被删除)：移除内存残留，避免写回复活
                 cachedProgress.remove(uri)
-                if (playlist[i].lastPosition != 0L) {
-                    playlist[i] = playlist[i].copy(lastPosition = 0L)
-                    adapter.updateProgress(i, 0L)
-                }
+                adapter.updateProgress(i, 0L)
             }
         }
     }
@@ -503,12 +499,10 @@ class MainActivity : AppCompatActivity() {
         if (duration != C.TIME_UNSET && duration > 0 && position >= duration) {
             // 已播放到末尾，视为看完，清除该条目的进度
             cachedProgress.remove(uri)
-            playlist[index] = playlist[index].copy(lastPosition = 0)
             adapter.updateProgress(index, 0)
             return
         }
         cachedProgress[uri] = position
-        playlist[index] = playlist[index].copy(lastPosition = position)
         adapter.updateProgress(index, position)
     }
 
@@ -536,7 +530,6 @@ class MainActivity : AppCompatActivity() {
             ) {
                 val finishedIndex = currentIndex
                 cachedProgress.remove(playlist[finishedIndex].uri.toString())
-                playlist[finishedIndex] = playlist[finishedIndex].copy(lastPosition = 0)
                 adapter.updateProgress(finishedIndex, 0)
             }
             currentIndex = controller?.currentMediaItemIndex ?: -1
@@ -578,13 +571,13 @@ class MainActivity : AppCompatActivity() {
 
     /**
      * 统一的续播位置来源：以磁盘(Service 后台写入的唯一事实来源)为优先，
-     * 磁盘无该 uri 的记录时才回退到内存 lastPosition。
-     * 用于 fix「播放中切到别的条目，旧条目进度丢失」：内存 lastPosition 只在少数字段
-     * 更新、易过期，而磁盘进度由 Service 周期+切换时精确落盘，更可靠。
+     * 磁盘无该 uri 的记录时才回退到内存 cachedProgress。
+     * 用于 fix「播放中切到别的条目，旧条目进度丢失」：磁盘进度由 Service 周期+切换时精确落盘，更可靠。
      */
     private fun resolveResumePosition(item: MediaItemData): Long {
         val disk = PlayerService.readProgressMap(playerPrefs)[item.uri.toString()]
-        return if (disk != null && disk > 0) disk else item.lastPosition
+        if (disk != null && disk > 0) return disk
+        return cachedProgress[item.uri.toString()] ?: 0L
     }
 
     /** 若当前项有保存过的进度（>0）则跳转到该位置，实现断点续播 */
@@ -1090,7 +1083,7 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, "请允许本应用安装未知应用，返回后将自动继续", Toast.LENGTH_LONG).show()
             return
         }
-        val uri = FileProvider.getUriForFile(this, "$packageName.file provider", file)
+        val uri = FileProvider.getUriForFile(this, "$packageName.file-provider", file)
         val intent = Intent(Intent.ACTION_VIEW).apply {
             setDataAndType(uri, "application/vnd.android.package-archive")
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)

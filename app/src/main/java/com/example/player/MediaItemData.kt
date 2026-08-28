@@ -7,8 +7,9 @@ import java.util.Locale
 /**
  * 播放列表中的单个媒体项描述。
  *
- * 一个完整的播放项既包含媒体本身的元信息（来源、名称、时长），
- * 也包含与「进度恢复」相关的播放位置信息。
+ * 只承载媒体本身的元信息（来源、名称、时长）。播放进度不放在这里，而是统一存在
+ * uri -> position 的进度映射中（磁盘 `SharedPreferences["progress"]` + 内存 `cachedProgress`），
+ * 避免同一份进度被存成多份导致对账复杂化（见 PlayerService 的 writeToDisk / 进度落盘唯一入口）。
  */
 data class MediaItemData(
     /** 媒体的来源地址（通常是 ContentResolver 查询到的 Uri） */
@@ -16,9 +17,7 @@ data class MediaItemData(
     /** 媒体文件显示名称，用于在列表中展示 */
     val name: String,
     /** 媒体总时长（毫秒），扫描时可能未知，播放后回填 */
-    val duration: Long = 0L,
-    /** 上次播放到的位置（毫秒），用于下次打开时从断点继续播放 */
-    val lastPosition: Long = 0L
+    val duration: Long = 0L
 )
 
 /**

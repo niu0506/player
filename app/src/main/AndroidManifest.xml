@@ -61,7 +61,7 @@
         <!-- 暴露下载好的更新 APK 给系统安装器（FileProvider） -->
         <provider
             android:name="androidx.core.content.FileProvider"
-            android:authorities="${applicationId}.file provider"
+            android:authorities="${applicationId}.file-provider"
             android:exported="false"
             android:grantUriPermissions="true">
             <meta-data

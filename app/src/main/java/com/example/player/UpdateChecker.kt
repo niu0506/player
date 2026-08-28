@@ -26,7 +26,7 @@ class UpdateChecker {
         // GitHub API 为唯一权威来源（Releases 里才是真正已发布、可下载的 APK）
         fetchFromGitHubApi()?.let { return it }
         // 兜底：jsDelivr @main 的 version.json（大陆可达性好，但受 CDN 缓存影响）
-        return fetchVersionJson("$JS_CDN@main/version.json")
+        return fetchVersionJson()
     }
 
     /** 发起 GET 请求并返回响应体字符串；非 200 或异常时返回 null */
@@ -46,8 +46,8 @@ class UpdateChecker {
     }
 
     /** 请求 jsDelivr 上的 version.json 并解析；失败返回 null */
-    private fun fetchVersionJson(url: String): Release? =
-        httpGet(url)?.let { parseVersionJson(it) }
+    private fun fetchVersionJson(): Release? =
+        httpGet(JS_VERSION_JSON_URL)?.let { parseVersionJson(it) }
 
     /** 优先来源：GitHub Releases latest 接口 */
     private fun fetchFromGitHubApi(): Release? {
@@ -91,6 +91,7 @@ class UpdateChecker {
 
     companion object {
         private const val JS_CDN = "https://cdn.jsdelivr.net/gh/niu0506/player"
+        private const val JS_VERSION_JSON_URL = "$JS_CDN@main/version.json"
         private const val GITHUB_API_LATEST = "https://api.github.com/repos/niu0506/player/releases/latest"
         private const val CONNECT_TIMEOUT_MS = 10_000
         private const val READ_TIMEOUT_MS = 20_000

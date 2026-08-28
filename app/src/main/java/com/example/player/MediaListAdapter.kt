@@ -30,6 +30,12 @@ class MediaListAdapter(
 
     /** 当前展示的数据副本（与外部 playlist 保持一致但不直接引用） */
     private val items = mutableListOf<MediaItemData>()
+    /**
+     * 各条目的播放进度（uri -> 位置毫秒），独立于条目数据单独维护。
+     * 进度不再放进 [MediaItemData]，这里是列表 UI 展示进度的唯一来源，随 [updateProgress]
+     * 局部更新，跨列表刷新(submitList)也保持存活。
+     */
+    private val progressMap = mutableMapOf<String, Long>()
     /** 当前正在播放的列表项下标，-1 表示无 */
     private var currentPlayingIndex = -1
     /** 当前是否处于播放状态（决定图标展示） */
@@ -83,10 +89,21 @@ class MediaListAdapter(
         }
     }
 
+    /**
+     * 批量同步各 uri 的播放进度（用于冷启动/回前台把内存或磁盘进度刷进列表，供进度条展示）。
+     * 只收录 >0 的有效进度，0 视为无进度。
+     */
+    fun setProgress(progress: Map<String, Long>) {
+        progressMap.clear()
+        for ((uri, pos) in progress) {
+            if (pos > 0) progressMap[uri] = pos
+        }
+    }
+
     /** 更新某个列表项的播放进度（毫秒），并刷新该项的进度条 */
     fun updateProgress(index: Int, position: Long) {
         if (index in items.indices) {
-            items[index] = items[index].copy(lastPosition = position)
+            progressMap[items[index].uri.toString()] = position
             notifyItemChanged(index)
         }
     }
@@ -117,19 +134,20 @@ class MediaListAdapter(
         )
 
         // 已有进度信息时展示进度条；正在播放的项显示「已播时长」，否则显示「已播/总时长」区间
-        if (item.lastPosition > 0 && item.duration > 0) {
-            val percent = (item.lastPosition * 100 / item.duration).toInt().coerceIn(0, 100)
+        val progress = progressMap[item.uri.toString()] ?: 0L
+        if (progress > 0 && item.duration > 0) {
+            val percent = (progress * 100 / item.duration).toInt().coerceIn(0, 100)
             holder.binding.progressRow.visibility = View.VISIBLE
             holder.binding.pbItem.progress = percent
             holder.binding.tvProgress.visibility = View.VISIBLE
             if (isActive) {
                 holder.binding.tvProgress.text = context.getString(
-                    R.string.playing_progress, formatTime(item.lastPosition)
+                    R.string.playing_progress, formatTime(progress)
                 )
             } else {
                 holder.binding.tvProgress.text = context.getString(
                     R.string.progress_range,
-                    formatTime(item.lastPosition), formatTime(item.duration)
+                    formatTime(progress), formatTime(item.duration)
                 )
             }
         } else {
