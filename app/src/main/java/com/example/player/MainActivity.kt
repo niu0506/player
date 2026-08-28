@@ -101,6 +101,7 @@ class MainActivity : AppCompatActivity() {
         const val GESTURE_BRIGHTNESS = 2 // 左半屏上下滑动调亮度
         const val GESTURE_VOLUME = 3 // 右半屏上下滑动调音量
         const val MENU_ID_CHECK_UPDATE = 100 // 溢出菜单里的「检查更新」项
+        const val MENU_ID_PROXY_SETTINGS = 101 // 溢出菜单里的「下载代理设置」项
     }
 
     /** 主线程 Handler，用于手势提示的延时隐藏 */
@@ -983,6 +984,40 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
+    /** 返回用户在「下载代理设置」里填的 GitHub 代理前缀，未配置时为空串 */
+    private fun downloadProxyPrefix(): String =
+        playerPrefs.getString("download_proxy", "")?.trim().orEmpty()
+
+    /** 弹出「下载代理设置」对话框：填写用于下载更新包的 GitHub 代理前缀（可为空） */
+    private fun showDownloadProxyDialog() {
+        val input = android.widget.EditText(this)
+        input.hint = "如 https://ghproxy.com/"
+        input.setText(downloadProxyPrefix())
+        androidx.appcompat.app.AlertDialog.Builder(this)
+            .setTitle(R.string.download_proxy_settings)
+            .setMessage("填写后，下载更新 APK 时会在此代理前缀后面拼接 GitHub 直链，用于解决大陆无法直连 github.com 的问题。留空则走直连。")
+            .setView(input)
+            .setPositiveButton("保存") { _, _ ->
+                playerPrefs.edit { putString("download_proxy", input.text.toString().trim()) }
+                Toast.makeText(this, "已保存", Toast.LENGTH_SHORT).show()
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    /**
+     * 拼接最终下载地址：若配置了代理前缀（如 https://ghproxy.com/），
+     * 则在 GitHub 直链前拼接，以绕过大陆对 github.com 下载的不稳定访问。
+     */
+    private fun buildDownloadUrl(apkUrl: String): Uri {
+        val prefix = downloadProxyPrefix()
+        val url = if (prefix.isEmpty()) apkUrl else {
+            val p = if (prefix.endsWith("/")) prefix else "$prefix/"
+            p + apkUrl
+        }
+        return Uri.parse(url)
+    }
+
     /** 用系统 DownloadManager 把更新包下载到应用专属目录（无需存储权限，通知栏自带进度） */
     private fun downloadApk(release: UpdateChecker.Release) {
         val fileName = "player-v${release.version}-release.apk"
@@ -993,7 +1028,7 @@ class MainActivity : AppCompatActivity() {
         }
         // 清掉旧的同名包，避免 DownloadManager 因目标文件已存在而拒绝覆盖
         File(dir, fileName).delete()
-        val request = DownloadManager.Request(release.apkUrl.toUri())
+        val request = DownloadManager.Request(buildDownloadUrl(release.apkUrl))
             .setTitle("影音盒 v${release.version}")
             .setDescription("正在下载更新包")
             .setMimeType("application/vnd.android.package-archive")
@@ -1094,12 +1129,18 @@ class MainActivity : AppCompatActivity() {
         binding.btnMore.setOnClickListener { anchor ->
             val popup = PopupMenu(this, anchor)
             popup.menu.add(0, MENU_ID_CHECK_UPDATE, 0, R.string.check_update)
+            popup.menu.add(0, MENU_ID_PROXY_SETTINGS, 0, R.string.download_proxy_settings)
             popup.setOnMenuItemClickListener { item ->
-                if (item.itemId == MENU_ID_CHECK_UPDATE) {
-                    checkForUpdate(manual = true)
-                    true
-                } else {
-                    false
+                when (item.itemId) {
+                    MENU_ID_CHECK_UPDATE -> {
+                        checkForUpdate(manual = true)
+                        true
+                    }
+                    MENU_ID_PROXY_SETTINGS -> {
+                        showDownloadProxyDialog()
+                        true
+                    }
+                    else -> false
                 }
             }
             popup.show()

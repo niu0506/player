@@ -1,0 +1,5 @@
+{
+  "version": "1.2.1",
+  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.2.1/player-v1.2.1-release.apk",
+  "notes": "修复：补充 INTERNET 权限与 jsDelivr 加速，解决大陆检查更新失败的问题。"
+}
