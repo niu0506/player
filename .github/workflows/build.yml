@@ -64,7 +64,11 @@ jobs:
           name: release-apk
           path: apk
 
+      - name: Extract release notes
+        run: jq -r '.notes' version.json > release-notes.txt
+
       - name: Create Release
         uses: softprops/action-gh-release@v3
         with:
+          body_path: release-notes.txt
           files: apk/player-*-release.apk

@@ -21,6 +21,12 @@ class UpdateChecker {
     /** 一次 Release 检查结果：版本号 + APK 直链 + 更新说明 */
     data class Release(val version: String, val apkUrl: String, val notes: String)
 
+    /**
+     * 从 JSONObject 取字符串：JSON null / 缺失 / 非字符串一律返回空串。
+     * 避免 [JSONObject.optString] 把 JSON null 变成字面量 "null"，导致界面显示 "null"。
+     */
+    private fun JSONObject.text(key: String): String = (opt(key) as? String).orEmpty()
+
     /** 请求远端最新版本信息；失败/解析不到时返回 null */
     fun checkLatest(): Release? {
         // GitHub API 为唯一权威来源（Releases 里才是真正已发布、可下载的 APK）
@@ -55,24 +61,24 @@ class UpdateChecker {
             ?: return null
         // 解析时把 version.json 的字段与 GitHub API 的字段都兼容掉
         val obj = JSONObject(body)
-        val version = obj.optString("version").ifBlank {
-            obj.optString("tag_name").removePrefix("v").removePrefix("V")
+        val version = text("version").ifBlank {
+            text("tag_name").removePrefix("v").removePrefix("V")
         }.trim().removePrefix("v").removePrefix("V").ifBlank { return null }
-        val apkUrl = obj.optString("apkUrl").ifBlank {
+        val apkUrl = text("apkUrl").ifBlank {
             findApkUrl(obj.optJSONArray("assets"))
         }.ifBlank { return null }
-        val notes = obj.optString("notes").ifBlank { obj.optString("body") }
+        val notes = text("notes").ifBlank { text("body") }
         return Release(version, apkUrl, notes)
     }
 
     /** 解析 version.json 的固定字段 */
     private fun parseVersionJson(body: String): Release? = try {
         val obj = JSONObject(body)
-        val version = obj.optString("version").trim()
+        val version = text("version").trim()
             .removePrefix("v").removePrefix("V").trim()
-        val apkUrl = obj.optString("apkUrl").trim()
+        val apkUrl = text("apkUrl").trim()
         if (version.isEmpty() || apkUrl.isEmpty()) null
-        else Release(version, apkUrl, obj.optString("notes"))
+        else Release(version, apkUrl, text("notes"))
     } catch (_: Exception) {
         null
     }
@@ -82,8 +88,8 @@ class UpdateChecker {
         if (assets == null) return ""
         for (i in 0 until assets.length()) {
             val asset = assets.optJSONObject(i) ?: continue
-            if (asset.optString("name").endsWith(".apk", ignoreCase = true)) {
-                return asset.optString("browser_download_url")
+            if (asset.text("name").endsWith(".apk", ignoreCase = true)) {
+                return asset.text("browser_download_url")
             }
         }
         return ""
