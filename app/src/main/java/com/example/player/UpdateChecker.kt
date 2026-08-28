@@ -9,9 +9,8 @@ import java.net.URL
  * 应用内更新检查器。
  *
  * 数据源（按优先级依次尝试，任一成功即返回）：
- * 1. jsDelivr + 最新提交 hash 的 version.json —— 发版即时生效，且大陆可达性较好
- * 2. jsDelivr @main 分支的 version.json —— 可能有最长约 12 小时的 CDN 缓存
- * 3. GitHub 官方 Releases API —— 原实现，作为最后兜底
+ * 1. GitHub 官方 Releases API —— 数据始终最新，不经过任何 CDN 缓存
+ * 2. jsDelivr @main 分支的 version.json —— 兜底，大陆可达性较好，但可能有最长约 12 小时的 CDN 缓存
  *
  * version.json 结构：{ "version": "1.2.1", "apkUrl": "<GitHub 直链>", "notes": "..." }
  *
@@ -24,14 +23,10 @@ class UpdateChecker {
 
     /** 请求远端最新版本信息；失败/解析不到时返回 null */
     fun checkLatest(): Release? {
-        // 1) 先取 jsDelivr 上的最新提交 hash，请求带 hash 的 URL，避免 @main 的长缓存
-        getLatestCommitHash()?.let { hash ->
-            fetchVersionJson("$JS_CDN@$hash/version.json")?.let { return it }
-        }
-        // 2) 直接请求 @main 分支的 version.json（可能有缓存延迟）
-        fetchVersionJson("$JS_CDN@main/version.json")?.let { return it }
-        // 3) 兜底：GitHub 官方 API
-        return fetchFromGitHubApi()
+        // GitHub API 为唯一权威来源（Releases 里才是真正已发布、可下载的 APK）
+        fetchFromGitHubApi()?.let { return it }
+        // 兜底：jsDelivr @main 的 version.json（大陆可达性好，但受 CDN 缓存影响）
+        return fetchVersionJson("$JS_CDN@main/version.json")
     }
 
     /** 发起 GET 请求并返回响应体字符串；非 200 或异常时返回 null */
@@ -50,21 +45,11 @@ class UpdateChecker {
         }
     }
 
-    /** 从 data.jsdelivr.com 获取当前 main 分支的最新提交 hash；失败返回 null */
-    private fun getLatestCommitHash(): String? =
-        httpGet(JS_LATEST_COMMIT)?.let { body ->
-            try {
-                JSONObject(body).optString("default").takeIf { it.isNotBlank() }
-            } catch (_: Exception) {
-                null
-            }
-        }
-
     /** 请求 jsDelivr 上的 version.json 并解析；失败返回 null */
     private fun fetchVersionJson(url: String): Release? =
         httpGet(url)?.let { parseVersionJson(it) }
 
-    /** 兜底：GitHub Releases latest 接口 */
+    /** 优先来源：GitHub Releases latest 接口 */
     private fun fetchFromGitHubApi(): Release? {
         val body = httpGet(GITHUB_API_LATEST, "Accept" to "application/vnd.github+json")
             ?: return null
@@ -106,7 +91,6 @@ class UpdateChecker {
 
     companion object {
         private const val JS_CDN = "https://cdn.jsdelivr.net/gh/niu0506/player"
-        private const val JS_LATEST_COMMIT = "https://data.jsdelivr.com/v1/package/gh/niu0506/player@main"
         private const val GITHUB_API_LATEST = "https://api.github.com/repos/niu0506/player/releases/latest"
         private const val CONNECT_TIMEOUT_MS = 10_000
         private const val READ_TIMEOUT_MS = 20_000
