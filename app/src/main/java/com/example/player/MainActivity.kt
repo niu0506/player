@@ -142,17 +142,61 @@ class MainActivity : AppCompatActivity() {
     private var lastDownloadId = -1L
     /** 等待用户授予「安装未知应用」权限后再安装的 APK 文件 */
     private var pendingInstallFile: File? = null
+    /** 本次要写入的 APK 目标文件（换源重试时复用同一路径） */
+    private var pendingDownloadFile: File? = null
+    /** 本次下载的版本号，用于通知栏标题 */
+    private var pendingDownloadVersion = ""
+    /** 剩余待尝试的下载源队列（CDN 加速在前，GitHub 直连兜底） */
+    private var pendingDownloadUrls: ArrayDeque<String> = ArrayDeque()
 
-    /** 下载完成监听：更新包下载成功后自动调起系统安装器 */
+    /** 下载完成监听：成功则调起系统安装器；失败且有备用下载源则换源重试 */
     private val downloadCompleteReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             if (intent.action != DownloadManager.ACTION_DOWNLOAD_COMPLETE) return
             val id = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1L)
             if (id != lastDownloadId) return
+            // 失败：换下一个源（CDN→…→GitHub 直连）重试
+            if (queryDownloadStatus(id) == DownloadManager.STATUS_FAILED) {
+                val next = pendingDownloadUrls.removeFirstOrNull()
+                if (next != null) {
+                    enqueueDownload(next)
+                    return
+                }
+                Toast.makeText(context, "下载失败，请手动下载安装", Toast.LENGTH_SHORT).show()
+                return
+            }
             val file = downloadedApkFile() ?: return
             installApk(file)
         }
     }
+
+    /** 查询某次下载的系统状态；查询失败按失败处理 */
+    private fun queryDownloadStatus(id: Long): Int {
+        val cursor = try {
+            downloadManager.query(DownloadManager.Query().setFilterById(id))
+        } catch (_: Exception) {
+            return DownloadManager.STATUS_FAILED
+        } ?: return DownloadManager.STATUS_FAILED
+        return try {
+            if (cursor.moveToFirst()) {
+                cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS))
+            } else DownloadManager.STATUS_FAILED
+        } finally {
+            cursor.close()
+        }
+    }
+
+    /**
+     * 本次更新包可用下载源：CDN 加速代理在前，GitHub 直连兜底。
+     * 仅用于下载安装包；版本检查永远走 GitHub API（一步到位、无 CDN 缓存干扰）。
+     */
+    private val downloadAccelerators = listOf(
+        "https://gh-proxy.com/",
+        "https://ghproxy.net/",
+        "https://mirror.ghproxy.com/",
+    )
+    private val downloadSources: List<String> =
+        downloadAccelerators.map { it.trimEnd('/') + "/" } + "" // 末尾空串 = 直连
 
     /**
      * 规整化 Uri 字符串，作为去重/匹配的稳定 key。
@@ -989,24 +1033,35 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
-    /** 用系统 DownloadManager 把更新包下载到应用专属目录（无需存储权限，通知栏自带进度） */
+    /** 用系统 DownloadManager 把更新包下载到应用专属目录；CDN 加速，失败自动换源 */
     private fun downloadApk(release: UpdateChecker.Release) {
-        val fileName = "player-v${release.version}-release.apk"
         val dir = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
         if (dir == null) {
             Toast.makeText(this, "存储不可用，下载失败", Toast.LENGTH_SHORT).show()
             return
         }
+        pendingDownloadFile = File(dir, "player-v${release.version}-release.apk")
+        pendingDownloadVersion = release.version
+        // CDN 加速在前，GitHub 直连兜底
+        pendingDownloadUrls = ArrayDeque(
+            downloadSources.map { prefix -> prefix + release.apkUrl }
+        )
+        enqueueDownload(pendingDownloadUrls.removeFirst())
+        Toast.makeText(this, "开始下载，完成后自动弹出安装", Toast.LENGTH_SHORT).show()
+    }
+
+    /** 用 DownManager 发起一次下载（每次下载前清掉旧文件，避免目标已存在被拒） */
+    private fun enqueueDownload(url: String) {
+        val file = pendingDownloadFile ?: return
         // 清掉旧的同名包，避免 DownloadManager 因目标文件已存在而拒绝覆盖
-        File(dir, fileName).delete()
-        val request = DownloadManager.Request(release.apkUrl.toUri())
-            .setTitle("影音盒 v${release.version}")
+        file.delete()
+        val request = DownloadManager.Request(url.toUri())
+            .setTitle("影音盒 v$pendingDownloadVersion")
             .setDescription("正在下载更新包")
             .setMimeType("application/vnd.android.package-archive")
-            .setDestinationInExternalFilesDir(this, Environment.DIRECTORY_DOWNLOADS, fileName)
+            .setDestinationInExternalFilesDir(this, Environment.DIRECTORY_DOWNLOADS, file.name)
             .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
         lastDownloadId = downloadManager.enqueue(request)
-        Toast.makeText(this, "开始下载，完成后自动弹出安装", Toast.LENGTH_SHORT).show()
     }
 
     /** 取回刚下载完成的更新包文件（应用专属下载目录里最新的 .apk） */

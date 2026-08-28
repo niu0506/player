@@ -1,5 +1,5 @@
 {
-  "version": "1.2.5",
-  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.2.5/player-v1.2.5-release.apk",
-  "notes": "修复：更新检查改为优先使用 GitHub Releases API，不再被 jsDelivr 的 CDN 旧缓存卡住导致每次提示已是最新版本。"
+  "version": "1.2.6",
+  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.2.6/player-v1.2.6-release.apk",
+  "notes": "优化：更新包下载改用 CDN 加速（gh-proxy 等），失败自动换源并回退 GitHub 直连；版本检查仍走 GitHub API。"
 }
