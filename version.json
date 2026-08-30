@@ -1,5 +1,5 @@
 {
-  "version": "1.2.10",
-  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.2.10/player-v1.2.10-release.apk",
-  "notes": "更新包改存到手机公共下载目录（可在系统「下载」中查看），并在安装成功后自动清理；修复更新说明显示为 null 的问题。"
+  "version": "1.2.11",
+  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.2.11/player-v1.2.11-release.apk",
+  "notes": "修复进度落盘时同步/异步不一致的问题（需保证写盘的场景真正同步），并补充进度合并、版本比较、时长格式化的单元测试。"
 }

@@ -223,7 +223,7 @@ class PlayerService : MediaSessionService() {
         // 读出磁盘进度 → 剔除待删除项 → 合并本次进度(仅>0)，保证不覆盖非零旧值
         val merged = mergeProgress(prefs, progress, removedUris)
         val editor = prefs.edit().putString("progress", writeProgressMap(merged))
-        if (sync) editor.apply() else editor.apply()
+        if (sync) editor.commit() else editor.apply()
         // commit() 同步落盘返回后再清理，保证 onTaskRemoved/onDestroy 时「播完清理」记录不会丢失
         removedUris.clear()
         lastPersistedSnapshot = progress
@@ -320,8 +320,20 @@ private fun mergeProgress(
     prefs: SharedPreferences,
     writes: Map<String, Long>,
     removes: Set<String>
+): Map<String, Long> =
+    mergeProgressMap(PlayerService.readProgressMap(prefs), writes, removes)
+
+/**
+ * 进度合并纯函数：在磁盘已有进度 [disk] 上，先剔除 [removes] 中的条目，再合并 [writes](仅 >0)。
+ * 与 [PlayerService.writeToDisk] 共用同一「合并非覆盖 + 0 值不覆盖」语义；
+ * 与 SharedPreferences 解耦，便于单元测试。
+ */
+internal fun mergeProgressMap(
+    disk: Map<String, Long>,
+    writes: Map<String, Long>,
+    removes: Set<String>
 ): Map<String, Long> {
-    val merged = PlayerService.readProgressMap(prefs).toMutableMap()
+    val merged = disk.toMutableMap()
     for (uri in removes) merged.remove(uri)
     for ((k, v) in writes) {
         if (v > 0) merged[k] = v

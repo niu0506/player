@@ -25,8 +25,8 @@ android {
         applicationId = "com.example.player"
         minSdk = 24
         targetSdk = 35
-        versionCode = 14
-        versionName = "1.2.10"
+        versionCode = 15
+        versionName = "1.2.11"
     }
 
     signingConfigs {
@@ -56,6 +56,10 @@ android {
         }
     }
     buildFeatures { viewBinding = true }
+    testOptions {
+        // 本地单测中 formatTime 等使用 android.util.LruCache；缺失时返回默认值而非抛异常，便于测试纯逻辑
+        unitTests.isReturnDefaultValues = true
+    }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
@@ -70,4 +74,5 @@ dependencies {
     implementation("androidx.recyclerview:recyclerview:1.3.2")
     implementation("androidx.activity:activity-ktx:1.9.3")
     implementation("com.google.android.material:material:1.12.0")
+    testImplementation("junit:junit:4.13.2")
 }
