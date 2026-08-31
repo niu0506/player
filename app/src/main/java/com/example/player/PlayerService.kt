@@ -233,10 +233,10 @@ class PlayerService : MediaSessionService() {
         progressJsonCache = json to merged
     }
 
-    /** 内存不足时立即落盘，避免进度丢失 */
+    /** 内存不足时立即落盘，避免进度丢失（commit 同步写：进程可能随后被杀，apply 的排队写会丢） */
     override fun onTrimMemory(level: Int) {
         super.onTrimMemory(level)
-        persistProgress()
+        persistProgress(sync = true)
     }
 
     override fun onDestroy() {
@@ -287,11 +287,12 @@ class PlayerService : MediaSessionService() {
         @Volatile
         private var progressJsonCache: Pair<String, Map<String, Long>>? = null
 
-        /** 从 SharedPreferences 读出《uri -> 播放进度毫秒》映射（带解析缓存） */
+        /** 从 SharedPreferences 读出《uri -> 播放进度毫秒》映射（带解析缓存）。
+         *  返回缓存的快照副本：调用方持有/修改返回值不会污染缓存内部实例。 */
         fun readProgressMap(prefs: SharedPreferences): Map<String, Long> {
             val json = prefs.getString("progress", null) ?: return emptyMap()
             progressJsonCache?.let { (cachedJson, cachedMap) ->
-                if (cachedJson == json) return cachedMap
+                if (cachedJson == json) return cachedMap.toMap()
             }
             val map = mutableMapOf<String, Long>()
             try {
@@ -302,7 +303,7 @@ class PlayerService : MediaSessionService() {
             } catch (_: Exception) {
             }
             progressJsonCache = json to map
-            return map
+            return map.toMap()
         }
 
         /** 把进度映射序列化为 JSON 字符串以便存储 */

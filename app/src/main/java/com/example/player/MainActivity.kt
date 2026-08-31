@@ -52,8 +52,13 @@ import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.TrackSelectionDialogBuilder
 import androidx.recyclerview.widget.LinearLayoutManager
 import com.example.player.databinding.ActivityMainBinding
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -86,6 +91,14 @@ class MainActivity : AppCompatActivity() {
     private var controller: MediaController? = null
     /** 进度/列表等数据存储的 SharedPreferences，懒加载复用 */
     private val playerPrefs by lazy { getSharedPreferences("player", MODE_PRIVATE) }
+    /**
+     * 磁盘写专用作用域 + 互斥锁：串行化 playlist / progress 的落盘协程。
+     * 多次保存（删除条目、扫描、对账）可能背靠背触发，若各自在多线程 IO 池并发执行，
+     * 旧快照可能后写覆盖新快照，导致已删条目/进度在磁盘「复活」；
+     * Mutex 为公平锁（按挂起先后授予），保证写盘顺序与启动顺序一致。
+     */
+    private val diskWriteScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val diskWriteMutex = Mutex()
     /** 当前正在播放的列表项下标，-1 表示无 */
     private var currentIndex = -1
     /** 标记播放列表是否已从磁盘加载过（防止重复加载） */
@@ -443,19 +456,21 @@ class MainActivity : AppCompatActivity() {
     private fun savePlaylist() {
         val itemsSnapshot = playlist.toList()
         val progressSnapshot = cachedProgress.toMap()
-        lifecycleScope.launch(Dispatchers.IO) {
-            // 先把内存进度按与 Service 一致的「合并非覆盖」语义落盘，统一两侧来源，避免互相覆盖
-            PlayerService.writeProgressBatch(playerPrefs, progressSnapshot)
-            val arr = JSONArray()
-            for (item in itemsSnapshot) {
-                val obj = JSONObject()
-                obj.put("uri", item.uri.toString())
-                obj.put("name", item.name)
-                obj.put("duration", item.duration)
-                arr.put(obj)
-            }
-            playerPrefs.edit {
-                putString("playlist", arr.toString())
+        diskWriteScope.launch {
+            diskWriteMutex.withLock {
+                // 先把内存进度按与 Service 一致的「合并非覆盖」语义落盘，统一两侧来源，避免互相覆盖
+                PlayerService.writeProgressBatch(playerPrefs, progressSnapshot)
+                val arr = JSONArray()
+                for (item in itemsSnapshot) {
+                    val obj = JSONObject()
+                    obj.put("uri", item.uri.toString())
+                    obj.put("name", item.name)
+                    obj.put("duration", item.duration)
+                    arr.put(obj)
+                }
+                playerPrefs.edit {
+                    putString("playlist", arr.toString())
+                }
             }
         }
     }
@@ -543,9 +558,11 @@ class MainActivity : AppCompatActivity() {
         val key = uri.toString()
         cachedProgress.remove(key)
         PlayerService.dropProgress(key)
-        lifecycleScope.launch(Dispatchers.IO) {
-            // 复用统一的合并写入口（removes 语义），与 Service 的删除规则保持一致
-            PlayerService.writeProgressBatch(playerPrefs, emptyMap(), setOf(key))
+        diskWriteScope.launch {
+            diskWriteMutex.withLock {
+                // 复用统一的合并写入口（removes 语义），与 Service 的删除规则保持一致
+                PlayerService.writeProgressBatch(playerPrefs, emptyMap(), setOf(key))
+            }
         }
     }
 
@@ -1346,6 +1363,8 @@ class MainActivity : AppCompatActivity() {
             unregisterReceiver(packageReplacedReceiver)
         } catch (_: Exception) {
         }
+        // 取消磁盘写调度器，避免泄漏
+        diskWriteScope.cancel()
         super.onDestroy()
     }
 

@@ -1,5 +1,5 @@
 {
-  "version": "1.2.12",
-  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.2.12/player-v1.2.12-release.apk",
-  "notes": "优化大列表下的流畅度：进度读取增加解析缓存（切歌续播、周期落盘不再全量解析 JSON），列表保存与进度删除移至后台线程；CI 在无签名密钥时自动回退无签名构建，PR 也能正常跑通。"
+  "version": "1.2.13",
+  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.2.13/player-v1.2.13-release.apk",
+  "notes": "稳定性修复：播放列表与进度的磁盘写入加互斥锁串行化，消除快速删除条目时旧快照后写覆盖新快照导致条目「复活」的竞态；进度解析缓存改为返回只读副本，防止调用方意外污染缓存；系统内存不足时改为同步落盘，与任务移除/销毁路径保持一致。"
 }
