@@ -437,22 +437,26 @@ class MainActivity : AppCompatActivity() {
         return ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
     }
 
-    /** 把当前播放列表序列化为 JSON 存到 SharedPreferences（进度存于独立的 "progress" 映射） */
+    /** 把当前播放列表序列化为 JSON 存到 SharedPreferences（进度存于独立的 "progress" 映射）。
+     *  序列化与合并写盘都在 IO 线程执行，避免大列表在主线程做 JSON 全量读写。
+     *  先在主线程对 playlist 做快照，防止 IO 侧遍历期间列表被交互修改。 */
     private fun savePlaylist() {
-        // 先把内存进度按与 Service 一致的「合并非覆盖」语义落盘，统一两侧来源，避免互相覆盖
-        PlayerService.writeProgressBatch(
-            playerPrefs, cachedProgress.toMap()
-        )
-        val arr = JSONArray()
-        for (item in playlist) {
-            val obj = JSONObject()
-            obj.put("uri", item.uri.toString())
-            obj.put("name", item.name)
-            obj.put("duration", item.duration)
-            arr.put(obj)
-        }
-        playerPrefs.edit {
-            putString("playlist", arr.toString())
+        val itemsSnapshot = playlist.toList()
+        val progressSnapshot = cachedProgress.toMap()
+        lifecycleScope.launch(Dispatchers.IO) {
+            // 先把内存进度按与 Service 一致的「合并非覆盖」语义落盘，统一两侧来源，避免互相覆盖
+            PlayerService.writeProgressBatch(playerPrefs, progressSnapshot)
+            val arr = JSONArray()
+            for (item in itemsSnapshot) {
+                val obj = JSONObject()
+                obj.put("uri", item.uri.toString())
+                obj.put("name", item.name)
+                obj.put("duration", item.duration)
+                arr.put(obj)
+            }
+            playerPrefs.edit {
+                putString("playlist", arr.toString())
+            }
         }
     }
 
@@ -534,15 +538,14 @@ class MainActivity : AppCompatActivity() {
         adapter.updateProgress(index, position)
     }
 
-    /** 彻底清除某个 uri 的进度：内存缓存、磁盘映射、SharedPreferences 三处一致删除 */
+    /** 彻底清除某个 uri 的进度：内存缓存、Service 缓存、磁盘映射三处一致删除（磁盘写入走 IO 线程） */
     private fun clearProgress(uri: Uri) {
-        cachedProgress.remove(uri.toString())
-        PlayerService.dropProgress(uri.toString())
-        val prefs = playerPrefs
-        val map = PlayerService.readProgressMap(prefs).toMutableMap()
-        map.remove(uri.toString())
-        prefs.edit {
-            putString("progress", PlayerService.writeProgressMap(map))
+        val key = uri.toString()
+        cachedProgress.remove(key)
+        PlayerService.dropProgress(key)
+        lifecycleScope.launch(Dispatchers.IO) {
+            // 复用统一的合并写入口（removes 语义），与 Service 的删除规则保持一致
+            PlayerService.writeProgressBatch(playerPrefs, emptyMap(), setOf(key))
         }
     }
 

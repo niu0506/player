@@ -222,11 +222,15 @@ class PlayerService : MediaSessionService() {
         val prefs = playerPrefs
         // 读出磁盘进度 → 剔除待删除项 → 合并本次进度(仅>0)，保证不覆盖非零旧值
         val merged = mergeProgress(prefs, progress, removedUris)
-        val editor = prefs.edit().putString("progress", writeProgressMap(merged))
-        if (sync) editor.commit() else editor.apply()
+        val json = writeProgressMap(merged)
+        // sync=true 同步写完才返回（onTaskRemoved/onDestroy 需保证写盘）；
+        // sync=false 异步落盘（周期上报等高频场景不阻塞主线程）
+        prefs.edit(commit = sync) { putString("progress", json) }
         // commit() 同步落盘返回后再清理，保证 onTaskRemoved/onDestroy 时「播完清理」记录不会丢失
         removedUris.clear()
         lastPersistedSnapshot = progress
+        // 写入后立即登记解析缓存，后续读取直接命中，无需重新解析
+        progressJsonCache = json to merged
     }
 
     /** 内存不足时立即落盘，避免进度丢失 */
@@ -274,9 +278,21 @@ class PlayerService : MediaSessionService() {
             svc.persistProgress(sync = true)
         }
 
-        /** 从 SharedPreferences 读出《uri -> 播放进度毫秒》映射 */
+        /**
+         * 解析结果缓存（key 为磁盘上的原始 JSON 字符串）。
+         * 磁盘内容未变化时直接命中缓存，免去全量重新解析；内容变化后自动失效重解析。
+         * 高频调用点（每次 media item transition 的续播查询、Service 2 秒周期合并读）
+         * 因此从「每次全量解析」变为「几乎零成本命中」。
+         */
+        @Volatile
+        private var progressJsonCache: Pair<String, Map<String, Long>>? = null
+
+        /** 从 SharedPreferences 读出《uri -> 播放进度毫秒》映射（带解析缓存） */
         fun readProgressMap(prefs: SharedPreferences): Map<String, Long> {
             val json = prefs.getString("progress", null) ?: return emptyMap()
+            progressJsonCache?.let { (cachedJson, cachedMap) ->
+                if (cachedJson == json) return cachedMap
+            }
             val map = mutableMapOf<String, Long>()
             try {
                 val obj = JSONObject(json)
@@ -285,6 +301,7 @@ class PlayerService : MediaSessionService() {
                 }
             } catch (_: Exception) {
             }
+            progressJsonCache = json to map
             return map
         }
 
@@ -307,7 +324,11 @@ class PlayerService : MediaSessionService() {
             writes: Map<String, Long>,
             removes: Set<String> = emptySet()
         ) {
-            prefs.edit { putString("progress", writeProgressMap(mergeProgress(prefs, writes, removes))) }
+            val merged = mergeProgress(prefs, writes, removes)
+            val json = writeProgressMap(merged)
+            prefs.edit { putString("progress", json) }
+            // 写入后同步登记解析缓存，保持读侧缓存新鲜
+            progressJsonCache = json to merged
         }
     }
 }
