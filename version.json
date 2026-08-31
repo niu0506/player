@@ -1,5 +1,5 @@
 {
-  "version": "1.2.11",
-  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.2.11/player-v1.2.11-release.apk",
-  "notes": "修复退出应用时进度可能丢失的问题（关键场景改为同步落盘）；优化大列表下的性能（进度解析缓存、写盘移出主线程）；CI 无密钥时回退无签名构建；补充进度合并、版本比较、时长格式化的单元测试。"
+  "version": "1.2.12",
+  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.2.12/player-v1.2.12-release.apk",
+  "notes": "优化大列表下的流畅度：进度读取增加解析缓存（切歌续播、周期落盘不再全量解析 JSON），列表保存与进度删除移至后台线程；CI 在无签名密钥时自动回退无签名构建，PR 也能正常跑通。"
 }
