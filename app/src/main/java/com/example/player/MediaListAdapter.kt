@@ -77,14 +77,19 @@ class MediaListAdapter(
 
     /**
      * 设置当前正在播放的列表项。
-     * 只通知「旧项」与「新项」两个位置刷新，避免表刷新。
+     * 只通知「旧项」与「新项」两个位置刷新，避免全表刷新。
+     *
+     * 调用方传入的下标来自 ExoPlayer 队列，而 [items] 经 submitList 异步 diff 后才回写，
+     * 存在「队列已同步、items 未跟上」的窗口（如 Activity 重连时 items 尚为空、
+     * 扫描新增后 diff 未完成），因此与 updateDuration/updateProgress 一律做双向边界检查，
+     * 越界时仅记录状态，待下次 diff dispatch 或状态调用时自然刷新。
      */
     fun setCurrentPlaying(index: Int, playing: Boolean = false) {
         val old = currentPlayingIndex
         currentPlayingIndex = index
         isPlaying = playing
-        if (old >= 0) notifyItemChanged(old)
-        if (index >= 0) notifyItemChanged(index)
+        if (old in items.indices) notifyItemChanged(old)
+        if (index in items.indices) notifyItemChanged(index)
     }
 
     /** 更新某个列表项的时长（仅当原先未知时为 0 时写入），并刷新该项 */

@@ -25,8 +25,8 @@ android {
         applicationId = "com.example.player"
         minSdk = 24
         targetSdk = 35
-        versionCode = 17
-        versionName = "1.2.13"
+        versionCode = 18
+        versionName = "1.2.14"
     }
 
     signingConfigs {
@@ -75,4 +75,7 @@ dependencies {
     implementation("androidx.activity:activity-ktx:1.9.3")
     implementation("com.google.android.material:material:1.12.0")
     testImplementation("junit:junit:4.13.2")
+    // 本地单测中 android.jar 的 org.json 是空 stub（方法全部返回默认值），
+    // PlayerService 进度落盘用真实 JSON 序列化，测试需要引入真实现
+    testImplementation("org.json:json:20240303")
 }

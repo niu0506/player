@@ -220,17 +220,22 @@ class PlayerService : MediaSessionService() {
      */
     private fun writeToDisk(progress: Map<String, Long>, sync: Boolean = true) {
         val prefs = playerPrefs
-        // 读出磁盘进度 → 剔除待删除项 → 合并本次进度(仅>0)，保证不覆盖非零旧值
-        val merged = mergeProgress(prefs, progress, removedUris)
-        val json = writeProgressMap(merged)
-        // sync=true 同步写完才返回（onTaskRemoved/onDestroy 需保证写盘）；
-        // sync=false 异步落盘（周期上报等高频场景不阻塞主线程）
-        prefs.edit(commit = sync) { putString("progress", json) }
+        // 与 writeProgressBatch（Activity IO 线程）共用一把锁：
+        // 「读盘→合并→写盘」必须原子完成，否则两侧并发合并会互相丢更新
+        // （丢 removes 时已删进度「复活」，丢 writes 时新进度被旧快照覆盖）
+        synchronized(progressPrefsLock) {
+            // 读出磁盘进度 → 剔除待删除项 → 合并本次进度(仅>0)，保证不覆盖非零旧值
+            val merged = mergeProgress(prefs, progress, removedUris)
+            val json = writeProgressMap(merged)
+            // sync=true 同步写完才返回（onTaskRemoved/onDestroy 需保证写盘）；
+            // sync=false 异步落盘（周期上报等高频场景不阻塞主线程）
+            prefs.edit(commit = sync) { putString("progress", json) }
+            lastPersistedSnapshot = progress
+            // 写入后立即登记解析缓存，后续读取直接命中，无需重新解析
+            progressJsonCache = json to merged
+        }
         // commit() 同步落盘返回后再清理，保证 onTaskRemoved/onDestroy 时「播完清理」记录不会丢失
         removedUris.clear()
-        lastPersistedSnapshot = progress
-        // 写入后立即登记解析缓存，后续读取直接命中，无需重新解析
-        progressJsonCache = json to merged
     }
 
     /** 内存不足时立即落盘，避免进度丢失（commit 同步写：进程可能随后被杀，apply 的排队写会丢） */
@@ -257,6 +262,15 @@ class PlayerService : MediaSessionService() {
         /** 当前存活的 Service 实例，供静态方法直接操作其内存缓存 */
         @Volatile
         private var instance: PlayerService? = null
+
+        /**
+         * 进度「读盘→合并→写盘」的统一互斥锁。
+         * writeToDisk（Service 主线程）与 writeProgressBatch（Activity IO 线程）
+         * 各自的合并逻辑都不是原子的：不加锁时两侧并发「读-合并-写」会互相丢更新
+         * （丢 removes 时已删进度「复活」、丢 writes 时新进度被旧快照覆盖）。
+         * 临界区仅包含内存合并 + 一次 prefs 写，耗时极短，无死锁风险。
+         */
+        private val progressPrefsLock = Any()
 
         /** 供外部（MainActivity）请求删除某个 uri 的进度记录 */
         fun dropProgress(uri: String) {
@@ -325,11 +339,14 @@ class PlayerService : MediaSessionService() {
             writes: Map<String, Long>,
             removes: Set<String> = emptySet()
         ) {
-            val merged = mergeProgress(prefs, writes, removes)
-            val json = writeProgressMap(merged)
-            prefs.edit { putString("progress", json) }
-            // 写入后同步登记解析缓存，保持读侧缓存新鲜
-            progressJsonCache = json to merged
+            // 与 writeToDisk 共用一把锁，保证「读盘→合并→写盘」整体原子（见 progressPrefsLock 注释）
+            synchronized(progressPrefsLock) {
+                val merged = mergeProgress(prefs, writes, removes)
+                val json = writeProgressMap(merged)
+                prefs.edit { putString("progress", json) }
+                // 写入后同步登记解析缓存，保持读侧缓存新鲜
+                progressJsonCache = json to merged
+            }
         }
     }
 }
