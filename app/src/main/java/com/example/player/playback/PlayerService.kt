@@ -1,11 +1,11 @@
-package com.example.player
+package com.example.player.playback
 
 import android.content.Intent
-import android.content.SharedPreferences
 import android.os.Handler
 import android.os.Looper
 import androidx.annotation.OptIn
-import androidx.core.content.edit
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeoutOrNull
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
@@ -15,7 +15,8 @@ import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
-import org.json.JSONObject
+import com.example.player.data.PlayerRepository
+import kotlin.time.Duration.Companion.milliseconds
 
 /**
  * 后台播放媒体服务。
@@ -53,8 +54,6 @@ class PlayerService : MediaSessionService() {
      * 下标跟踪会悬空，导致误删/漏删其它条目的进度。
      */
     private var lastPlayedUri: String? = null
-    /** 进度/列表等数据存储的 SharedPreferences，懒加载复用 */
-    private val playerPrefs by lazy { getSharedPreferences("player", MODE_PRIVATE) }
 
     /** 播放器事件监听：处理进度清理、落盘与「上一播放项」记录 */
     private val playerEventListener = object : Player.Listener {
@@ -79,11 +78,7 @@ class PlayerService : MediaSessionService() {
                 }
             }
             lastPlayedUri = mediaItem?.localConfiguration?.uri?.toString()
-            if (lastPlayedUri != null) {
-                playerPrefs.edit {
-                    putString("lastItem", lastPlayedUri)
-                }
-            }
+            lastPlayedUri?.let { PlayerRepository.setLastItem(it) }
             persistProgress()
         }
 
@@ -207,35 +202,27 @@ class PlayerService : MediaSessionService() {
     }
 
     /**
-     * 把进度写入 SharedPreferences。
+     * 把进度写入 Room 数据库（经 [PlayerRepository]）。
      *
-     * 这是进度落盘的唯一写入点（进度只存于 "progress" 这一份数据，playlist 不再携带
+     * 这是进度落盘的唯一写入点（进度只存于 "progress" 表这一份数据，playlist 不再携带
      * lastPosition 字段，避免「双份数据源」的重复解析/序列化开销）。
      *
-     * 注意这是「合并」逻辑而非「追加」逻辑：
+     * 语义为「合并」而非「追加」（由 mergeProgressMap 保证）：
      * - 先移除 [removedUris] 中记录（播放到末尾/被删除的项）
      * - 再写入进度，且只写入大于 0 的值（0 不得覆盖已有非零进度的硬约束）
      *
-     * @param sync true 用 commit 同步落盘（任务移除/销毁等需保证写盘的场景），false 用 apply 异步落盘
+     * @param sync true 阻塞等待落盘完成（任务移除/销毁等需保证写盘的场景），
+     * false 异步落盘（周期上报等高频场景不阻塞主线程）
      */
     private fun writeToDisk(progress: Map<String, Long>, sync: Boolean = true) {
-        val prefs = playerPrefs
-        // 与 writeProgressBatch（Activity IO 线程）共用一把锁：
-        // 「读盘→合并→写盘」必须原子完成，否则两侧并发合并会互相丢更新
-        // （丢 removes 时已删进度「复活」，丢 writes 时新进度被旧快照覆盖）
-        synchronized(progressPrefsLock) {
-            // 读出磁盘进度 → 剔除待删除项 → 合并本次进度(仅>0)，保证不覆盖非零旧值
-            val merged = mergeProgress(prefs, progress, removedUris)
-            val json = writeProgressMap(merged)
-            // sync=true 同步写完才返回（onTaskRemoved/onDestroy 需保证写盘）；
-            // sync=false 异步落盘（周期上报等高频场景不阻塞主线程）
-            prefs.edit(commit = sync) { putString("progress", json) }
-            lastPersistedSnapshot = progress
-            // 写入后立即登记解析缓存，后续读取直接命中，无需重新解析
-            progressJsonCache = json to merged
-        }
-        // commit() 同步落盘返回后再清理，保证 onTaskRemoved/onDestroy 时「播完清理」记录不会丢失
+        // 仓库同步捕获本次写入/删除集合并更新内存镜像，之后 clear 不会影响已提交内容
+        PlayerRepository.applyProgressUpdates(progress, removedUris)
         removedUris.clear()
+        lastPersistedSnapshot = progress
+        if (sync) {
+            // 阻塞等待已提交写任务落库（有 2 秒上限，等价于旧的 commit 同步写盘）
+            runBlocking { withTimeoutOrNull(2_000.milliseconds) { PlayerRepository.flush() } }
+        }
     }
 
     /** 内存不足时立即落盘，避免进度丢失（commit 同步写：进程可能随后被杀，apply 的排队写会丢） */
@@ -263,15 +250,6 @@ class PlayerService : MediaSessionService() {
         @Volatile
         private var instance: PlayerService? = null
 
-        /**
-         * 进度「读盘→合并→写盘」的统一互斥锁。
-         * writeToDisk（Service 主线程）与 writeProgressBatch（Activity IO 线程）
-         * 各自的合并逻辑都不是原子的：不加锁时两侧并发「读-合并-写」会互相丢更新
-         * （丢 removes 时已删进度「复活」、丢 writes 时新进度被旧快照覆盖）。
-         * 临界区仅包含内存合并 + 一次 prefs 写，耗时极短，无死锁风险。
-         */
-        private val progressPrefsLock = Any()
-
         /** 供外部（MainActivity）请求删除某个 uri 的进度记录 */
         fun dropProgress(uri: String) {
             val svc = instance ?: return
@@ -291,91 +269,5 @@ class PlayerService : MediaSessionService() {
             svc.cacheCurrentPosition(player)
             svc.persistProgress(sync = true)
         }
-
-        /**
-         * 解析结果缓存（key 为磁盘上的原始 JSON 字符串）。
-         * 磁盘内容未变化时直接命中缓存，免去全量重新解析；内容变化后自动失效重解析。
-         * 高频调用点（每次 media item transition 的续播查询、Service 2 秒周期合并读）
-         * 因此从「每次全量解析」变为「几乎零成本命中」。
-         */
-        @Volatile
-        private var progressJsonCache: Pair<String, Map<String, Long>>? = null
-
-        /** 从 SharedPreferences 读出《uri -> 播放进度毫秒》映射（带解析缓存）。
-         *  返回缓存的快照副本：调用方持有/修改返回值不会污染缓存内部实例。 */
-        fun readProgressMap(prefs: SharedPreferences): Map<String, Long> {
-            val json = prefs.getString("progress", null) ?: return emptyMap()
-            progressJsonCache?.let { (cachedJson, cachedMap) ->
-                if (cachedJson == json) return cachedMap.toMap()
-            }
-            val map = mutableMapOf<String, Long>()
-            try {
-                val obj = JSONObject(json)
-                for (key in obj.keys()) {
-                    map[key] = obj.getLong(key)
-                }
-            } catch (_: Exception) {
-            }
-            progressJsonCache = json to map
-            return map.toMap()
-        }
-
-        /** 把进度映射序列化为 JSON 字符串以便存储 */
-        fun writeProgressMap(map: Map<String, Long>): String {
-            val obj = JSONObject()
-            for ((k, v) in map) {
-                obj.put(k, v)
-            }
-            return obj.toString()
-        }
-
-        /**
-         * 供外部(如 MainActivity)对进度做「合并非覆盖」式批量写入并落盘。
-         * 与 [writeToDisk] 采用同一规则：只写入 >0 的值，0 不覆盖已有非零进度。
-         * 统一两侧的写入来源，避免前端与后端各自维护的进度互相覆盖。
-         */
-        fun writeProgressBatch(
-            prefs: SharedPreferences,
-            writes: Map<String, Long>,
-            removes: Set<String> = emptySet()
-        ) {
-            // 与 writeToDisk 共用一把锁，保证「读盘→合并→写盘」整体原子（见 progressPrefsLock 注释）
-            synchronized(progressPrefsLock) {
-                val merged = mergeProgress(prefs, writes, removes)
-                val json = writeProgressMap(merged)
-                prefs.edit { putString("progress", json) }
-                // 写入后同步登记解析缓存，保持读侧缓存新鲜
-                progressJsonCache = json to merged
-            }
-        }
     }
-}
-
-/**
- * 进度合并公共逻辑：读磁盘已有进度 → 剔除 removes 中条目 → 合并 writes(仅 >0)。
- * 与 [PlayerService.writeToDisk] 共用同一「合并非覆盖 + 0 值不覆盖」语义。
- */
-private fun mergeProgress(
-    prefs: SharedPreferences,
-    writes: Map<String, Long>,
-    removes: Set<String>
-): Map<String, Long> =
-    mergeProgressMap(PlayerService.readProgressMap(prefs), writes, removes)
-
-/**
- * 进度合并纯函数：在磁盘已有进度 [disk] 上，先剔除 [removes] 中的条目，再合并 [writes](仅 >0)。
- * 与 [PlayerService.writeToDisk] 共用同一「合并非覆盖 + 0 值不覆盖」语义；
- * 与 SharedPreferences 解耦，便于单元测试。
- */
-internal fun mergeProgressMap(
-    disk: Map<String, Long>,
-    writes: Map<String, Long>,
-    removes: Set<String>
-): Map<String, Long> {
-    val merged = disk.toMutableMap()
-    for (uri in removes) merged.remove(uri)
-    for ((k, v) in writes) {
-        if (v > 0) merged[k] = v
-    }
-    return merged
 }

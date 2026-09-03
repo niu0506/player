@@ -1,11 +1,14 @@
-package com.example.player
+package com.example.player.ui.playlist
 
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
 import androidx.recyclerview.widget.DiffUtil
 import androidx.recyclerview.widget.RecyclerView
+import com.example.player.R
 import com.example.player.databinding.ItemMediaBinding
+import com.example.player.model.MediaItemData
+import com.example.player.model.formatTime
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job

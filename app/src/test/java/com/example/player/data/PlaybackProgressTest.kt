@@ -1,4 +1,4 @@
-package com.example.player
+package com.example.player.data
 
 import org.junit.Assert.assertEquals
 import org.junit.Test

@@ -1,4 +1,4 @@
-package com.example.player
+package com.example.player.model
 
 import android.net.Uri
 import android.util.LruCache
@@ -8,7 +8,7 @@ import java.util.Locale
  * 播放列表中的单个媒体项描述。
  *
  * 只承载媒体本身的元信息（来源、名称、时长）。播放进度不放在这里，而是统一存在
- * uri -> position 的进度映射中（磁盘 `SharedPreferences["progress"]` + 内存 `cachedProgress`），
+ * uri -> position 的进度映射中（Room `progress` 表 + 内存 `cachedProgress`），
  * 避免同一份进度被存成多份导致对账复杂化（见 PlayerService 的 writeToDisk / 进度落盘唯一入口）。
  */
 data class MediaItemData(
@@ -19,6 +19,16 @@ data class MediaItemData(
     /** 媒体总时长（毫秒），扫描时可能未知，播放后回填 */
     val duration: Long = 0L
 )
+
+/**
+ * 规整化 Uri 字符串，作为去重/匹配的稳定 key。
+ * 去掉 query 参数与末尾 '/'，并拼接末段路径，用于区分不同集合下同名的条目。
+ */
+fun normalizeUri(uri: Uri): String {
+    val base = uri.buildUpon().clearQuery().build().toString().trimEnd('/')
+    val lastSeg = uri.lastPathSegment ?: base
+    return "$base|$lastSeg"
+}
 
 /**
  * 把毫秒格式化为播放时长文本。

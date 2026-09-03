@@ -29,6 +29,7 @@
     <uses-permission android:name="android.permission.INTERNET" />
 
     <application
+        android:name=".PlayerApp"
         android:allowBackup="true"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="@xml/backup_rules"
@@ -52,7 +53,7 @@
 
         <!-- 后台播放服务；通过 MediaSessionService action 暴露给控制器 -->
         <service
-            android:name=".PlayerService"
+            android:name=".playback.PlayerService"
             android:exported="true"
             android:foregroundServiceType="mediaPlayback"
             tools:ignore="ExportedService">

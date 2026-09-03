@@ -2,6 +2,7 @@ import java.util.Properties
 
 plugins {
     id("com.android.application")
+    id("com.google.devtools.ksp")
 }
 
 /**
@@ -25,8 +26,8 @@ android {
         applicationId = "com.example.player"
         minSdk = 24
         targetSdk = 35
-        versionCode = 18
-        versionName = "1.2.14"
+        versionCode = 19
+        versionName = "1.3.0"
     }
 
     signingConfigs {
@@ -76,6 +77,9 @@ dependencies {
     implementation("com.google.android.material:material:1.12.0")
     testImplementation("junit:junit:4.13.2")
     // 本地单测中 android.jar 的 org.json 是空 stub（方法全部返回默认值），
-    // PlayerService 进度落盘用真实 JSON 序列化，测试需要引入真实现
+    // Room 迁移解析器与 UpdateChecker 用真实 JSON 序列化，测试需要引入真实现
     testImplementation("org.json:json:20240303")
+    // Room 持久化：播放列表/播放进度/上次播放项（替代旧 SharedPreferences 存储）
+    implementation("androidx.room:room-runtime:2.8.4")
+    ksp("androidx.room:room-compiler:2.8.4")
 }

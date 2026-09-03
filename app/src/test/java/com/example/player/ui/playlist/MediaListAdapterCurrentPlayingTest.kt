@@ -1,4 +1,4 @@
-package com.example.player
+package com.example.player.ui.playlist
 
 import androidx.recyclerview.widget.RecyclerView
 import org.junit.Assert.assertEquals

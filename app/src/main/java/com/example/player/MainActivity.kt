@@ -1,30 +1,15 @@
 package com.example.player
 
-import android.annotation.SuppressLint
-import android.app.DownloadManager
-import android.app.PictureInPictureParams
-import android.content.BroadcastReceiver
 import android.content.ComponentName
-import android.content.Context
-import android.content.Intent
-import android.content.IntentFilter
-import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.database.ContentObserver
-import android.media.AudioManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.os.Environment
 import android.os.Handler
 import android.os.Looper
-import android.provider.BaseColumns
 import android.provider.MediaStore
-import android.provider.Settings
-import android.util.Rational
-import android.view.GestureDetector
-import android.view.MotionEvent
 import android.view.View
 import android.widget.PopupMenu
 import android.widget.TextView
@@ -33,40 +18,33 @@ import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.OptIn
 import androidx.annotation.RequiresApi
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
-import androidx.core.content.FileProvider
-import androidx.core.content.edit
-import androidx.core.view.WindowCompat
-import androidx.core.view.WindowInsetsCompat
-import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.lifecycleScope
 import androidx.media3.common.C
 import androidx.media3.common.Player
+import androidx.media3.common.VideoSize
 import androidx.media3.common.util.RepeatModeUtil
 import androidx.media3.common.util.UnstableApi
-import androidx.media3.common.VideoSize
 import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
-import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.TrackSelectionDialogBuilder
 import androidx.recyclerview.widget.LinearLayoutManager
+import com.example.player.data.MediaStoreScanner
+import com.example.player.data.PlayerRepository
 import com.example.player.databinding.ActivityMainBinding
-import kotlinx.coroutines.CoroutineScope
+import com.example.player.model.MediaItemData
+import com.example.player.model.normalizeUri
+import com.example.player.playback.PlayerService
+import com.example.player.ui.FullscreenPipHelper
+import com.example.player.ui.GestureController
+import com.example.player.ui.playlist.MediaListAdapter
+import com.example.player.update.UpdateManager
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
-import org.json.JSONArray
-import org.json.JSONObject
-import java.io.File
-import kotlin.math.abs
-import kotlin.math.max
 import androidx.media3.common.MediaItem as M3MediaItem
-import androidx.core.net.toUri
 
 /**
  * 主界面：播放器 + 播放列表面板。
@@ -74,14 +52,15 @@ import androidx.core.net.toUri
  * 通过 [MediaController] 连接到 [PlayerService] 中的播放器进行控制，同时承担：
  * - 本地媒体扫描（视频/音频）并维护播放列表
  * - 播放进度的恢复与保存（内存缓存 + 磁盘持久化 + 列表项进度条）
- * - 手势控制（双击/滑动调进度、亮度、音量）
- * - 全屏、横竖屏切换、画中画（PiP）小窗
  * - 倍速切换与音轨/字幕选择
+ *
+ * 显示模式（全屏/PiP）、手势交互、应用内更新分别委托给：
+ * [FullscreenPipHelper]、[GestureController]、[UpdateManager]。
  */
 class MainActivity : AppCompatActivity() {
     /** 视图绑定对象，提供对全部布局控件的访问 */
     private lateinit var binding: ActivityMainBinding
-    /** 播放列列表适配器 */
+    /** 播放列表适配器 */
     private lateinit var adapter: MediaListAdapter
     /** 内存中的播放列表数据 */
     private val playlist = mutableListOf<MediaItemData>()
@@ -89,16 +68,6 @@ class MainActivity : AppCompatActivity() {
     private var controllerFuture: com.google.common.util.concurrent.ListenableFuture<MediaController>? = null
     /** 当前已连接上的 MediaController */
     private var controller: MediaController? = null
-    /** 进度/列表等数据存储的 SharedPreferences，懒加载复用 */
-    private val playerPrefs by lazy { getSharedPreferences("player", MODE_PRIVATE) }
-    /**
-     * 磁盘写专用作用域 + 互斥锁：串行化 playlist / progress 的落盘协程。
-     * 多次保存（删除条目、扫描、对账）可能背靠背触发，若各自在多线程 IO 池并发执行，
-     * 旧快照可能后写覆盖新快照，导致已删条目/进度在磁盘「复活」；
-     * Mutex 为公平锁（按挂起先后授予），保证写盘顺序与启动顺序一致。
-     */
-    private val diskWriteScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-    private val diskWriteMutex = Mutex()
     /** 当前正在播放的列表项下标，-1 表示无 */
     private var currentIndex = -1
     /** 标记播放列表是否已从磁盘加载过（防止重复加载） */
@@ -106,33 +75,19 @@ class MainActivity : AppCompatActivity() {
     /** 内存中的播放进度缓存（uri 字符串 -> 位置毫秒） */
     private val cachedProgress = mutableMapOf<String, Long>()
 
-    /** 手势模式常量 */
+    /** 本地媒体库扫描器（MediaStore 查询与全量权限判定） */
+    private val scanner = MediaStoreScanner(this)
+    /** 应用内更新管家（检查更新、下载、安装） */
+    private lateinit var updateManager: UpdateManager
+    /** 播放器手势控制（快进快退、亮度、音量、seek 预览） */
+    private lateinit var gestures: GestureController
+    /** 全屏与画中画切换 */
+    private lateinit var fullscreenPip: FullscreenPipHelper
+
     private companion object {
-        const val GESTURE_NONE = 0 // 无手势
-        const val GESTURE_SEEK = 1 // 左右滑动快进/快退
-        const val GESTURE_BRIGHTNESS = 2 // 左半屏上下滑动调亮度
-        const val GESTURE_VOLUME = 3 // 右半屏上下滑动调音量
         const val MENU_ID_CHECK_UPDATE = 100 // 溢出菜单里的「检查更新」项
     }
 
-    /** 主线程 Handler，用于手势提示的延时隐藏 */
-    private val gestureHandler = Handler(Looper.getMainLooper())
-    /** 隐藏手势提示的延时任务 */
-    private val hideOverlayRunnable = Runnable { binding.gestureOverlay.visibility = View.GONE }
-    /** 当前正在进行的手势模式 */
-    private var gestureMode = GESTURE_NONE
-    /** 手势开始时的播放位置（用于 seek） */
-    private var seekStartPosition = 0L
-    /** 手势结束时最终要跳转到的位置 */
-    private var seekTargetPosition = 0L
-    /** 手势开始时的亮度 */
-    private var brightnessStart = 0f
-    /** 手势开始时的音量 */
-    private var volumeStart = 0
-    /** 音频管理器（懒加载，用于音量调节） */
-    private val gestureAudioManager by lazy {
-        getSystemService(AUDIO_SERVICE) as AudioManager
-    }
     /** 通知权限请求（API 33+ 需要） */
     private val notifPermission = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -145,95 +100,8 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, "权限已授予，请点击扫描", Toast.LENGTH_SHORT).show()
         }
     }
-    /** 写外部存储权限（仅 Android 9 及以下需要，用于把更新包存到公共 Download） */
-    private val writePermission = registerForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { granted ->
-        if (granted) {
-            pendingDownloadUrls.removeFirstOrNull()?.let { enqueueDownload(it) }
-        } else {
-            Toast.makeText(this, "缺少存储权限，无法保存到下载目录", Toast.LENGTH_SHORT).show()
-        }
-    }
 
-    // ===== 应用内更新（GitHub Releases） =====
-    /** 更新检查器 */
-    private val updateChecker = UpdateChecker()
-    /** 系统下载管理器（懒加载，更新包下载用它，自带通知栏进度与重试） */
-    private val downloadManager by lazy { getSystemService(DOWNLOAD_SERVICE) as DownloadManager }
-    /** 最近一次发起的下载 id，用于过滤广播 */
-    private var lastDownloadId = -1L
-    /** 等待用户授予「安装未知应用」权限后再安装的 APK 文件 */
-    private var pendingInstallFile: File? = null
-    /** 本次要写入的 APK 目标文件（换源重试时复用同一路径） */
-    private var pendingDownloadFile: File? = null
-    /** 本次下载的版本号，用于通知栏标题 */
-    private var pendingDownloadVersion = ""
-    /** 剩余待尝试的下载源队列（CDN 加速在前，GitHub 直连兜底） */
-    private var pendingDownloadUrls: ArrayDeque<String> = ArrayDeque()
-    /** 应用被新版本替换后清理公共 Download 里的更新包 */
-    private val packageReplacedReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context, intent: Intent) {
-            if (intent.action == Intent.ACTION_MY_PACKAGE_REPLACED) deleteInstalledUpdateApk()
-        }
-    }
-
-    /** 下载完成监听：成功则调起系统安装器；失败且有备用下载源则换源重试 */
-    private val downloadCompleteReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context, intent: Intent) {
-            if (intent.action != DownloadManager.ACTION_DOWNLOAD_COMPLETE) return
-            val id = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1L)
-            if (id != lastDownloadId) return
-            // 失败：换下一个源（CDN→…→GitHub 直连）重试
-            if (queryDownloadStatus(id) == DownloadManager.STATUS_FAILED) {
-                val next = pendingDownloadUrls.removeFirstOrNull()
-                if (next != null) {
-                    enqueueDownload(next)
-                    return
-                }
-                Toast.makeText(context, "下载失败，请手动下载安装", Toast.LENGTH_SHORT).show()
-                return
-            }
-            val file = downloadedApkFile() ?: return
-            installApk(file)
-        }
-    }
-
-    /** 查询某次下载的系统状态；查询失败按失败处理 */
-    private fun queryDownloadStatus(id: Long): Int {
-        val cursor = try {
-            downloadManager.query(DownloadManager.Query().setFilterById(id))
-        } catch (_: Exception) {
-            return DownloadManager.STATUS_FAILED
-        } ?: return DownloadManager.STATUS_FAILED
-        return cursor.use { cursor ->
-            if (cursor.moveToFirst()) {
-                cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS))
-            } else DownloadManager.STATUS_FAILED
-        }
-    }
-
-    /**
-     * 本次更新包可用下载源：CDN 加速代理在前，GitHub 直连兜底。
-     * 仅用于下载安装包；版本检查永远走 GitHub API（一步到位、无 CDN 缓存干扰）。
-     */
-    private val downloadAccelerators = listOf(
-        "https://gh-proxy.com/",
-        "https://ghproxy.net/",
-        "https://mirror.ghproxy.com/",
-    )
-    private val downloadSources: List<String> =
-        downloadAccelerators.map { it.trimEnd('/') + "/" } + "" // 末尾空串 = 直连
-
-    /**
-     * 规整化 Uri 字符串，作为去重/匹配的稳定 key。
-     * 去掉 query 参数与末尾 '/'，并拼接末段路径，用于区分不同集合下同名的条目。
-     */
-    private fun normalizeUri(uri: Uri): String {
-        val base = uri.buildUpon().clearQuery().build().toString().trimEnd('/')
-        val lastSeg = uri.lastPathSegment ?: base
-        return "$base|$lastSeg"
-    }
+    // ===== 播放列表管理 =====
 
     /** 从播放列表删除某个条目（同步清理其播放进度、控制器与磁盘记录） */
     private fun removeItemFromPlaylist(index: Int) {
@@ -263,259 +131,45 @@ class MainActivity : AppCompatActivity() {
         binding.tvCount.text = if (playlist.isEmpty()) "空" else "${playlist.size} 个"
         binding.tvEmpty.visibility = if (playlist.isEmpty()) View.VISIBLE else View.GONE
     }
-    /** 是否正在扫描（防止重复触发导致重复添加） */
-    private var isScanning = false
 
     /**
-     * MediaStore 内容观察器：监听本地视频/音频集合的变化。
-     * 媒体库有新增/修改/删除时系统会通知，触发一次「去重增量扫描」，
-     * 避免每次点扫描都对整库全量重查，也免去手动点击的维护负担。
+     * 把当前播放列表与进度快照交给仓库持久化（Room 全量替换列表 + 合并进度，单事务落盘）。
+     * 仓库内部保证按调用顺序落库，这里先在主线程做快照，防止 IO 侧遍历期间列表被交互修改。
      */
-    private val mediaChangeObserver = object : ContentObserver(Handler(Looper.getMainLooper())) {
-        @Deprecated("Deprecated in Java")
-        override fun onChange(selfChange: Boolean, uri: Uri?) {
-            // MediaStore 常常连发多次通知，合并到一次延时扫描
-            scanHandler.removeCallbacks(debouncedScanRunnable)
-            scanHandler.postDelayed(debouncedScanRunnable, 800)
-        }
-    }
-    /** 用于合并 MediaStore 多次通知的 Handler */
-    private val scanHandler = Handler(Looper.getMainLooper())
-    /** 延时的增量扫描任务（先校验权限，避免无权限时白白查询） */
-    private val debouncedScanRunnable = Runnable {
-        if (hasStoragePermission()) scanLocalMedia()
-    }
-
-
-    /** 扫描本地音视频并加入播放列表（在 IO 线程执行，带重入保护） */
-    private fun scanLocalMedia() {
-        if (isScanning) return
-        isScanning = true
-        lifecycleScope.launch(Dispatchers.IO) {
-            try {
-                val videos = queryMediaStore(MediaStore.Video.Media.EXTERNAL_CONTENT_URI)
-                val audios = queryMediaStore(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI)
-                withContext(Dispatchers.Main) {
-                    val scanned = mutableListOf<MediaItemData>()
-                    scanned.addAll(videos)
-                    scanned.addAll(audios)
-                    // 对账移除「文件已被外部删除」的条目，保证列表与实际文件一致
-                    val removedCount = pruneDeletedMedia(videos, audios)
-                    val existingKeys = playlist.map { normalizeUri(it.uri) }.toSet()
-                    // 过滤掉时长过短(<5秒)与已存在(去重)的条目
-                    val newItems = scanned.filter {
-                        it.duration >= 5000 && normalizeUri(it.uri) !in existingKeys
-                    }
-                    if (newItems.isEmpty() && removedCount == 0) {
-                        Toast.makeText(this@MainActivity, "没有新文件", Toast.LENGTH_SHORT).show()
-                        return@withContext
-                    }
-                    playlist.addAll(newItems)
-                    for (item in newItems) {
-                        controller?.addMediaItem(M3MediaItem.fromUri(item.uri))
-                    }
-                    refreshPlaylist()
-                    savePlaylist()
-                    val parts = mutableListOf<String>()
-                    if (removedCount > 0) parts.add("删除 $removedCount 个已消失文件")
-                    if (newItems.isNotEmpty()) parts.add("添加 ${newItems.size} 个文件")
-                    Toast.makeText(this@MainActivity, parts.joinToString("，"), Toast.LENGTH_SHORT).show()
-                }
-            } finally {
-                isScanning = false
-            }
-        }
-    }
-
-    /**
-     * 回前台时静默对账：移除「后台期间被外部删除」的文件。
-     * 后台时 onStop 已取消 MediaStore 观察者、删除通知会错过，因此回到前台主动对账一次；
-     * 只删除已消失的文件，不自动新增，也不弹提示，避免打扰用户。
-     */
-    private fun pruneDeletedMediaOnResume() {
-        if (isScanning) return
-        isScanning = true
-        lifecycleScope.launch(Dispatchers.IO) {
-            try {
-                if (!hasStoragePermission()) {
-                    return@launch
-                }
-                val videos = queryMediaStore(MediaStore.Video.Media.EXTERNAL_CONTENT_URI)
-                val audios = queryMediaStore(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI)
-                withContext(Dispatchers.Main) {
-                    if (pruneDeletedMedia(videos, audios) > 0) {
-                        refreshPlaylist()
-                        savePlaylist()
-                    }
-                }
-            } finally {
-                isScanning = false
-            }
-        }
-    }
-
-    /**
-     * 查询 MediaStore 获取媒体文件列表。
-     * @param contentUri 视频或音频的集合 Uri
-     * @return 查询到的媒体列表（可能为空）
-     */
-    private fun queryMediaStore(contentUri: Uri): List<MediaItemData> {
-        val items = mutableListOf<MediaItemData>()
-        val projection = arrayOf(
-            BaseColumns._ID,
-            MediaStore.MediaColumns.DISPLAY_NAME,
-            MediaStore.MediaColumns.DURATION
-        )
-        try {
-            contentResolver.query(
-                contentUri, projection, null, null,
-                "${MediaStore.MediaColumns.DISPLAY_NAME} ASC"
-            )?.use { cursor ->
-                val idIdx = cursor.getColumnIndexOrThrow(BaseColumns._ID)
-                val nameIdx = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DISPLAY_NAME)
-                val durIdx = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DURATION)
-                while (cursor.moveToNext()) {
-                    val id = cursor.getLong(idIdx)
-                    val name = cursor.getString(nameIdx)
-                    val duration = cursor.getLong(durIdx)
-                    items.add(
-                        MediaItemData(Uri.withAppendedPath(contentUri, id.toString()), name, duration)
-                    )
-                }
-            }
-        } catch (_: Exception) {
-        }
-        return items
-    }
-
-    /**
-     * 用 MediaStore 扫描结果对账播放列表，移除「文件已从系统媒体库删除」的条目
-     * （同时清理其播放进度与控制器队列中的对应项）。
-     *
-     * 权限保护：API 34+ 用户可能只授予「仅选中的照片/视频」(READ_MEDIA_VISUAL_USER_SELECTED)，
-     * 此时 MediaStore 查询结果只含被选中的文件，若会把……「误删未授权但
-     * 仍存在的文件。因此仅当拿到对应媒体类型的完整读取权限时才执行该类型的删除对账。
-     *
-     * @param scannedVideos 本次扫描到的视频集合
-     * @param scannedAudios 本次扫描到的音频集合
-     * @return 被移除的条数
-     */
-    private fun pruneDeletedMedia(
-        scannedVideos: List<MediaItemData>,
-        scannedAudios: List<MediaItemData>
-    ): Int {
-        val videoKeys = if (hasFullMediaAccess(android.Manifest.permission.READ_MEDIA_VIDEO)) {
-            scannedVideos.map { normalizeUri(it.uri) }.toSet()
-        } else null
-        val audioKeys = if (hasFullMediaAccess(android.Manifest.permission.READ_MEDIA_AUDIO)) {
-            scannedAudios.map { normalizeUri(it.uri) }.toSet()
-        } else null
-        val videoPrefix = MediaStore.Video.Media.EXTERNAL_CONTENT_URI.toString()
-        val audioPrefix = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI.toString()
-        var removed = 0
-        // 逆序遍历，保证删除过程下标不失效（playlist 与控制器队列保持同步）
-        for (i in playlist.indices.reversed()) {
-            val item = playlist[i]
-            val uriStr = item.uri.toString()
-            val keys = when {
-                uriStr.startsWith(videoPrefix) -> videoKeys
-                uriStr.startsWith(audioPrefix) -> audioKeys
-                else -> null
-            }
-            if (keys != null && normalizeUri(item.uri) !in keys) {
-                clearProgress(item.uri)
-                playlist.removeAt(i)
-                controller?.removeMediaItem(i)
-                if (i < currentIndex) currentIndex--
-                removed++
-            }
-        }
-        // 有删除时同步校正适配器高亮下标，避免删除后播放项高亮漂移
-        if (removed > 0) {
-            adapter.setCurrentPlaying(
-                currentIndex.takeIf { it in playlist.indices } ?: -1,
-                controller?.isPlaying == true
-            )
-        }
-        return removed
-    }
-
-    /** 是否具备指定媒体类型的「全量」读取权限（API 34+ 的「仅选中」授权不算全量） */
-    private fun hasFullMediaAccess(permission: String): Boolean {
-        if (Build.VERSION.SDK_INT < 33) {
-            return ContextCompat.checkSelfPermission(
-                this, android.Manifest.permission.READ_EXTERNAL_STORAGE
-            ) == PackageManager.PERMISSION_GRANTED
-        }
-        return ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
-    }
-
-    /** 把当前播放列表序列化为 JSON 存到 SharedPreferences（进度存于独立的 "progress" 映射）。
-     *  序列化与合并写盘都在 IO 线程执行，避免大列表在主线程做 JSON 全量读写。
-     *  先在主线程对 playlist 做快照，防止 IO 侧遍历期间列表被交互修改。 */
     private fun savePlaylist() {
-        val itemsSnapshot = playlist.toList()
-        val progressSnapshot = cachedProgress.toMap()
-        diskWriteScope.launch {
-            diskWriteMutex.withLock {
-                // 先把内存进度按与 Service 一致的「合并非覆盖」语义落盘，统一两侧来源，避免互相覆盖
-                PlayerService.writeProgressBatch(playerPrefs, progressSnapshot)
-                val arr = JSONArray()
-                for (item in itemsSnapshot) {
-                    val obj = JSONObject()
-                    obj.put("uri", item.uri.toString())
-                    obj.put("name", item.name)
-                    obj.put("duration", item.duration)
-                    arr.put(obj)
-                }
-                playerPrefs.edit {
-                    putString("playlist", arr.toString())
-                }
-            }
-        }
+        PlayerRepository.savePlaylist(playlist.toList(), cachedProgress.toMap())
     }
 
     /**
-     * 从 SharedPreferences 恢复播放列表。
+     * 从仓库内存镜像恢复播放列表（数据源为 Room 数据库，进程启动时已一次性加载）。
      * 关键点（项目记忆）：loadPlaylist 只做数据加载，**不允许**调用 addMediaItem 同步到控制器；
      * 媒体项与控制器同步只发生在 onStart 且 controller.mediaItemCount == 0 时，
      * 否则服务存活重建时会导致队列被重复添加。
      */
     private fun loadPlaylist() {
-        val prefs = playerPrefs
-        val json = prefs.getString("playlist", null) ?: return
-        val progressMap = PlayerService.readProgressMap(prefs)
-        try {
-            val arr = JSONArray(json)
-            // 跳过内存中已存在的项，并对磁盘数据按 uri 去重
-            val existingKeys = playlist.map { normalizeUri(it.uri) }.toMutableSet()
-            val seen = mutableSetOf<String>()
-            for (i in 0 until arr.length()) {
-                val obj = arr.getJSONObject(i)
-                val uri = Uri.parse(obj.getString("uri"))
-                val key = normalizeUri(uri)
-                if (key in seen || key in existingKeys) continue
-                seen.add(key)
-                existingKeys.add(key)
-                val name = obj.getString("name")
-                val duration = obj.optLong("duration", 0L)
-                // 进度只取独立的 "progress" 映射（唯一数据源）；有进度则同步进内存缓存
-                val lastPos = progressMap[uri.toString()] ?: 0L
-                if (lastPos > 0) cachedProgress[uri.toString()] = lastPos
-                playlist.add(MediaItemData(uri, name, duration))
-            }
-        } catch (_: Exception) {
+        val progressMap = PlayerRepository.getProgressMap()
+        // 跳过内存中已存在的项，并对磁盘数据按 uri 去重
+        val existingKeys = playlist.map { normalizeUri(it.uri) }.toMutableSet()
+        for (item in PlayerRepository.getPlaylist()) {
+            val key = normalizeUri(item.uri)
+            if (key in existingKeys) continue
+            existingKeys.add(key)
+            // 进度只取独立的 progress 表（唯一数据源）；有进度则同步进内存缓存
+            val lastPos = progressMap[item.uri.toString()] ?: 0L
+            if (lastPos > 0) cachedProgress[item.uri.toString()] = lastPos
+            playlist.add(item)
         }
     }
 
+    // ===== 播放进度管理 =====
+
     /**
-     * 用磁盘进度(Service 清理后的权威值)校正内存中的 cachedProgress 与列表进度条。
+     * 用持久层进度(Service 清理后的权威值)校正内存中的 cachedProgress 与列表进度条。
      * 背景：后台自动播完切集时 MainActivity 监听器已解绑，内存会残留"播完进度"；
      * 回前台若不校正，该残留值将在下次 savePlaylist 时被写回磁盘导致进度复活。
      */
     private fun reconcileProgressFromDisk() {
-        val prefs = playerPrefs
-        val diskMap = PlayerService.readProgressMap(prefs)
+        val diskMap = PlayerRepository.getProgressMap()
         for (i in playlist.indices) {
             val uri = playlist[i].uri.toString()
             val diskVal = diskMap[uri]
@@ -553,17 +207,13 @@ class MainActivity : AppCompatActivity() {
         adapter.updateProgress(index, position)
     }
 
-    /** 彻底清除某个 uri 的进度：内存缓存、Service 缓存、磁盘映射三处一致删除（磁盘写入走 IO 线程） */
+    /** 彻底清除某个 uri 的进度：内存缓存、Service 缓存、持久层三处一致删除（仓库异步落库） */
     private fun clearProgress(uri: Uri) {
         val key = uri.toString()
         cachedProgress.remove(key)
         PlayerService.dropProgress(key)
-        diskWriteScope.launch {
-            diskWriteMutex.withLock {
-                // 复用统一的合并写入口（removes 语义），与 Service 的删除规则保持一致
-                PlayerService.writeProgressBatch(playerPrefs, emptyMap(), setOf(key))
-            }
-        }
+        // 复用统一的合并写入口（removes 语义），与 Service 的删除规则保持一致
+        PlayerRepository.applyProgressUpdates(emptyMap(), setOf(key))
     }
 
     /** 播放器事件监听：切换项/播放状态变化/就绪时的 UI 刷新与进度更新 */
@@ -611,19 +261,18 @@ class MainActivity : AppCompatActivity() {
          * 小窗会跟着视频比例自适应伸缩，避免出现黑边。
          */
         @RequiresApi(Build.VERSION_CODES.O)
-        @OptIn(UnstableApi::class)
         override fun onVideoSizeChanged(videoSize: VideoSize) {
-            if (isInPipMode) updatePipAspectRatio()
+            if (fullscreenPip.isInPipMode) fullscreenPip.updatePipAspectRatio(videoSize)
         }
     }
 
     /**
-     * 统一的续播位置来源：以磁盘(Service 后台写入的唯一事实来源)为优先，
-     * 磁盘无该 uri 的记录时才回退到内存 cachedProgress。
-     * 用于 fix「播放中切到别的条目，旧条目进度丢失」：磁盘进度由 Service 周期+切换时精确落盘，更可靠。
+     * 统一的续播位置来源：以持久层(仓库内存镜像，Service 后台写入的唯一事实来源)为优先，
+     * 持久层无该 uri 的记录时才回退到内存 cachedProgress。
+     * 用于 fix「播放中切到别的条目，旧条目进度丢失」：持久层进度由 Service 周期+切换时精确落盘，更可靠。
      */
     private fun resolveResumePosition(item: MediaItemData): Long {
-        val disk = PlayerService.readProgressMap(playerPrefs)[item.uri.toString()]
+        val disk = PlayerRepository.getProgress(item.uri.toString())
         if (disk != null && disk > 0) return disk
         return cachedProgress[item.uri.toString()] ?: 0L
     }
@@ -646,8 +295,7 @@ class MainActivity : AppCompatActivity() {
     private fun restoreLastPlayed() {
         val ctrl = controller ?: return
         if (ctrl.playWhenReady || ctrl.isPlaying) return
-        val prefs = playerPrefs
-        val lastUri = prefs.getString("lastItem", null) ?: return
+        val lastUri = PlayerRepository.getLastItem() ?: return
         val idx = playlist.indexOfFirst { it.uri.toString() == lastUri }
         if (idx !in playlist.indices) return
         if (ctrl.currentMediaItemIndex == idx) return
@@ -656,6 +304,8 @@ class MainActivity : AppCompatActivity() {
         currentIndex = idx
         adapter.setCurrentPlaying(idx, ctrl.isPlaying)
     }
+
+    // ===== 播放器自定义控件（倍速/音轨/字幕） =====
 
     /** 可选择的倍速档位 */
     private val speedLevels = floatArrayOf(0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 2.0f, 3.0f)
@@ -668,7 +318,7 @@ class MainActivity : AppCompatActivity() {
             RepeatModeUtil.REPEAT_TOGGLE_MODE_ONE or RepeatModeUtil.REPEAT_TOGGLE_MODE_ALL
         )
         binding.playerView.setShowShuffleButton(true)
-        // 播放时保持屏幕常亮，防止系统屏幕超时自动变暗/熄灭
+        // 播放时保持屏幕常亮，防止系统屏幕超时自动变暗/熄屏
         binding.playerView.keepScreenOn = true
 
         val speedBtn = binding.playerView.findViewById<TextView>(R.id.btn_speed)
@@ -697,7 +347,7 @@ class MainActivity : AppCompatActivity() {
         val ctrl = controller ?: return
         val labels = speedLevels.map { formatSpeed(it) }.toTypedArray()
         val checked = speedsIndex(ctrl.playbackParameters.speed)
-        androidx.appcompat.app.AlertDialog.Builder(this)
+        AlertDialog.Builder(this)
             .setTitle("倍速播放")
             .setSingleChoiceItems(labels, checked) { dialog, which ->
                 ctrl.setPlaybackSpeed(speedLevels[which])
@@ -730,439 +380,160 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 初始化手势识别（单击显隐控制栏、双击快进快退、滑动调进度/亮度/音量） */
-    @SuppressLint("ClickableViewAccessibility")
-    private fun setupGestures() {
-        val detector = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
-            // 按下即消费事件，保证后续手势均由我们处理
-            override fun onDown(e: MotionEvent): Boolean = true
+    // ===== 本地媒体扫描与对账 =====
 
-            /** 单击：切换控制栏显隐 */
-            @OptIn(UnstableApi::class)
-            override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
-                if (binding.playerView.isControllerFullyVisible) {
-                    binding.playerView.hideController()
-                } else {
-                    binding.playerView.showController()
+    /** 是否正在扫描（防止重复触发导致重复添加） */
+    private var isScanning = false
+
+    /**
+     * MediaStore 内容观察者：监听本地视频/音频集合的变化。
+     * 媒体库有新增/修改/删除时系统会通知，触发一次「去重增量扫描」，
+     * 避免每次点扫描都对整库全量重查，也免去手动点击的维护负担。
+     */
+    private val mediaChangeObserver = object : ContentObserver(Handler(Looper.getMainLooper())) {
+        @Deprecated("Deprecated in Java")
+        override fun onChange(selfChange: Boolean, uri: Uri?) {
+            // MediaStore 常常连发多次通知，合并到一次延时扫描
+            scanHandler.removeCallbacks(debouncedScanRunnable)
+            scanHandler.postDelayed(debouncedScanRunnable, 800)
+        }
+    }
+    /** 用于合并 MediaStore 多次通知的 Handler */
+    private val scanHandler = Handler(Looper.getMainLooper())
+    /** 延时的增量扫描任务（先校验权限，避免无权限时白白查询） */
+    private val debouncedScanRunnable = Runnable {
+        if (hasStoragePermission()) scanLocalMedia()
+    }
+
+    /** 扫描本地音视频并加入播放列表（在 IO 线程执行，带重入保护） */
+    private fun scanLocalMedia() {
+        if (isScanning) return
+        isScanning = true
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                val videos = scanner.queryVideos()
+                val audios = scanner.queryAudios()
+                withContext(Dispatchers.Main) {
+                    val scanned = mutableListOf<MediaItemData>()
+                    scanned.addAll(videos)
+                    scanned.addAll(audios)
+                    // 对账移除「文件已被外部删除」的条目，保证列表与实际文件一致
+                    val removedCount = pruneDeletedMedia(videos, audios)
+                    val existingKeys = playlist.map { normalizeUri(it.uri) }.toSet()
+                    // 过滤掉时长过短(<5秒)与已存在(去重)的条目
+                    val newItems = scanned.filter {
+                        it.duration >= 5000 && normalizeUri(it.uri) !in existingKeys
+                    }
+                    if (newItems.isEmpty() && removedCount == 0) {
+                        Toast.makeText(this@MainActivity, "没有新文件", Toast.LENGTH_SHORT).show()
+                        return@withContext
+                    }
+                    playlist.addAll(newItems)
+                    for (item in newItems) {
+                        controller?.addMediaItem(M3MediaItem.fromUri(item.uri))
+                    }
+                    refreshPlaylist()
+                    savePlaylist()
+                    val parts = mutableListOf<String>()
+                    if (removedCount > 0) parts.add("删除 $removedCount 个已消失文件")
+                    if (newItems.isNotEmpty()) parts.add("添加 ${newItems.size} 个文件")
+                    Toast.makeText(this@MainActivity, parts.joinToString("，"), Toast.LENGTH_SHORT).show()
                 }
-                return true
+            } finally {
+                isScanning = false
             }
-
-            /** 双击：左侧快退 15 秒，右侧快进 15 秒 */
-            override fun onDoubleTap(e: MotionEvent): Boolean {
-                val ctrl = controller ?: return true
-                if (e.x < binding.playerView.width / 2f) {
-                    if (ctrl.isCommandAvailable(Player.COMMAND_SEEK_BACK)) {
-                        ctrl.seekBack()
-                        showGestureOverlay("快退 15 秒")
-                    }
-                } else {
-                    if (ctrl.isCommandAvailable(Player.COMMAND_SEEK_FORWARD)) {
-                        ctrl.seekForward()
-                        showGestureOverlay("快进 15 秒")
-                    }
-                }
-                return true
-            }
-
-            /** 滑动：
-             * 横向手势 -> 进度快进/快退
-             * 纵向 + 起点在左半屏 -> 亮度
-             * 纵向 + 起点在右半屏 -> 音量
-             */
-            @OptIn(UnstableApi::class)
-            override fun onScroll(
-                e1: MotionEvent?, e2: MotionEvent, dX: Float, dY: Float
-            ): Boolean {
-                val start = e1 ?: return false
-                val ctrl = controller ?: return false
-                // 手势刚开始时确定模式
-                if (gestureMode == GESTURE_NONE) {
-                    if (binding.playerView.isControllerFullyVisible) {
-                        binding.playerView.hideController()
-                    }
-                    gestureMode = if (abs(e2.x - start.x) > abs(e2.y - start.y)) {
-                        seekStartPosition = ctrl.currentPosition
-                        seekTargetPosition = seekStartPosition
-                        GESTURE_SEEK
-                    } else if (start.x < binding.playerView.width / 2f) {
-                        brightnessStart = currentBrightness()
-                        GESTURE_BRIGHTNESS
-                    } else {
-                        volumeStart = gestureAudioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
-                        GESTURE_VOLUME
-                    }
-                }
-                when (gestureMode) {
-                    // 根据横向位移换算毫秒目标位置，并实时预览
-                    GESTURE_SEEK -> {
-                        val duration = ctrl.duration
-                        if (duration == C.TIME_UNSET || duration <= 0) {
-                            gestureMode = GESTURE_NONE
-                            return false
-                        }
-                        val msPerPx = max(300f, duration / binding.playerView.width * 1.2f)
-                        val target = (seekStartPosition + (e2.x - start.x) * msPerPx)
-                            .toLong().coerceIn(0L, duration)
-                        seekTargetPosition = target
-                        val deltaSec = (target - seekStartPosition) / 1000
-                        val action = if (deltaSec >= 0) "快进" else "快退"
-                        showGestureOverlay(
-                            "$action ${abs(deltaSec)} 秒\n" +
-                                "${formatTime(target)} / ${formatTime(duration)}"
-                        )
-                    }
-                    // 纵向位移换算亮度增量并实时预览
-                    GESTURE_BRIGHTNESS -> {
-                        val delta = (start.y - e2.y) / binding.playerView.height
-                        applyBrightness(brightnessStart + delta)
-                        showGestureOverlay("亮度 ${(currentBrightness() * 100).toInt()}%")
-                    }
-                    // 纵向位移换算音量增量并实时预览
-                    GESTURE_VOLUME -> {
-                        val maxVolume =
-                            gestureAudioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
-                        val delta =
-                            ((start.y - e2.y) / binding.playerView.height * maxVolume).toInt()
-                        val target = (volumeStart + delta).coerceIn(0, maxVolume)
-                        gestureAudioManager.setStreamVolume(AudioManager.STREAM_MUSIC, target, 0)
-                        val pct = if (maxVolume > 0) target * 100 / maxVolume else 0
-                        showGestureOverlay("音量 $pct%")
-                    }
-                }
-                return true
-            }
-        })
-
-        binding.playerView.setOnTouchListener { _, event ->
-            detector.onTouchEvent(event)
-            // 手指抬起/取消时结束手势，若为 seek 则跳转到目标位置
-            if (event.actionMasked == MotionEvent.ACTION_UP
-                || event.actionMasked == MotionEvent.ACTION_CANCEL
-            ) {
-                endGesture()
-            }
-            true
         }
-    }
-
-    /** 手势结束时执行最终动作（seek 手势才需要真正跳转），并复位手势状态 */
-    private fun endGesture() {
-        if (gestureMode == GESTURE_SEEK) {
-            controller?.seekTo(seekTargetPosition)
-        }
-        gestureMode = GESTURE_NONE
-    }
-
-    /** 读取当前窗口亮度（跟随系统时返回默认 0.5） */
-    private fun currentBrightness(): Float {
-        val b = window.attributes.screenBrightness
-        return if (b < 0f) 0.5f else b
-    }
-
-    /** 设置窗口亮度（限制在 0.02~1.0 之间） */
-    private fun applyBrightness(value: Float) {
-        val lp = window.attributes
-        lp.screenBrightness = value.coerceIn(0.02f, 1f)
-        window.attributes = lp
-    }
-
-    /** 显示手势提示浮层，并在 800ms 后自动隐藏 */
-    private fun showGestureOverlay(text: String) {
-        gestureHandler.removeCallbacks(hideOverlayRunnable)
-        binding.gestureOverlay.text = text
-        binding.gestureOverlay.visibility = View.VISIBLE
-        gestureHandler.postDelayed(hideOverlayRunnable, 800)
-    }
-
-    /** 是否处于全屏状态 */
-    private var isFullscreen = false
-    /** 是否处于画中画（PiP）模式 */
-    private var isInPipMode = false
-
-    /** PiP 模式变化回调：根据是否在小窗/全屏调整 UI 显隐与视频表面尺寸 */
-    override fun onPictureInPictureModeChanged(isInPictureInPictureMode: Boolean, newConfig: Configuration) {
-        super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
-        isInPipMode = isInPictureInPictureMode
-        val uiVisible = !isInPipMode && !isFullscreen
-        binding.toolbarLayout.visibility = if (uiVisible) View.VISIBLE else View.GONE
-        binding.playlistContainer.visibility = if (uiVisible) View.VISIBLE else View.GONE
-        binding.playerView.useController = !isInPipMode
-        applyPipVideoSurface(isInPictureInPictureMode)
-    }
-
-    /** 依据当前是否 PiP / 全屏，调整视频容器边距、圆角与缩放模式，避免黑边 */
-    @OptIn(UnstableApi::class)
-    private fun applyPipVideoSurface(inPip: Boolean) {
-        if (inPip) {
-            // PiP：ZOOM 填满 + 无圆角无边距
-            binding.playerView.setResizeMode(AspectRatioFrameLayout.RESIZE_MODE_ZOOM)
-            binding.playerCard.radius = 0f
-            val lp = binding.playerCard.layoutParams as android.view.ViewGroup.MarginLayoutParams
-            lp.setMargins(0, 0, 0, 0)
-            binding.playerCard.layoutParams = lp
-        } else if (isFullscreen) {
-            // 全屏：ZOOM 等比放大铺满屏幕，无圆角无边距，避免黑边
-            binding.playerView.setResizeMode(AspectRatioFrameLayout.RESIZE_MODE_ZOOM)
-            binding.playerCard.radius = 0f
-            val lp = binding.playerCard.layoutParams as android.view.ViewGroup.MarginLayoutParams
-            lp.setMargins(0, 0, 0, 0)
-            binding.playerCard.layoutParams = lp
-        } else {
-            // 普通横屏/竖屏：加圆角与边距的卡片样式
-            applyNormalVideoSurfaceStyle()
-        }
-    }
-
-    /** 普通非全屏、非 PiP 的卡片样式：FIT 缩放 + 12dp 边距 + 18dp 圆角 */
-    @OptIn(UnstableApi::class)
-    private fun applyNormalVideoSurfaceStyle() {
-        binding.playerView.setResizeMode(AspectRatioFrameLayout.RESIZE_MODE_FIT)
-        val lp = binding.playerCard.layoutParams as android.view.ViewGroup.MarginLayoutParams
-        val m = (12 * resources.displayMetrics.density).toInt()
-        lp.setMargins(m, m, m, m / 3)
-        binding.playerCard.radius = 18 * resources.displayMetrics.density
-        binding.playerCard.layoutParams = lp
-    }
-
-    /** 切换全屏：隐藏/显示顶栏与播放列表，横屏/竖屏，隐藏/显示系统栏 */
-    @OptIn(UnstableApi::class)
-    private fun setFullscreen(enabled: Boolean) {
-        isFullscreen = enabled
-        if (enabled) {
-            val lp = binding.playerCard.layoutParams as android.view.ViewGroup.MarginLayoutParams
-            binding.toolbarLayout.visibility = View.GONE
-            binding.playlistContainer.visibility = View.GONE
-            lp.setMargins(0, 0, 0, 0)
-            binding.playerCard.radius = 0f
-            binding.playerCard.layoutParams = lp
-            // 全屏：ZOOM 等比放大铺满屏幕，裁剪溢出部分，避免黑边
-            binding.playerView.setResizeMode(AspectRatioFrameLayout.RESIZE_MODE_ZOOM)
-            requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-            hideSystemBars()
-        } else {
-            binding.toolbarLayout.visibility = View.VISIBLE
-            binding.playlistContainer.visibility = View.VISIBLE
-            requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
-            showSystemBars()
-            applyNormalVideoSurfaceStyle()
-        }
-    }
-
-    /** 隐藏系统状态栏/导航栏（沉浸式全屏） */
-    private fun hideSystemBars() {
-        WindowCompat.setDecorFitsSystemWindows(window, false)
-        val insetsController = WindowInsetsControllerCompat(window, binding.root)
-        insetsController.hide(WindowInsetsCompat.Type.systemBars())
-        insetsController.systemBarsBehavior =
-            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-    }
-
-    /** 恢复显示系统状态栏/导航栏 */
-    private fun showSystemBars() {
-        WindowCompat.setDecorFitsSystemWindows(window, true)
-        WindowInsetsControllerCompat(window, binding.root)
-            .show(WindowInsetsCompat.Type.systemBars())
-    }
-
-    /** 进入画中画（PiP）小窗模式，失败时回退并提示 */
-    private fun enterPipMode() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
-            Toast.makeText(this, "系统不支持小窗播放", Toast.LENGTH_SHORT).show()
-            return
-        }
-        val vs = controller?.videoSize
-        if (vs == null || vs.width <= 0) {
-            Toast.makeText(this, "当前没有正在播放的视频", Toast.LENGTH_SHORT).show()
-            return
-        }
-        if (isFullscreen) {
-            setFullscreen(false)
-        }
-        // 隐藏 UI、关闭控制器、调整为 PiP 视频尺寸
-        binding.toolbarLayout.visibility = View.GONE
-        binding.playlistContainer.visibility = View.GONE
-        binding.playerView.useController = false
-        applyPipVideoSurface(true)
-        try {
-            // 以视频宽高比作为小窗比例，解析失败时回退 16:9
-            val builder = PictureInPictureParams.Builder()
-                .setAspectRatio(try {
-                    Rational(vs.width, vs.height)
-                } catch (_: Exception) {
-                    Rational(16, 9)
-                })
-            // seamless resize 仅 API 31+ 支持；低版本省略该选项即可(此前误用 TODO 抛异常崩溃)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                builder.setSeamlessResizeEnabled(true)
-            }
-            val params = builder.build()
-            if (enterPictureInPictureMode(params)) return
-        } catch (_: Exception) {
-        }
-        // 进入失败：恢复原有 UI
-        binding.toolbarLayout.visibility = View.VISIBLE
-        binding.playlistContainer.visibility = View.VISIBLE
-        binding.playerView.useController = true
-        applyPipVideoSurface(false)
-        Toast.makeText(this, "无法进入小窗模式", Toast.LENGTH_SHORT).show()
     }
 
     /**
-     * 用当前视频的真实宽高比动态更新 PiP 小窗比例，使小窗贴合视频、避免黑边。
-     * 在 [enterPipMode] 之后由 onVideoSizeChanged 触发：视频分辨率在进入小窗后
-     * 才确定（或中途切换清晰度）时，窗口会跟随比例平滑伸缩。
+     * 回前台时静默对账：移除「后台期间被外部删除」的文件。
+     * 后台时 onStop 已取消 MediaStore 观察者、删除通知会错过，因此回到前台主动对账一次；
+     * 只删除已消失的文件，不自动新增，也不弹提示，避免打扰用户。
      */
-    @RequiresApi(Build.VERSION_CODES.O)
-    private fun updatePipAspectRatio() {
-        val vs = controller?.videoSize ?: return
-        if (vs.width <= 0 || vs.height <= 0) return
-        if (!isInPipMode) return
-        val ratio = try {
-            Rational(vs.width, vs.height)
-        } catch (_: Exception) {
-            return
-        }
-        val builder = PictureInPictureParams.Builder().setAspectRatio(ratio)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            builder.setSeamlessResizeEnabled(true)
-        }
-        try {
-            setPictureInPictureParams(builder.build())
-        } catch (_: Exception) {
-        }
-    }
-
-    // ===== 应用内更新（GitHub Releases） =====
-
-    /** 检查更新：请求 GitHub latest Release 并与本地版本比较。失败时仅手动触发给提示 */
-    private fun checkForUpdate(manual: Boolean) {
+    private fun pruneDeletedMediaOnResume() {
+        if (isScanning) return
+        isScanning = true
         lifecycleScope.launch(Dispatchers.IO) {
-            val release = try {
-                updateChecker.checkLatest()
-            } catch (_: Exception) {
-                null
-            }
-            withContext(Dispatchers.Main) {
-                if (isFinishing || isDestroyed) return@withContext
-                val current = try {
-                    packageManager.getPackageInfo(packageName, 0).versionName ?: ""
-                } catch (_: Exception) {
-                    ""
-                }
-                when {
-                    release == null -> if (manual) {
-                        Toast.makeText(this@MainActivity, "检查更新失败，请稍后重试", Toast.LENGTH_SHORT).show()
-                    }
-                    !UpdateChecker.isNewer(release.version, current) -> if (manual) {
-                        Toast.makeText(this@MainActivity, "已是最新版本 v$current", Toast.LENGTH_SHORT).show()
-                    }
-                    else -> showUpdateDialog(release)
-                }
-            }
-        }
-    }
-
-    /** 弹出更新确认框：新版本号 + Release Notes，确认后下载 */
-    private fun showUpdateDialog(release: UpdateChecker.Release) {
-        val notes = release.notes.trim().ifEmpty { "优化体验并修复已知问题" }
-        androidx.appcompat.app.AlertDialog.Builder(this)
-            .setTitle("发现新版本 v${release.version}")
-            .setMessage(notes)
-            .setPositiveButton("立即更新") { _, _ -> downloadApk(release) }
-            .setNegativeButton("取消", null)
-            .show()
-    }
-
-    /** 用系统 DownloadManager 把更新包下载到应用专属目录；CDN 加速，失败自动换源 */
-    @Suppress("DEPRECATION")
-    private fun downloadApk(release: UpdateChecker.Release) {
-        val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-        pendingDownloadFile = File(dir, "player-v${release.version}-release.apk")
-        pendingDownloadVersion = release.version
-        // CDN 加速在前，GitHub 直连兜底
-        pendingDownloadUrls = ArrayDeque(
-            downloadSources.map { prefix -> prefix + release.apkUrl }
-        )
-        // Android 9 及以下需 WRITE_EXTERNAL_STORAGE 才能写入公共 Download
-        if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P && !hasWritePermission()) {
-            writePermission.launch(android.Manifest.permission.WRITE_EXTERNAL_STORAGE)
-            Toast.makeText(this, "需要存储权限以保存更新包到下载目录", Toast.LENGTH_SHORT).show()
-            return
-        }
-        enqueueDownload(pendingDownloadUrls.removeFirst())
-        Toast.makeText(this, "开始下载，完成后自动弹出安装", Toast.LENGTH_SHORT).show()
-    }
-
-    /** 用 DownManager 发起一次下载（每次下载前清掉旧文件，避免目标已存在被拒） */
-    private fun enqueueDownload(url: String) {
-        val file = pendingDownloadFile ?: return
-        // 清掉旧的同名包，避免 DownloadManager 因目标文件已存在而拒绝覆盖
-        file.delete()
-        val request = DownloadManager.Request(url.toUri())
-            .setTitle("影音盒 v$pendingDownloadVersion")
-            .setDescription("正在下载更新包")
-            .setMimeType("application/vnd.android.package-archive")
-            .setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, file.name)
-            .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-        lastDownloadId = downloadManager.enqueue(request)
-    }
-
-    /** 取回刚下载实现的更新包文件：直接用启动下载时记下的目标文件，避免「按最新 .apk」误取历史版本包 */
-    private fun downloadedApkFile(): File? =
-        pendingDownloadFile?.takeIf { it.exists() }
-
-    /** 是否已具备写入公共 Download 的权限（Android 9 及以下需 WRITE_EXTERNAL_STORAGE） */
-    private fun hasWritePermission(): Boolean =
-        Build.VERSION.SDK_INT > Build.VERSION_CODES.P ||
-            ContextCompat.checkSelfPermission(
-                this, android.Manifest.permission.WRITE_EXTERNAL_STORAGE
-            ) == PackageManager.PERMISSION_GRANTED
-
-    /** 安装成功后清理公共 Download 下的更新包（含历史版本），避免堆积 */
-    @Suppress("DEPRECATION")
-    private fun deleteInstalledUpdateApk() {
-        val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-        dir.listFiles { f -> f.name.startsWith("player-v") && f.name.endsWith("-release.apk") }
-            ?.forEach { it.delete() }
-    }
-
-    /** 安装更新包：FileProvider 暴露 APK 给系统安装器；Android 8+ 需「安装未知应用」授权 */
-    private fun installApk(file: File) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
-            && !packageManager.canRequestPackageInstalls()
-        ) {
-            // 未授权：跳到设置页，用户授权返回前台后自动继续安装
-            pendingInstallFile = file
             try {
-                startActivity(
-                    Intent(
-                        Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
-                        "package:$packageName".toUri()
-                    )
-                )
-            } catch (_: Exception) {
+                if (!hasStoragePermission()) {
+                    return@launch
+                }
+                val videos = scanner.queryVideos()
+                val audios = scanner.queryAudios()
+                withContext(Dispatchers.Main) {
+                    if (pruneDeletedMedia(videos, audios) > 0) {
+                        refreshPlaylist()
+                        savePlaylist()
+                    }
+                }
+            } finally {
+                isScanning = false
             }
-            Toast.makeText(this, "请允许本应用安装未知应用，返回后将自动继续", Toast.LENGTH_LONG).show()
-            return
-        }
-        val uri = FileProvider.getUriForFile(this, "$packageName.file-provider", file)
-        val intent = Intent(Intent.ACTION_VIEW).apply {
-            setDataAndType(uri, "application/vnd.android.package-archive")
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        }
-        try {
-            startActivity(intent)
-        } catch (_: Exception) {
-            Toast.makeText(this, "无法启动安装器，请在下载通知中手动安装", Toast.LENGTH_SHORT).show()
         }
     }
+
+    /**
+     * 用 MediaStore 扫描结果对账播放列表，移除「文件已从系统媒体库删除」的条目
+     * （同时清理其播放进度与控制器队列中的对应项）。
+     *
+     * 权限保护：API 34+ 用户可能只授予「仅选中的照片/视频」(READ_MEDIA_VISUAL_USER_SELECTED)，
+     * 此时 MediaStore 查询结果只含被选中的文件，若会把……「误删未授权但
+     * 仍存在的文件。因此仅当拿到对应媒体类型的完整读取权限时才执行该类型的删除对账。
+     *
+     * @param scannedVideos 本次扫描到的视频集合
+     * @param scannedAudios 本次扫描到的音频集合
+     * @return 被移除的条数
+     */
+    private fun pruneDeletedMedia(
+        scannedVideos: List<MediaItemData>,
+        scannedAudios: List<MediaItemData>
+    ): Int {
+        val videoKeys = if (scanner.hasFullMediaAccess(android.Manifest.permission.READ_MEDIA_VIDEO)) {
+            scannedVideos.map { normalizeUri(it.uri) }.toSet()
+        } else null
+        val audioKeys = if (scanner.hasFullMediaAccess(android.Manifest.permission.READ_MEDIA_AUDIO)) {
+            scannedAudios.map { normalizeUri(it.uri) }.toSet()
+        } else null
+        val videoPrefix = MediaStore.Video.Media.EXTERNAL_CONTENT_URI.toString()
+        val audioPrefix = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI.toString()
+        var removed = 0
+        // 逆序遍历，保证删除过程下标不失效（playlist 与控制器队列保持同步）
+        for (i in playlist.indices.reversed()) {
+            val item = playlist[i]
+            val uriStr = item.uri.toString()
+            val keys = when {
+                uriStr.startsWith(videoPrefix) -> videoKeys
+                uriStr.startsWith(audioPrefix) -> audioKeys
+                else -> null
+            }
+            if (keys != null && normalizeUri(item.uri) !in keys) {
+                clearProgress(item.uri)
+                playlist.removeAt(i)
+                controller?.removeMediaItem(i)
+                if (i < currentIndex) currentIndex--
+                removed++
+            }
+        }
+        // 有删除时同步校正适配器高亮下标，避免删除后播放项高亮漂移
+        if (removed > 0) {
+            adapter.setCurrentPlaying(
+                currentIndex.takeIf { it in playlist.indices } ?: -1,
+                controller?.isPlaying == true
+            )
+        }
+        return removed
+    }
+
+    // ===== 生命周期 =====
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
+
+        updateManager = UpdateManager(this)
+        gestures = GestureController(this, binding.playerView, binding.gestureOverlay) { controller }
+        fullscreenPip = FullscreenPipHelper(this, binding) { controller }
 
         // 构建列表适配器：点击播放（优先断点续播），删除移除
         adapter = MediaListAdapter(
@@ -1187,7 +558,7 @@ class MainActivity : AppCompatActivity() {
             onDelete = { index ->
                 if (index !in playlist.indices) return@MediaListAdapter
                 val item = playlist[index]
-                androidx.appcompat.app.AlertDialog.Builder(this)
+                AlertDialog.Builder(this)
                     .setTitle("删除条目")
                     .setMessage("确定从播放列表中删除「${item.name}」吗？\n该文件的播放进度也会被清除。")
                     .setPositiveButton("删除") { _, _ -> removeItemFromPlaylist(index) }
@@ -1206,7 +577,7 @@ class MainActivity : AppCompatActivity() {
                 requestStoragePermission()
             }
         }
-        binding.btnPip.setOnClickListener { enterPipMode() }
+        binding.btnPip.setOnClickListener { fullscreenPip.enterPipMode() }
         // 溢出菜单（⋮）：手动检查更新
         binding.btnMore.setOnClickListener { anchor ->
             val popup = PopupMenu(this, anchor)
@@ -1214,7 +585,7 @@ class MainActivity : AppCompatActivity() {
             popup.setOnMenuItemClickListener { item ->
                 when (item.itemId) {
                     MENU_ID_CHECK_UPDATE -> {
-                        checkForUpdate(manual = true)
+                        updateManager.checkForUpdate(manual = true)
                         true
                     }
                     else -> false
@@ -1223,13 +594,13 @@ class MainActivity : AppCompatActivity() {
             popup.show()
         }
         binding.playerView.setFullscreenButtonClickListener { enabled ->
-            setFullscreen(enabled)
+            fullscreenPip.setFullscreen(enabled)
         }
         // 返回键：全屏时先退出全屏，否则退出界面
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
-                if (isFullscreen) {
-                    setFullscreen(false)
+                if (fullscreenPip.isFullscreen) {
+                    fullscreenPip.setFullscreen(false)
                 } else {
                     finish()
                 }
@@ -1237,40 +608,22 @@ class MainActivity : AppCompatActivity() {
         })
 
         setupControllerExtras()
-        setupGestures()
+        gestures.setup()
 
         // API 33+ 申请通知权限
         if (Build.VERSION.SDK_INT >= 33) {
             notifPermission.launch(android.Manifest.permission.POST_NOTIFICATIONS)
         }
 
-        // 监听更新包下载完成（API 33+ 需 RECEIVER_NOT_EXPORTED 标志）
-        ContextCompat.registerReceiver(
-            this, downloadCompleteReceiver,
-            IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE),
-            ContextCompat.RECEIVER_NOT_EXPORTED
-        )
-        // 本应用被新版本替换后清理公共 Download 里的更新包
-        ContextCompat.registerReceiver(
-            this, packageReplacedReceiver,
-            IntentFilter(Intent.ACTION_MY_PACKAGE_REPLACED),
-            ContextCompat.RECEIVER_NOT_EXPORTED
-        )
+        updateManager.registerReceivers()
         // 冷启动静默检查一次新版本（失败不打扰）
-        checkForUpdate(manual = false)
+        updateManager.checkForUpdate(manual = false)
     }
 
     override fun onStart() {
         super.onStart()
         // 用户已在设置页授权「安装未知应用」：继续完成被挂起的更新安装
-        pendingInstallFile?.let { file ->
-            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O
-                || packageManager.canRequestPackageInstalls()
-            ) {
-                pendingInstallFile = null
-                installApk(file)
-            }
-        }
+        updateManager.resumePendingInstall()
         // 监听本地媒体库变化，实现新增/修改时的去重增量自动扫描
         contentResolver.registerContentObserver(
             MediaStore.Video.Media.EXTERNAL_CONTENT_URI, true, mediaChangeObserver
@@ -1298,32 +651,37 @@ class MainActivity : AppCompatActivity() {
             ctrl.addListener(playerListener)
             currentIndex = ctrl.currentMediaItemIndex
             adapter.setCurrentPlaying(currentIndex, ctrl.isPlaying)
-            // 首次进入才从磁盘恢复列表，避免服务存活重建时重复加载
-            if (!playlistLoaded) {
-                loadPlaylist()
-                playlistLoaded = true
-            } else {
-                // 回前台：用磁盘(Service 已完成的清理)校正内存，防止后台播完项的残留进度复活
-                reconcileProgressFromDisk()
-            }
-            // 队列与内存列表数量不一致时(含控制器尚为空/重连失步)全量重灌自愈；
-            // 空队列时 cur 为 null，天然不触发 seek
-            if (playlist.isNotEmpty() && ctrl.mediaItemCount != playlist.size) {
-                val cur = ctrl.currentMediaItem
-                val curUri = cur?.localConfiguration?.uri?.toString()
-                val curPos = ctrl.currentPosition
-                ctrl.clearMediaItems()
-                for (item in playlist) {
-                    ctrl.addMediaItem(M3MediaItem.fromUri(item.uri))
+            // 数据相关部分等仓库一次性加载完成（通常早已就绪）后再执行，
+            // 挂起恢复后重新读取 ctrl 状态，无过期读取风险
+            lifecycleScope.launch {
+                PlayerRepository.awaitLoaded(this@MainActivity)
+                // 首次进入才从持久层恢复列表，避免服务存活重建时重复加载
+                if (!playlistLoaded) {
+                    loadPlaylist()
+                    playlistLoaded = true
+                } else {
+                    // 回前台：用持久层(Service 已完成的清理)校正内存，防止后台播完项的残留进度复活
+                    reconcileProgressFromDisk()
                 }
-                val curIdx = curUri?.let { u -> playlist.indexOfFirst { it.uri.toString() == u } }
-                if (curIdx != null && curIdx >= 0) {
-                    ctrl.seekTo(curIdx, curPos)
+                // 队列与内存列表数量不一致时(含控制器尚为空/重连失步)全量重灌自愈；
+                // 空队列时 cur 为 null，天然不触发 seek
+                if (playlist.isNotEmpty() && ctrl.mediaItemCount != playlist.size) {
+                    val cur = ctrl.currentMediaItem
+                    val curUri = cur?.localConfiguration?.uri?.toString()
+                    val curPos = ctrl.currentPosition
+                    ctrl.clearMediaItems()
+                    for (item in playlist) {
+                        ctrl.addMediaItem(M3MediaItem.fromUri(item.uri))
+                    }
+                    val curIdx = curUri?.let { u -> playlist.indexOfFirst { it.uri.toString() == u } }
+                    if (curIdx != null && curIdx >= 0) {
+                        ctrl.seekTo(curIdx, curPos)
+                    }
                 }
+                // 冷启动/服务重建后恢复上次播放项(仅定位 + 断点，等用户按播放)
+                restoreLastPlayed()
+                refreshPlaylist()
             }
-            // 冷启动/服务重建后恢复上次播放项(仅定位 + 断点，等用户按播放)
-            restoreLastPlayed()
-            refreshPlaylist()
         }, ContextCompat.getMainExecutor(this))
     }
 
@@ -1332,11 +690,8 @@ class MainActivity : AppCompatActivity() {
         contentResolver.unregisterContentObserver(mediaChangeObserver)
         scanHandler.removeCallbacks(debouncedScanRunnable)
         // PiP 关闭返回前台时暂停播放，并复位 PiP 状态
-        if (isInPipMode) {
-            controller?.pause()
-            isInPipMode = false
-        }
-        gestureHandler.removeCallbacks(hideOverlayRunnable)
+        fullscreenPip.onStopped()
+        gestures.cancelPendingHide()
         saveCurrentProgress()
         // 释放控制器与播放器视图的绑定
         binding.playerView.player = null
@@ -1353,20 +708,20 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
-        // 注销更新包下载完成监听
-        try {
-            unregisterReceiver(downloadCompleteReceiver)
-        } catch (_: Exception) {
-        }
-        // 注销应用替换监听
-        try {
-            unregisterReceiver(packageReplacedReceiver)
-        } catch (_: Exception) {
-        }
-        // 取消磁盘写调度器，避免泄漏
-        diskWriteScope.cancel()
+        // 注销更新相关系统广播（下载完成/应用替换）
+        updateManager.unregisterReceivers()
         super.onDestroy()
     }
+
+    override fun onPictureInPictureModeChanged(
+        isInPictureInPictureMode: Boolean,
+        newConfig: Configuration
+    ) {
+        super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
+        fullscreenPip.onPipModeChanged(isInPictureInPictureMode)
+    }
+
+    // ===== 存储权限 =====
 
     /** 是否已获得存储读取权限（API 33+ 检查媒体权限，旧版本检查外部存储权限） */
     private fun hasStoragePermission(): Boolean {

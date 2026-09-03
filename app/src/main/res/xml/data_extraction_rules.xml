@@ -1,12 +1,16 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- Android 12+ 的云备份与设备迁移规则：
-     把「播放列表/进度」所在的 SharedPreferences(player.xml) 排除在备份之外，
+     把「播放列表/进度」所在的 Room 数据库（player.db 及其 WAL/SHM 文件）排除在备份之外，
      这样用户卸载重装后不会恢复旧播放列表。 -->
 <data-extraction-rules>
     <cloud-backup>
-        <exclude domain="sharedpref" path="player.xml" />
+        <exclude domain="database" path="player.db" />
+        <exclude domain="database" path="player.db-wal" />
+        <exclude domain="database" path="player.db-shm" />
     </cloud-backup>
     <device-transfer>
-        <exclude domain="sharedpref" path="player.xml" />
+        <exclude domain="database" path="player.db" />
+        <exclude domain="database" path="player.db-wal" />
+        <exclude domain="database" path="player.db-shm" />
     </device-transfer>
 </data-extraction-rules>

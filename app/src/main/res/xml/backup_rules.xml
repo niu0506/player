@@ -1,6 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- Android 11 (API 30) 及更早版本的备份规则：
-     排除「播放列表/进度」所在的 SharedPreferences(player.xml)，卸载重装后不恢复旧列表。 -->
+     排除「播放列表/进度」所在的 Room 数据库（player.db 及其 WAL/SHM 文件），
+     卸载重装后不恢复旧列表。 -->
 <full-backup-content>
-    <exclude domain="sharedpref" path="player.xml" />
+    <exclude domain="database" path="player.db" />
+    <exclude domain="database" path="player.db-wal" />
+    <exclude domain="database" path="player.db-shm" />
 </full-backup-content>

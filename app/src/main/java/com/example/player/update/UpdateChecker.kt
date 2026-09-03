@@ -1,4 +1,4 @@
-package com.example.player
+package com.example.player.update
 
 import org.json.JSONArray
 import org.json.JSONObject
