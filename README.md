@@ -45,8 +45,8 @@
 - 语言：Kotlin
 - 最低支持 / 目标版本：minSdk 24 / targetSdk 35
 - 播放器：androidx.media3 1.5.1（ExoPlayer + MediaSession + MediaController）
-- 架构：前台服务（`PlayerService`）+ 单 Activity（`MainActivity`），经 MediaController 通信
-- 持久化：SharedPreferences + JSON（播放列表与进度映射分离存储，统一「合并写」入口并跨线程互斥）
+- 架构：前台服务（`PlayerService`）+ 单 Activity（`MainActivity`），经 MediaController 通信；按 `model` / `data` / `playback` / `ui` / `update` 分包，UI 逻辑拆分为 `GestureController`、`FullscreenPipHelper`、`UpdateManager`、`MediaStoreScanner` 等职责类
+- 持久化：Room 数据库（播放列表、进度映射、KV 分表存储，统一「合并写」入口；首次启动自动迁移旧 SharedPreferences 数据）
 - 更新下载：系统 DownloadManager + FileProvider 暴露 APK 给安装器
 - UI：ViewBinding + RecyclerView（DiffUtil 后台差分刷新）
 - 构建：AGP + Kotlin DSL (Gradle)，GitHub Actions CI 自动构建
@@ -87,18 +87,34 @@ Release 签名信息按优先级取自：
 
 ```
 app/src/main/java/com/example/player/
-├── MainActivity.kt      # UI、播放列表、手势、PiP/全屏、进度恢复与更新下载安装
-├── PlayerService.kt     # 前台服务、后台播放、进度持久化（统一合并写入口）
-├── MediaListAdapter.kt  # 播放列表 RecyclerView 适配器（DiffUtil 后台差分）
-├── MediaItemData.kt     # 数据模型与时长格式化工具
-└── UpdateChecker.kt     # 应用内更新检查（GitHub Releases / jsDelivr 兜底）
+├── MainActivity.kt                  # UI 入口、播放列表、进度恢复与更新流程编排
+├── PlayerApp.kt                     # Application 初始化
+├── model/
+│   └── MediaItemData.kt             # 数据模型与时长格式化工具
+├── data/
+│   ├── MediaStoreScanner.kt         # 媒体库扫描（增量扫描、防抖、变化监听）
+│   └── PlayerRepository.kt          # Room 数据库与统一合并写入口（含旧数据迁移）
+├── playback/
+│   └── PlayerService.kt             # 前台服务、后台播放、进度持久化
+├── ui/
+│   ├── GestureController.kt         # 手势控制（双击快进/退、亮度/音量、滑动 seek）
+│   ├── FullscreenPipHelper.kt       # 全屏与画中画切换
+│   └── playlist/
+│       └── MediaListAdapter.kt      # 播放列表 RecyclerView 适配器（DiffUtil 后台差分）
+└── update/
+    ├── UpdateChecker.kt             # 应用内更新检查（GitHub Releases / jsDelivr 兜底）
+    └── UpdateManager.kt             # 更新下载与安装流程（DownloadManager + 安装器）
 
 app/src/test/java/com/example/player/
-├── PlaybackProgressTest.kt              # 进度合并语义（非覆盖/0 值保护/移除优先）
-├── ProgressDiskIOTest.kt                # 并发读写盘互斥（丢更新/进度复活回归）
-├── MediaListAdapterCurrentPlayingTest.kt# 列表高亮越界防护
-├── UpdateCheckerTest.kt                 # 语义化版本比较
-└── FormatTimeTest.kt                    # 时长格式化
+├── data/
+│   ├── PlaybackProgressTest.kt                  # 进度合并语义（非覆盖/0 值保护/移除优先）
+│   └── LegacyPrefsMigrationTest.kt              # 旧 SharedPreferences → Room 迁移
+├── model/
+│   └── FormatTimeTest.kt                         # 时长格式化
+├── ui/playlist/
+│   └── MediaListAdapterCurrentPlayingTest.kt     # 列表高亮越界防护
+└── update/
+    └── UpdateCheckerTest.kt                      # 语义化版本比较
 ```
 
 ## License
