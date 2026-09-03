@@ -1,5 +1,5 @@
 {
-  "version": "1.3.0",
-  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.3.0/player-v1.3.0-release.apk",
-  "notes": "内部重构：拆分 1361 行 MainActivity 为 UpdateManager/MediaStoreScanner/GestureController/FullscreenPipHelper 等职责类，按 model/data/playback/ui/update 分包；持久化迁移到 Room 数据库（含旧数据自动迁移）；行为无变化，冒烟测试通过。"
+  "version": "1.4.0",
+  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.4.0/player-v1.4.0-release.apk",
+  "notes": "内部重构：源码扁平化为单包结构，移除 model/data/playback/ui/update 子包，11 个主源码文件合并为 5 个（MainActivity/PlayerRepository/PlayerService/PlayerUi/UpdateManager），测试合并为单文件；行为无变化，32 个单元测试全部通过。"
 }
