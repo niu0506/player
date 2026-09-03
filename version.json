@@ -1,5 +1,5 @@
 {
-  "version": "1.2.14",
-  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.2.14/player-v1.2.14-release.apk",
-  "notes": "崩溃与数据安全修复：修复列表高亮下标越界（应用重连或扫描新增后 diff 未完成时可能崩溃），播放高亮现在做双向边界检查；进度「读盘→合并→写盘」在前后台线程间统一加互斥锁，消除并发合并丢更新导致已删进度「复活」或新进度被旧快照覆盖的竞态；为以上两处修复补充并发回归单元测试；完善 README（应用内更新、签名、CI 与测试说明）。"
+  "version": "1.3.0",
+  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.3.0/player-v1.3.0-release.apk",
+  "notes": "内部重构：拆分 1361 行 MainActivity 为 UpdateManager/MediaStoreScanner/GestureController/FullscreenPipHelper 等职责类，按 model/data/playback/ui/update 分包；持久化迁移到 Room 数据库（含旧数据自动迁移）；行为无变化，冒烟测试通过。"
 }
