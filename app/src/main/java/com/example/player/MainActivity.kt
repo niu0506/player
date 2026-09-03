@@ -1,5 +1,6 @@
 package com.example.player
 
+import android.app.Application
 import android.content.ComponentName
 import android.content.pm.PackageManager
 import android.content.res.Configuration
@@ -31,20 +32,23 @@ import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
 import androidx.media3.ui.TrackSelectionDialogBuilder
 import androidx.recyclerview.widget.LinearLayoutManager
-import com.example.player.data.MediaStoreScanner
-import com.example.player.data.PlayerRepository
 import com.example.player.databinding.ActivityMainBinding
-import com.example.player.model.MediaItemData
-import com.example.player.model.normalizeUri
-import com.example.player.playback.PlayerService
-import com.example.player.ui.FullscreenPipHelper
-import com.example.player.ui.GestureController
-import com.example.player.ui.playlist.MediaListAdapter
-import com.example.player.update.UpdateManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import androidx.media3.common.MediaItem as M3MediaItem
+
+/**
+ * 应用入口：进程启动时最先执行，触发持久化仓库的一次性加载
+ * （Room 建库 + 旧 SharedPreferences 数据迁移），保证任何组件
+ * （MainActivity / PlayerService）运行时数据已就绪或写入自动排队。
+ */
+class PlayerApp : Application() {
+    override fun onCreate() {
+        super.onCreate()
+        PlayerRepository.ensureLoaded(this)
+    }
+}
 
 /**
  * 主界面：播放器 + 播放列表面板。

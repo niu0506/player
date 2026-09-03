@@ -53,7 +53,7 @@
 
         <!-- 后台播放服务；通过 MediaSessionService action 暴露给控制器 -->
         <service
-            android:name=".playback.PlayerService"
+            android:name=".PlayerService"
             android:exported="true"
             android:foregroundServiceType="mediaPlayback"
             tools:ignore="ExportedService">

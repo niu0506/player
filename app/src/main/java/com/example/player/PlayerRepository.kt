@@ -1,7 +1,14 @@
-package com.example.player.data
+package com.example.player
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.content.pm.PackageManager
+import android.net.Uri
+import android.os.Build
+import android.provider.BaseColumns
+import android.provider.MediaStore
+import android.util.LruCache
+import androidx.core.content.ContextCompat
 import androidx.core.content.edit
 import androidx.core.net.toUri
 import androidx.room.ColumnInfo
@@ -16,7 +23,6 @@ import androidx.room.Room
 import androidx.room.RoomDatabase
 import androidx.room.Transaction
 import androidx.room.withTransaction
-import com.example.player.model.MediaItemData
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
@@ -30,6 +36,123 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.Locale
+
+// ==================== 数据模型 ====================
+
+/**
+ * 播放列表中的单个媒体项描述。
+ *
+ * 只承载媒体本身的元信息（来源、名称、时长）。播放进度不放在这里，而是统一存在
+ * uri -> position 的进度映射中（Room `progress` 表 + 内存 `cachedProgress`），
+ * 避免同一份进度被存成多份导致对账复杂化（见 PlayerService 的 writeToDisk / 进度落盘唯一入口）。
+ */
+data class MediaItemData(
+    /** 媒体的来源地址（通常是 ContentResolver 查询到的 Uri） */
+    val uri: Uri,
+    /** 媒体文件显示名称，用于在列表中展示 */
+    val name: String,
+    /** 媒体总时长（毫秒），扫描时可能未知，播放后回填 */
+    val duration: Long = 0L
+)
+
+/**
+ * 规整化 Uri 字符串，作为去重/匹配的稳定 key。
+ * 去掉 query 参数与末尾 '/'，并拼接末段路径，用于区分不同集合下同名的条目。
+ */
+fun normalizeUri(uri: Uri): String {
+    val base = uri.buildUpon().clearQuery().build().toString().trimEnd('/')
+    val lastSeg = uri.lastPathSegment ?: base
+    return "$base|$lastSeg"
+}
+
+/**
+ * 把毫秒格式化为播放时长文本。
+ * 不足 1 小时显示「分:秒」（如 12:34），满 1 小时显示「时:分:秒」（如 1:02:03）。
+ * 供播放列表时长、手势进度预览等共用，替代原先分散的格式化方法。
+ *
+ * 格式化结果按毫秒值做有界缓存：列表滚动绑定（时长/进度不断重复格式化）与
+ * 进度条刷新场景中相同数值会被反复请求，缓存可直接命中避免重复构造字符串。
+ */
+private val timeFormatCache = LruCache<Long, String>(512)
+
+fun formatTime(ms: Long): String {
+    timeFormatCache.get(ms)?.let { return it }
+    val totalSec = ms / 1000
+    val h = totalSec / 3600
+    val m = totalSec % 3600 / 60
+    val s = totalSec % 60
+    val result = if (h > 0) String.format(Locale.US, "%d:%02d:%02d", h, m, s)
+    else String.format(Locale.US, "%02d:%02d", m, s)
+    timeFormatCache.put(ms, result)
+    return result
+}
+
+// ==================== 本地媒体库扫描 ====================
+
+/**
+ * 本地媒体库扫描器：封装 MediaStore 的查询细节与权限判定。
+ *
+ * 只负责「读」：查询系统媒体库中的视频/音频、判断是否具备某类媒体的
+ * 全量读取权限。播放列表的合并/去重/清理等状态编排由上层（MainActivity）负责。
+ */
+class MediaStoreScanner(private val context: Context) {
+
+    /** 查询系统媒体库中的全部视频（按名称升序） */
+    fun queryVideos(): List<MediaItemData> = query(MediaStore.Video.Media.EXTERNAL_CONTENT_URI)
+
+    /** 查询系统媒体库中的全部音频（按名称升序） */
+    fun queryAudios(): List<MediaItemData> = query(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI)
+
+    /**
+     * 查询 MediaStore 获取媒体文件列表。
+     * @param contentUri 视频或音频的集合 Uri
+     * @return 查询到的媒体列表（可能为空）
+     */
+    private fun query(contentUri: Uri): List<MediaItemData> {
+        val items = mutableListOf<MediaItemData>()
+        val projection = arrayOf(
+            BaseColumns._ID,
+            MediaStore.MediaColumns.DISPLAY_NAME,
+            MediaStore.MediaColumns.DURATION
+        )
+        try {
+            context.contentResolver.query(
+                contentUri, projection, null, null,
+                "${MediaStore.MediaColumns.DISPLAY_NAME} ASC"
+            )?.use { cursor ->
+                val idIdx = cursor.getColumnIndexOrThrow(BaseColumns._ID)
+                val nameIdx = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DISPLAY_NAME)
+                val durIdx = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DURATION)
+                while (cursor.moveToNext()) {
+                    val id = cursor.getLong(idIdx)
+                    val name = cursor.getString(nameIdx)
+                    val duration = cursor.getLong(durIdx)
+                    items.add(
+                        MediaItemData(Uri.withAppendedPath(contentUri, id.toString()), name, duration)
+                    )
+                }
+            }
+        } catch (_: Exception) {
+        }
+        return items
+    }
+
+    /**
+     * 是否具备指定媒体类型的「全量」读取权限（API 34+ 的「仅选中」授权不算全量）。
+     * 用于删除对账前的保护：避免在部分授权下把「未授权但仍存在」的文件误判为已删除。
+     */
+    fun hasFullMediaAccess(permission: String): Boolean {
+        if (Build.VERSION.SDK_INT < 33) {
+            return ContextCompat.checkSelfPermission(
+                context, android.Manifest.permission.READ_EXTERNAL_STORAGE
+            ) == PackageManager.PERMISSION_GRANTED
+        }
+        return ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED
+    }
+}
+
+// ==================== Room 持久化层 ====================
 
 /**
  * 持久化层：Room 数据库 + 内存镜像仓库。
@@ -46,8 +169,6 @@ import org.json.JSONObject
  * - **flush**：Service 销毁等需要同步落盘的场景，join 全部已提交写任务
  *   （替代旧 commit() 同步写盘）
  */
-
-// ---------- 实体 ----------
 
 /** 播放列表条目（sortOrder 维护列表顺序） */
 @Entity(tableName = "playlist")
@@ -71,8 +192,6 @@ data class KvEntity(
     @PrimaryKey @ColumnInfo(name = "key") val key: String,
     val value: String?,
 )
-
-// ---------- DAO（全 suspend，仅可在后台线程调用） ----------
 
 @Dao
 interface PlaylistDao {
@@ -314,6 +433,8 @@ object PlayerRepository {
         prefs.edit { clear() }
     }
 }
+
+// ==================== 纯函数与旧数据迁移解析 ====================
 
 /**
  * 进度合并纯函数：在已有进度 [disk] 上，先剔除 [removes] 中的条目，再合并 [writes](仅 >0)。

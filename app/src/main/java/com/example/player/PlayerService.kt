@@ -1,4 +1,4 @@
-package com.example.player.playback
+package com.example.player
 
 import android.content.Intent
 import android.os.Handler
@@ -15,7 +15,6 @@ import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
-import com.example.player.data.PlayerRepository
 import kotlin.time.Duration.Companion.milliseconds
 
 /**
