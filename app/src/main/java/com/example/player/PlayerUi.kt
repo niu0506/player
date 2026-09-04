@@ -92,8 +92,8 @@ class FullscreenPipHelper(
             lp.setMargins(0, 0, 0, 0)
             binding.playerCard.layoutParams = lp
         } else if (isFullscreen) {
-            // 全屏：ZOOM 等比放大铺满屏幕，无圆角无边距，避免黑边
-            binding.playerView.setResizeMode(AspectRatioFrameLayout.RESIZE_MODE_ZOOM)
+            // 全屏：FIT 保持原始比例完整显示，超出部分留黑边
+            binding.playerView.setResizeMode(AspectRatioFrameLayout.RESIZE_MODE_FIT)
             binding.playerCard.radius = 0f
             val lp = binding.playerCard.layoutParams as ViewGroup.MarginLayoutParams
             lp.setMargins(0, 0, 0, 0)
@@ -124,8 +124,8 @@ class FullscreenPipHelper(
             lp.setMargins(0, 0, 0, 0)
             binding.playerCard.radius = 0f
             binding.playerCard.layoutParams = lp
-            // 全屏：ZOOM 等比放大铺满屏幕，裁剪溢出部分，避免黑边
-            binding.playerView.setResizeMode(AspectRatioFrameLayout.RESIZE_MODE_ZOOM)
+            // 全屏：FIT 保持原始比例完整显示，超出部分留黑边
+            binding.playerView.setResizeMode(AspectRatioFrameLayout.RESIZE_MODE_FIT)
             activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
             hideSystemBars()
         } else {
