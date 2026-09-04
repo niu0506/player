@@ -257,16 +257,21 @@ class PlayerService : MediaSessionService() {
         }
 
         /**
-         * 供前端在「切到别的条目」之前调用，把当前正在播放项的精确进度立即落盘。
+         * 供前端在「切到别的条目」之前调用，把当前正在播放项的精确进度立即持久化。
          * 背景：onMediaItemTransition 触发时播放器已经切到新条目，此时按 currentItem 读取
          * 拿到的是新条目位置，旧的正在播放项进度会因此丢失（只能靠 2 秒周期上报兜底）。
          * 因此在 seekTo 切换前先同步抓取当前项位置并立即持久化。
+         *
+         * 落盘采用异步（sync=false）：进度值已同步抓进缓存并按提交顺序排队落库，
+         * 续播正确性不受影响；此前 sync=true 会在主线程 runBlocking 等待磁盘 IO，
+         * 每次点列表项最坏阻塞 2 秒。磁盘可靠性由周期上报 + seek 触发的
+         * onPositionDiscontinuity 落盘多层兜底。
          */
         fun flushCurrentPosition() {
             val svc = instance ?: return
             val player = svc.mediaSession?.player ?: return
             svc.cacheCurrentPosition(player)
-            svc.persistProgress(sync = true)
+            svc.persistProgress(sync = false)
         }
     }
 }

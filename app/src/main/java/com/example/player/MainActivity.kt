@@ -386,7 +386,8 @@ class MainActivity : AppCompatActivity() {
 
     // ===== 本地媒体扫描与对账 =====
 
-    /** 是否正在扫描（防止重复触发导致重复添加） */
+    /** 是否正在扫描（防止重复触发导致重复添加）。主线程读写、IO 线程收尾复位，需保证可见性 */
+    @Volatile
     private var isScanning = false
 
     /**
@@ -418,10 +419,15 @@ class MainActivity : AppCompatActivity() {
                 val videos = scanner.queryVideos()
                 val audios = scanner.queryAudios()
                 withContext(Dispatchers.Main) {
+                    if (videos == null && audios == null) {
+                        Toast.makeText(this@MainActivity, "扫描失败，请稍后重试", Toast.LENGTH_SHORT).show()
+                        return@withContext
+                    }
                     val scanned = mutableListOf<MediaItemData>()
-                    scanned.addAll(videos)
-                    scanned.addAll(audios)
-                    // 对账移除「文件已被外部删除」的条目，保证列表与实际文件一致
+                    videos?.let(scanned::addAll)
+                    audios?.let(scanned::addAll)
+                    // 对账移除「文件已被外部删除」的条目，保证列表与实际文件一致；
+                    // 查询失败的类型(null)由 pruneDeletedMedia 内部跳过其删除对账
                     val removedCount = pruneDeletedMedia(videos, audios)
                     val existingKeys = playlist.map { normalizeUri(it.uri) }.toSet()
                     // 过滤掉时长过短(<5秒)与已存在(去重)的条目
@@ -483,19 +489,21 @@ class MainActivity : AppCompatActivity() {
      * 权限保护：API 34+ 用户可能只授予「仅选中的照片/视频」(READ_MEDIA_VISUAL_USER_SELECTED)，
      * 此时 MediaStore 查询结果只含被选中的文件，若会把……「误删未授权但
      * 仍存在的文件。因此仅当拿到对应媒体类型的完整读取权限时才执行该类型的删除对账。
+     * 同理，某类型查询失败（[scannedVideos]/[scannedAudios] 为 null）时也跳过该类型的
+     * 删除对账：查询失败 ≠ 空结果，把失败当空集会整类误删。
      *
-     * @param scannedVideos 本次扫描到的视频集合
-     * @param scannedAudios 本次扫描到的音频集合
+     * @param scannedVideos 本次扫描到的视频集合，null 表示本次视频查询失败
+     * @param scannedAudios 本次扫描到的音频集合，null 表示本次音频查询失败
      * @return 被移除的条数
      */
     private fun pruneDeletedMedia(
-        scannedVideos: List<MediaItemData>,
-        scannedAudios: List<MediaItemData>
+        scannedVideos: List<MediaItemData>?,
+        scannedAudios: List<MediaItemData>?
     ): Int {
-        val videoKeys = if (scanner.hasFullMediaAccess(android.Manifest.permission.READ_MEDIA_VIDEO)) {
+        val videoKeys = if (scannedVideos != null && scanner.hasFullMediaAccess(android.Manifest.permission.READ_MEDIA_VIDEO)) {
             scannedVideos.map { normalizeUri(it.uri) }.toSet()
         } else null
-        val audioKeys = if (scanner.hasFullMediaAccess(android.Manifest.permission.READ_MEDIA_AUDIO)) {
+        val audioKeys = if (scannedAudios != null && scanner.hasFullMediaAccess(android.Manifest.permission.READ_MEDIA_AUDIO)) {
             scannedAudios.map { normalizeUri(it.uri) }.toSet()
         } else null
         val videoPrefix = MediaStore.Video.Media.EXTERNAL_CONTENT_URI.toString()
@@ -539,12 +547,15 @@ class MainActivity : AppCompatActivity() {
         gestures = GestureController(this, binding.playerView, binding.gestureOverlay) { controller }
         fullscreenPip = FullscreenPipHelper(this, binding) { controller }
 
-        // 构建列表适配器：点击播放（优先断点续播），删除移除
+        // 构建列表适配器：点击播放（优先断点续播），删除移除。
+        // 回调收到的是条目 uri（适配器 items 异步 diff 存在下标错位窗口），处理时现查下标
         adapter = MediaListAdapter(
-            onClick = { index ->
-                if (index in playlist.indices) {
+            onClick = { uri ->
+                // 用 uri 现查下标：点击与 diff 回写竞态时旧下标会指向错位条目
+                val index = playlist.indexOfFirst { it.uri.toString() == uri }
+                if (index >= 0) {
                     // 切走前先把当前播放项(A)的精确进度同时记录到内存与磁盘(saveCurrentProgress 更新
-                    // 续播所读的内存值；flushCurrentPosition 同步落盘)。因 onMediaItemTransition 触发
+                    // 续播所读的内存值；flushCurrentPosition 排队落盘)。因 onMediaItemTransition 触发
                     // 时 controller 已切到新条目、读不到旧项位置，必须在 seekTo 之前记录。
                     saveCurrentProgress()
                     PlayerService.flushCurrentPosition()
@@ -559,13 +570,17 @@ class MainActivity : AppCompatActivity() {
                     controller?.play()
                 }
             },
-            onDelete = { index ->
-                if (index !in playlist.indices) return@MediaListAdapter
-                val item = playlist[index]
+            onDelete = { uri ->
+                val item = playlist.firstOrNull { it.uri.toString() == uri }
+                    ?: return@MediaListAdapter
                 AlertDialog.Builder(this)
                     .setTitle("删除条目")
                     .setMessage("确定从播放列表中删除「${item.name}」吗？\n该文件的播放进度也会被清除。")
-                    .setPositiveButton("删除") { _, _ -> removeItemFromPlaylist(index) }
+                    .setPositiveButton("删除") { _, _ ->
+                        // 对话框存续期间列表可能位移（后台扫描对账/其它删除），确认时按 uri 重新定位
+                        playlist.indexOfFirst { it.uri.toString() == uri }
+                            .takeIf { it >= 0 }?.let { removeItemFromPlaylist(it) }
+                    }
                     .setNegativeButton("取消", null)
                     .show()
             }

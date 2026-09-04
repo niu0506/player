@@ -98,44 +98,48 @@ fun formatTime(ms: Long): String {
  */
 class MediaStoreScanner(private val context: Context) {
 
-    /** 查询系统媒体库中的全部视频（按名称升序） */
-    fun queryVideos(): List<MediaItemData> = query(MediaStore.Video.Media.EXTERNAL_CONTENT_URI)
+    /** 查询系统媒体库中的全部视频（按名称升序）；查询失败返回 null */
+    fun queryVideos(): List<MediaItemData>? = query(MediaStore.Video.Media.EXTERNAL_CONTENT_URI)
 
-    /** 查询系统媒体库中的全部音频（按名称升序） */
-    fun queryAudios(): List<MediaItemData> = query(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI)
+    /** 查询系统媒体库中的全部音频（按名称升序）；查询失败返回 null */
+    fun queryAudios(): List<MediaItemData>? = query(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI)
 
     /**
      * 查询 MediaStore 获取媒体文件列表。
      * @param contentUri 视频或音频的集合 Uri
-     * @return 查询到的媒体列表（可能为空）
+     * @return 查询到的媒体列表（可能为空）；查询失败（异常或拿不到游标）返回 null。
+     * 失败必须与「空结果」区分：空结果会被上层对账当作「全部已删除」，瞬时失败
+     * （provider 重启、SQLite 忙锁）若会被……吞导致整类条目被误删。
      */
-    private fun query(contentUri: Uri): List<MediaItemData> {
+    private fun query(contentUri: Uri): List<MediaItemData>? {
         val items = mutableListOf<MediaItemData>()
         val projection = arrayOf(
             BaseColumns._ID,
             MediaStore.MediaColumns.DISPLAY_NAME,
             MediaStore.MediaColumns.DURATION
         )
-        try {
-            context.contentResolver.query(
+        return try {
+            val cursor = context.contentResolver.query(
                 contentUri, projection, null, null,
                 "${MediaStore.MediaColumns.DISPLAY_NAME} ASC"
-            )?.use { cursor ->
-                val idIdx = cursor.getColumnIndexOrThrow(BaseColumns._ID)
-                val nameIdx = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DISPLAY_NAME)
-                val durIdx = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DURATION)
-                while (cursor.moveToNext()) {
-                    val id = cursor.getLong(idIdx)
-                    val name = cursor.getString(nameIdx)
-                    val duration = cursor.getLong(durIdx)
+            ) ?: return null
+            cursor.use {
+                val idIdx = it.getColumnIndexOrThrow(BaseColumns._ID)
+                val nameIdx = it.getColumnIndexOrThrow(MediaStore.MediaColumns.DISPLAY_NAME)
+                val durIdx = it.getColumnIndexOrThrow(MediaStore.MediaColumns.DURATION)
+                while (it.moveToNext()) {
+                    val id = it.getLong(idIdx)
+                    val name = it.getString(nameIdx)
+                    val duration = it.getLong(durIdx)
                     items.add(
                         MediaItemData(Uri.withAppendedPath(contentUri, id.toString()), name, duration)
                     )
                 }
             }
+            items
         } catch (_: Exception) {
+            null
         }
-        return items
     }
 
     /**

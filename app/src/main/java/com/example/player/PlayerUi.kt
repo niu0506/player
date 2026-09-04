@@ -437,12 +437,16 @@ class GestureController(
  * - 点击列表项播放对应媒体（通过 [onClick] 回调）
  * - 点击删除按钮移除列表项（通过 [onDelete] 回调）
  * - 实时刷新当前播放项 / 进度条 / 时长等信息
+ *
+ * 交互回调回传条目 uri 而非下标：items 经 submitList 异步 diff 后才回写，
+ * 存在「playlist 已变更、items 未跟上」的窗口，旧下标会指向错位条目；
+ * uri 是稳定身份，由调用方在处理时现查下标。
  */
 class MediaListAdapter(
-    /** 点击某个列表项时的回调，参数为被点击项的下标 */
-    private val onClick: (Int) -> Unit,
-    /** 点击删除按钮时的回调，参数为被删除项的下标 */
-    private val onDelete: (Int) -> Unit
+    /** 点击某个列表项时的回调，参数为被点击项的 uri（点击时点的身份标识，不受列表位移影响） */
+    private val onClick: (String) -> Unit,
+    /** 点击删除按钮时的回调，参数为待删除项的 uri */
+    private val onDelete: (String) -> Unit
 ) : RecyclerView.Adapter<MediaListAdapter.VH>() {
 
     /** 当前展示的数据副本（与外部 playlist 保持一致但不直接引用） */
@@ -591,9 +595,15 @@ class MediaListAdapter(
 
     /** 列表项视图持有者（inner 以便在 init 中绑定一次点击监听，避免每次绑定重建 lambda） */
     inner class VH(val binding: ItemMediaBinding) : RecyclerView.ViewHolder(binding.root) {
+        /** 取点击位置对应条目的 uri；位置无效（含 NO_POSITION）时返回 null */
+        private fun uriAt(position: Int): String? =
+            if (position == RecyclerView.NO_POSITION) null
+            else items.getOrNull(position)?.uri?.toString()
+
         init {
-            binding.itemRoot.setOnClickListener { onClick(bindingAdapterPosition) }
-            binding.btnDelete.setOnClickListener { onDelete(bindingAdapterPosition) }
+            // 回传 uri 而非下标，规避 diff 回写窗口内的下标错位（见类注释）
+            binding.itemRoot.setOnClickListener { uriAt(bindingAdapterPosition)?.let(onClick) }
+            binding.btnDelete.setOnClickListener { uriAt(bindingAdapterPosition)?.let(onDelete) }
         }
     }
 }
