@@ -7,11 +7,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 
-// ==================== formatTime 时长格式化 ====================
-
-/**
- * formatTime 的时长格式化测试。
- */
+/** formatTime 时长格式化测试 */
 class FormatTimeTest {
 
     @Test
@@ -40,12 +36,7 @@ class FormatTimeTest {
     }
 }
 
-// ==================== mergeProgressMap 进度合并 ====================
-
-/**
- * mergeProgressMap 的单元测试：覆盖「合并非覆盖 + 0 值不覆盖 + removes 优先剔除」语义，
- * 防止该进度合并逻辑的历史 bug 回归。
- */
+/** mergeProgressMap「合并非覆盖 + 0 值不覆盖 + removes 优先剔除」语义测试 */
 class PlaybackProgressTest {
 
     @Test
@@ -98,13 +89,7 @@ class PlaybackProgressTest {
     }
 }
 
-// ==================== 旧 SharedPreferences 数据迁移解析 ====================
-
-/**
- * 旧 SharedPreferences 数据迁移解析器的单元测试：
- * 覆盖 null/空/坏 JSON、进度仅保留 >0 值、列表按 uri 去重等迁移契约，
- * 防止「覆盖安装后旧数据丢失/脏数据入库」回归。
- */
+/** 旧 SharedPreferences 迁移解析测试：null/空/坏 JSON、进度 >0 过滤、列表去重 */
 class LegacyPrefsMigrationTest {
 
     // ---- parseLegacyProgressJson ----
@@ -175,20 +160,15 @@ class LegacyPrefsMigrationTest {
     }
 }
 
-// ==================== MediaListAdapter.setCurrentPlaying 边界检查 ====================
-
 /**
- * MediaListAdapter.setCurrentPlaying 边界检查的单元测试：
- * 守护「notifyItemChanged 一律做 items.indices 双向边界检查」的修复。
+ * MediaListAdapter.setCurrentPlaying 边界检查测试。
  *
- * 背景：调用方传入的下标来自 ExoPlayer 队列，而 adapter.items 经 submitList 异步
- * diff 后才回写，存在「队列已同步、items 未跟上」的窗口（Activity 重连时 items
- * 尚为空、扫描新增后 diff 未完成），越界 position 传给 RecyclerView 会在绑定时
- * 抛 IndexOutOfBoundsException。
+ * 传入下标来自 ExoPlayer 队列，items 经异步 diff 后才回写，存在越界窗口，
+ * 越界 position 传给 RecyclerView 会抛 IndexOutOfBoundsException。
  *
- * 说明：items 为私有字段且 submitList 需要 Main dispatcher（纯 JVM 测试不可用），
- * 故用反射直接填充。setCurrentPlaying 只读取列表大小、不读取元素内容，
- * 用任意对象占位即可；MediaItemData 依赖 android.net.Uri，在纯 JVM 下无法构造。
+ * 纯 JVM 限制：items 为私有字段且 MediaItemData 依赖 android.net.Uri 无法构造，
+ * 用反射填充占位；AdapterDataObservable 来自 mockable android.jar（空 stub），
+ * 需反射注入观察者列表让 notifyItemChanged 回调可被记录。
  */
 class MediaListAdapterCurrentPlayingTest {
 
@@ -210,12 +190,6 @@ class MediaListAdapterCurrentPlayingTest {
         attachObserver(adapter, observer)
     }
 
-    /**
-     * 纯 JVM 单测环境限制：AdapterDataObservable 的父类 android.database.Observable
-     * 来自 mockable android.jar（空 stub）——构造器不执行（mObservers 永为 null）、
-     * registerObserver 是空实现。因此不能用 registerAdapterDataObserver，
-     * 需反射注入观察者列表并手动挂上观察者，让 notifyItemChanged 的回调可被记录。
-     */
     @Suppress("UNCHECKED_CAST")
     private fun attachObserver(adapter: MediaListAdapter, observer: RecordingObserver) {
         val observableField = RecyclerView.Adapter::class.java.getDeclaredField("mObservable")
@@ -253,8 +227,6 @@ class MediaListAdapterCurrentPlayingTest {
 
     @Test
     fun `index beyond empty items notifies nothing`() {
-        // 场景：Activity 重连时 loadPlaylist 未执行、items 为空，
-        // 但 Service 存活使 controller.currentMediaItemIndex >= 0
         adapter.setCurrentPlaying(0, true)
         adapter.setCurrentPlaying(5, true)
         assertTrue(observer.changedPositions.isEmpty())
@@ -292,7 +264,6 @@ class MediaListAdapterCurrentPlayingTest {
 
     @Test
     fun `stale old index is suppressed after list shrinks`() {
-        // 场景：列表缩短后 diff 未完成，old 高亮下标已越界
         repeat(2) { items().add(Any()) }
         adapter.setCurrentPlaying(1)
         assertEquals(listOf(1), observer.changedPositions)
@@ -300,17 +271,13 @@ class MediaListAdapterCurrentPlayingTest {
         items().clear()
         observer.changedPositions.clear()
 
-        // old=1 与 index=0 均越界（空列表），不应产生任何回调
+        // 空列表时 old=1 与 index=0 均越界，不应产生任何回调
         adapter.setCurrentPlaying(0)
         assertTrue(observer.changedPositions.isEmpty())
     }
 }
 
-// ==================== UpdateChecker.isNewer 版本比较 ====================
-
-/**
- * UpdateChecker.isNewer 的语义化版本比较测试。
- */
+/** UpdateChecker.isNewer 语义化版本比较测试 */
 class UpdateCheckerTest {
 
     @Test
@@ -340,7 +307,6 @@ class UpdateCheckerTest {
 
     @Test
     fun `shorter version treated as zero padded`() {
-        // "1.2" 与 "1.2.0" 补零后相等，不视为更新
         assertFalse(UpdateChecker.isNewer("1.2", "1.2.0"))
         assertFalse(UpdateChecker.isNewer("1.2", "1.2.1"))
     }

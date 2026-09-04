@@ -1,5 +1,5 @@
 {
-  "version": "1.4.2",
-  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.4.2/player-v1.4.2-release.apk",
-  "notes": "全屏改为 FIT 模式：视频按原始比例完整显示、不再裁剪溢出的画面（比例为非常规时两侧会留黑边）；同时同步调整全屏切换时的缩放逻辑，PiP 小窗仍保持 ZOOM 填满。"
+  "version": "1.4.3",
+  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.4.3/player-v1.4.3-release.apk",
+  "notes": "清理冗余代码并精简注释：合并重复的条目删除、媒体扫描/对账、全屏与 PiP 样式、进度落盘等逻辑，删除无引用的图标资源；播放行为与功能保持不变。"
 }

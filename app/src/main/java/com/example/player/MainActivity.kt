@@ -38,11 +38,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import androidx.media3.common.MediaItem as M3MediaItem
 
-/**
- * 应用入口：进程启动时最先执行，触发持久化仓库的一次性加载
- * （Room 建库 + 旧 SharedPreferences 数据迁移），保证任何组件
- * （MainActivity / PlayerService）运行时数据已就绪或写入自动排队。
- */
+/** 应用入口：进程启动即触发仓库一次性加载（Room 建库 + 旧 prefs 迁移） */
 class PlayerApp : Application() {
     override fun onCreate() {
         super.onCreate()
@@ -51,52 +47,37 @@ class PlayerApp : Application() {
 }
 
 /**
- * 主界面：播放器 + 播放列表面板。
- *
- * 通过 [MediaController] 连接到 [PlayerService] 中的播放器进行控制，同时承担：
- * - 本地媒体扫描（视频/音频）并维护播放列表
- * - 播放进度的恢复与保存（内存缓存 + 磁盘持久化 + 列表项进度条）
- * - 倍速切换与音轨/字幕选择
- *
- * 显示模式（全屏/PiP）、手势交互、应用内更新分别委托给：
- * [FullscreenPipHelper]、[GestureController]、[UpdateManager]。
+ * 主界面：播放器 + 播放列表面板。经 MediaController 控制 PlayerService 中的播放器，
+ * 负责本地媒体扫描、播放进度恢复/保存、倍速与音轨/字幕选择；
+ * 全屏/PiP、手势、更新分别委托给 [FullscreenPipHelper]、[GestureController]、[UpdateManager]。
  */
 class MainActivity : AppCompatActivity() {
-    /** 视图绑定对象，提供对全部布局控件的访问 */
     private lateinit var binding: ActivityMainBinding
-    /** 播放列表适配器 */
     private lateinit var adapter: MediaListAdapter
-    /** 内存中的播放列表数据 */
     private val playlist = mutableListOf<MediaItemData>()
-    /** 异步构建 MediaController 的 Future（用于返回前台的重新连接） */
+    /** 异步构建 MediaController 的 Future（用于返回前台重新连接） */
     private var controllerFuture: com.google.common.util.concurrent.ListenableFuture<MediaController>? = null
-    /** 当前已连接上的 MediaController */
     private var controller: MediaController? = null
-    /** 当前正在播放的列表项下标，-1 表示无 */
+    /** 当前播放项下标，-1 表示无 */
     private var currentIndex = -1
-    /** 标记播放列表是否已从磁盘加载过（防止重复加载） */
+    /** 列表是否已从磁盘加载过（防止重复加载） */
     private var playlistLoaded = false
-    /** 内存中的播放进度缓存（uri 字符串 -> 位置毫秒） */
+    /** 内存进度缓存（uri -> 位置毫秒） */
     private val cachedProgress = mutableMapOf<String, Long>()
 
-    /** 本地媒体库扫描器（MediaStore 查询与全量权限判定） */
     private val scanner = MediaStoreScanner(this)
-    /** 应用内更新管家（检查更新、下载、安装） */
     private lateinit var updateManager: UpdateManager
-    /** 播放器手势控制（快进快退、亮度、音量、seek 预览） */
     private lateinit var gestures: GestureController
-    /** 全屏与画中画切换 */
     private lateinit var fullscreenPip: FullscreenPipHelper
 
     private companion object {
-        const val MENU_ID_CHECK_UPDATE = 100 // 溢出菜单里的「检查更新」项
+        const val MENU_ID_CHECK_UPDATE = 100
     }
 
-    /** 通知权限请求（API 33+ 需要） */
+    /** 通知权限请求（API 33+） */
     private val notifPermission = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { _ -> }
-    /** 存储权限请求（多个权限，用于扫描本地媒体） */
     private val storagePermission = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { grants: Map<String, Boolean> ->
@@ -107,17 +88,22 @@ class MainActivity : AppCompatActivity() {
 
     // ===== 播放列表管理 =====
 
-    /** 从播放列表删除某个条目（同步清理其播放进度、控制器与磁盘记录） */
-    private fun removeItemFromPlaylist(index: Int) {
+    /**
+     * 移除指定下标的条目（清理进度/控制器队列并校正 currentIndex），不含 UI 刷新与落盘。
+     * 删除当前项之前的条目不触发 transition，必须手动校正下标，否则残留下标会让「播完进度」复活。
+     */
+    private fun removeItemAt(index: Int) {
         if (index !in playlist.indices) return
-        val item = playlist[index]
-        clearProgress(item.uri)
+        clearProgress(playlist[index].uri)
         playlist.removeAt(index)
         controller?.removeMediaItem(index)
-        // 删除播放项之前的条目会使下标前移但不触发 transition，需手动校正 currentIndex，
-        // 否则残留下标会绕过 AUTO 清理分支，把"播完进度"写回复活
         if (index < currentIndex) currentIndex--
-        // 同步校正适配器内的高亮下标，否则删除后高亮漂移，直到下次切换/播放状态变化才自愈
+    }
+
+    /** 用户删除条目：移除后校正高亮、刷新 UI、落盘并提示 */
+    private fun removeItemFromPlaylist(index: Int) {
+        if (index !in playlist.indices) return
+        removeItemAt(index)
         adapter.setCurrentPlaying(
             currentIndex.takeIf { it in playlist.indices } ?: -1,
             controller?.isPlaying == true
@@ -127,38 +113,30 @@ class MainActivity : AppCompatActivity() {
         Toast.makeText(this, "已删除", Toast.LENGTH_SHORT).show()
     }
 
-    /** 刷新列表与顶部计数 / 空态提示 */
+    /** 刷新列表、顶部计数与空态提示 */
     private fun refreshPlaylist() {
-        // 先把当前内存进度刷进适配器，保证进度条展示与 cachedProgress 一致
         adapter.setProgress(cachedProgress)
         adapter.submitList(playlist.toList())
         binding.tvCount.text = if (playlist.isEmpty()) "空" else "${playlist.size} 个"
         binding.tvEmpty.visibility = if (playlist.isEmpty()) View.VISIBLE else View.GONE
     }
 
-    /**
-     * 把当前播放列表与进度快照交给仓库持久化（Room 全量替换列表 + 合并进度，单事务落盘）。
-     * 仓库内部保证按调用顺序落库，这里先在主线程做快照，防止 IO 侧遍历期间列表被交互修改。
-     */
+    /** 列表与进度快照交给仓库持久化（主线程先做快照，防 IO 侧遍历期间列表被修改） */
     private fun savePlaylist() {
         PlayerRepository.savePlaylist(playlist.toList(), cachedProgress.toMap())
     }
 
     /**
-     * 从仓库内存镜像恢复播放列表（数据源为 Room 数据库，进程启动时已一次性加载）。
-     * 关键点（项目记忆）：loadPlaylist 只做数据加载，**不允许**调用 addMediaItem 同步到控制器；
-     * 媒体项与控制器同步只发生在 onStart 且 controller.mediaItemCount == 0 时，
-     * 否则服务存活重建时会导致队列被重复添加。
+     * 从仓库恢复播放列表（按 uri 去重）。只加载数据，不同步控制器——
+     * 媒体项同步只发生在 onStart 且数量失不时，否则服务存活重建会重复添加队列。
      */
     private fun loadPlaylist() {
         val progressMap = PlayerRepository.getProgressMap()
-        // 跳过内存中已存在的项，并对磁盘数据按 uri 去重
         val existingKeys = playlist.map { normalizeUri(it.uri) }.toMutableSet()
         for (item in PlayerRepository.getPlaylist()) {
             val key = normalizeUri(item.uri)
             if (key in existingKeys) continue
             existingKeys.add(key)
-            // 进度只取独立的 progress 表（唯一数据源）；有进度则同步进内存缓存
             val lastPos = progressMap[item.uri.toString()] ?: 0L
             if (lastPos > 0) cachedProgress[item.uri.toString()] = lastPos
             playlist.add(item)
@@ -168,9 +146,8 @@ class MainActivity : AppCompatActivity() {
     // ===== 播放进度管理 =====
 
     /**
-     * 用持久层进度(Service 清理后的权威值)校正内存中的 cachedProgress 与列表进度条。
-     * 背景：后台自动播完切集时 MainActivity 监听器已解绑，内存会残留"播完进度"；
-     * 回前台若不校正，该残留值将在下次 savePlaylist 时被写回磁盘导致进度复活。
+     * 用持久层的权威进度校正内存缓存与列表进度条。
+     * 后台播完切集时前台监听已解绑、内存残留「播完进度」，不校正会在下次落盘时复活。
      */
     private fun reconcileProgressFromDisk() {
         val diskMap = PlayerRepository.getProgressMap()
@@ -179,20 +156,19 @@ class MainActivity : AppCompatActivity() {
             val diskVal = diskMap[uri]
             val memVal = cachedProgress[uri]
             if (diskVal != null && diskVal > 0) {
-                // 磁盘有有效进度，以磁盘为权威对齐内存
                 if (memVal != diskVal) {
                     cachedProgress[uri] = diskVal
                     adapter.updateProgress(i, diskVal)
                 }
             } else if (memVal != null) {
-                // 磁盘已无该进度(后台播完被清理/被删除)：移除内存残留，避免写回复活
+                // 磁盘已无该进度（播完被清理/删除）：移除内存残留
                 cachedProgress.remove(uri)
                 adapter.updateProgress(i, 0L)
             }
         }
     }
 
-    /** 保存当前播放项的进度到内存缓存并刷新列表进度条；播放到末尾则清除进度 */
+    /** 保存当前项进度到内存缓存并刷新进度条；播到末尾视为看完，清除进度 */
     private fun saveCurrentProgress() {
         val ctrl = controller ?: return
         val index = ctrl.currentMediaItemIndex
@@ -202,7 +178,6 @@ class MainActivity : AppCompatActivity() {
         val uri = playlist[index].uri.toString()
         if (position <= 0) return
         if (duration != C.TIME_UNSET && duration > 0 && position >= duration) {
-            // 已播放到末尾，视为看完，清除该条目的进度
             cachedProgress.remove(uri)
             adapter.updateProgress(index, 0)
             return
@@ -211,21 +186,18 @@ class MainActivity : AppCompatActivity() {
         adapter.updateProgress(index, position)
     }
 
-    /** 彻底清除某个 uri 的进度：内存缓存、Service 缓存、持久层三处一致删除（仓库异步落库） */
+    /** 清除某个 uri 的进度：内存、Service 缓存、持久层三处一致删除 */
     private fun clearProgress(uri: Uri) {
         val key = uri.toString()
         cachedProgress.remove(key)
         PlayerService.dropProgress(key)
-        // 复用统一的合并写入口（removes 语义），与 Service 的删除规则保持一致
         PlayerRepository.applyProgressUpdates(emptyMap(), setOf(key))
     }
 
-    /** 播放器事件监听：切换项/播放状态变化/就绪时的 UI 刷新与进度更新 */
     private val playerListener = object : Player.Listener {
-        /** 媒体项发生切换：保存进度 / 清理刚播完项的残留进度 / 刷新当前播放项 / 恢复进度 */
         override fun onMediaItemTransition(mediaItem: M3MediaItem?, reason: Int) {
             saveCurrentProgress()
-            // 自然播完自动切换到下一项时，用「上一项的下标」清掉它的近末尾进度
+            // 自然播完自动切换时，用「上一项的下标」清掉其近末尾进度
             if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO
                 && currentIndex in playlist.indices
                 && currentIndex != controller?.currentMediaItemIndex
@@ -239,7 +211,6 @@ class MainActivity : AppCompatActivity() {
             restoreProgressIfNeeded()
         }
 
-        /** 播放/暂停变化：非播放时刷新进度到内存(UI)，磁盘由 Service 周期落盘，此处不重复 */
         override fun onIsPlayingChanged(isPlaying: Boolean) {
             adapter.setCurrentPlaying(currentIndex, isPlaying)
             if (!isPlaying) {
@@ -247,7 +218,6 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        /** 播放器就绪：回填真正读取到的时长 */
         override fun onPlaybackStateChanged(playbackState: Int) {
             if (playbackState == Player.STATE_READY) {
                 val index = controller?.currentMediaItemIndex ?: -1
@@ -259,29 +229,20 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        /**
-         * 视频尺寸变化时，若当前处于 PiP 小窗，则同步更新小窗宽高比例。
-         * 这样进入小窗后如果画质/分辨率切换（含第一次取到真实分辨率），
-         * 小窗会跟着视频比例自适应伸缩，避免出现黑边。
-         */
         @RequiresApi(Build.VERSION_CODES.O)
         override fun onVideoSizeChanged(videoSize: VideoSize) {
             if (fullscreenPip.isInPipMode) fullscreenPip.updatePipAspectRatio(videoSize)
         }
     }
 
-    /**
-     * 统一的续播位置来源：以持久层(仓库内存镜像，Service 后台写入的唯一事实来源)为优先，
-     * 持久层无该 uri 的记录时才回退到内存 cachedProgress。
-     * 用于 fix「播放中切到别的条目，旧条目进度丢失」：持久层进度由 Service 周期+切换时精确落盘，更可靠。
-     */
+    /** 续播位置：优先持久层（Service 落盘的权威值），无记录才回退内存缓存 */
     private fun resolveResumePosition(item: MediaItemData): Long {
         val disk = PlayerRepository.getProgress(item.uri.toString())
         if (disk != null && disk > 0) return disk
         return cachedProgress[item.uri.toString()] ?: 0L
     }
 
-    /** 若当前项有保存过的进度（>0）则跳转到该位置，实现断点续播 */
+    /** 当前项有保存进度（>0）则 seek 到该位置，实现断点续播 */
     private fun restoreProgressIfNeeded() {
         val ctrl = controller ?: return
         val index = ctrl.currentMediaItemIndex
@@ -292,10 +253,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /**
-     * 冷启动/服务重建后恢复上次播放项：仅定位并回放断点，不自动起播，等用户按播放键。
-     * 若播放器当下正在播放(如服务仍存活)，则不打断。
-     */
+    /** 恢复上次播放项：仅定位与断点回放，不自动起播；正在播放时不打断 */
     private fun restoreLastPlayed() {
         val ctrl = controller ?: return
         if (ctrl.playWhenReady || ctrl.isPlaying) return
@@ -311,18 +269,14 @@ class MainActivity : AppCompatActivity() {
 
     // ===== 播放器自定义控件（倍速/音轨/字幕） =====
 
-    /** 可选择的倍速档位 */
     private val speedLevels = floatArrayOf(0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 2.0f, 3.0f)
 
-    /** 配置播放器自定义控件：循环/随机按钮、倍速、音轨、字幕 */
     @OptIn(UnstableApi::class)
     private fun setupControllerExtras() {
-        // 启用「单曲循环」与「列表循环」切换；第二次类型需同时再点一次切换
         binding.playerView.setRepeatToggleModes(
             RepeatModeUtil.REPEAT_TOGGLE_MODE_ONE or RepeatModeUtil.REPEAT_TOGGLE_MODE_ALL
         )
         binding.playerView.setShowShuffleButton(true)
-        // 播放时保持屏幕常亮，防止系统屏幕超时自动变暗/熄屏
         binding.playerView.keepScreenOn = true
 
         val speedBtn = binding.playerView.findViewById<TextView>(R.id.btn_speed)
@@ -338,7 +292,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 在倍速档位中找到给定倍速的下标（找不到时回退到 1.0x 的下标） */
+    /** 倍速档位下标，找不到时回退 1.0x */
     private fun speedsIndex(speed: Float): Int {
         val idx = speedLevels.indexOfFirst { it == speed }
         if (idx >= 0) return idx
@@ -346,7 +300,6 @@ class MainActivity : AppCompatActivity() {
         return if (one >= 0) one else 0
     }
 
-    /** 弹出倍速选择对话框并应用所选倍速 */
     private fun showSpeedSelection(speedBtn: TextView) {
         val ctrl = controller ?: return
         val labels = speedLevels.map { formatSpeed(it) }.toTypedArray()
@@ -362,12 +315,11 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
-    /** 倍速的展示文案，如 "1x"、"1.5x"、"2x" */
+    /** 倍速文案，如 "1x"、"1.5x" */
     private fun formatSpeed(speed: Float): String {
         return if (speed % 1f == 0f) "${speed.toInt()}x" else "${speed}x"
     }
 
-    /** 弹出音轨/字幕选择对话框 */
     @OptIn(UnstableApi::class)
     private fun showTrackSelection(trackType: Int, title: String) {
         val ctrl = controller ?: run {
@@ -386,95 +338,38 @@ class MainActivity : AppCompatActivity() {
 
     // ===== 本地媒体扫描与对账 =====
 
-    /** 是否正在扫描（防止重复触发导致重复添加）。主线程读写、IO 线程收尾复位，需保证可见性 */
+    /** 是否正在扫描（重入保护）。主线程读写、IO 线程复位，需保证可见性 */
     @Volatile
     private var isScanning = false
 
-    /**
-     * MediaStore 内容观察者：监听本地视频/音频集合的变化。
-     * 媒体库有新增/修改/删除时系统会通知，触发一次「去重增量扫描」，
-     * 避免每次点扫描都对整库全量重查，也免去手动点击的维护负担。
-     */
+    /** MediaStore 观察者：媒体库变化时触发去抖的增量扫描 */
     private val mediaChangeObserver = object : ContentObserver(Handler(Looper.getMainLooper())) {
         @Deprecated("Deprecated in Java")
         override fun onChange(selfChange: Boolean, uri: Uri?) {
-            // MediaStore 常常连发多次通知，合并到一次延时扫描
+            // MediaStore 常连发多次通知，合并到一次延时扫描
             scanHandler.removeCallbacks(debouncedScanRunnable)
             scanHandler.postDelayed(debouncedScanRunnable, 800)
         }
     }
-    /** 用于合并 MediaStore 多次通知的 Handler */
     private val scanHandler = Handler(Looper.getMainLooper())
-    /** 延时的增量扫描任务（先校验权限，避免无权限时白白查询） */
     private val debouncedScanRunnable = Runnable {
         if (hasStoragePermission()) scanLocalMedia()
     }
 
-    /** 扫描本地音视频并加入播放列表（在 IO 线程执行，带重入保护） */
-    private fun scanLocalMedia() {
-        if (isScanning) return
-        isScanning = true
-        lifecycleScope.launch(Dispatchers.IO) {
-            try {
-                val videos = scanner.queryVideos()
-                val audios = scanner.queryAudios()
-                withContext(Dispatchers.Main) {
-                    if (videos == null && audios == null) {
-                        Toast.makeText(this@MainActivity, "扫描失败，请稍后重试", Toast.LENGTH_SHORT).show()
-                        return@withContext
-                    }
-                    val scanned = mutableListOf<MediaItemData>()
-                    videos?.let(scanned::addAll)
-                    audios?.let(scanned::addAll)
-                    // 对账移除「文件已被外部删除」的条目，保证列表与实际文件一致；
-                    // 查询失败的类型(null)由 pruneDeletedMedia 内部跳过其删除对账
-                    val removedCount = pruneDeletedMedia(videos, audios)
-                    val existingKeys = playlist.map { normalizeUri(it.uri) }.toSet()
-                    // 过滤掉时长过短(<5秒)与已存在(去重)的条目
-                    val newItems = scanned.filter {
-                        it.duration >= 5000 && normalizeUri(it.uri) !in existingKeys
-                    }
-                    if (newItems.isEmpty() && removedCount == 0) {
-                        Toast.makeText(this@MainActivity, "没有新文件", Toast.LENGTH_SHORT).show()
-                        return@withContext
-                    }
-                    playlist.addAll(newItems)
-                    for (item in newItems) {
-                        controller?.addMediaItem(M3MediaItem.fromUri(item.uri))
-                    }
-                    refreshPlaylist()
-                    savePlaylist()
-                    val parts = mutableListOf<String>()
-                    if (removedCount > 0) parts.add("删除 $removedCount 个已消失文件")
-                    if (newItems.isNotEmpty()) parts.add("添加 ${newItems.size} 个文件")
-                    Toast.makeText(this@MainActivity, parts.joinToString("，"), Toast.LENGTH_SHORT).show()
-                }
-            } finally {
-                isScanning = false
-            }
-        }
-    }
-
     /**
-     * 回前台时静默对账：移除「后台期间被外部删除」的文件。
-     * 后台时 onStop 已取消 MediaStore 观察者、删除通知会错过，因此回到前台主动对账一次；
-     * 只删除已消失的文件，不自动新增，也不弹提示，避免打扰用户。
+     * 扫描本地音视频并对账播放列表（IO 线程，带重入保护）。
+     * @param silent true 为回前台静默对账：只删不增、不弹提示、无权限时跳过
      */
-    private fun pruneDeletedMediaOnResume() {
+    private fun scanLocalMedia(silent: Boolean = false) {
         if (isScanning) return
         isScanning = true
         lifecycleScope.launch(Dispatchers.IO) {
             try {
-                if (!hasStoragePermission()) {
-                    return@launch
-                }
+                if (silent && !hasStoragePermission()) return@launch
                 val videos = scanner.queryVideos()
                 val audios = scanner.queryAudios()
                 withContext(Dispatchers.Main) {
-                    if (pruneDeletedMedia(videos, audios) > 0) {
-                        refreshPlaylist()
-                        savePlaylist()
-                    }
+                    reconcileScanResult(videos, audios, silent)
                 }
             } finally {
                 isScanning = false
@@ -483,18 +378,56 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 用 MediaStore 扫描结果对账播放列表，移除「文件已从系统媒体库删除」的条目
-     * （同时清理其播放进度与控制器队列中的对应项）。
+     * 主线程消化扫描结果：先对账移除已删除的条目，非静默时再合并新增（过滤 <5 秒与重复）。
+     */
+    private fun reconcileScanResult(
+        scannedVideos: List<MediaItemData>?,
+        scannedAudios: List<MediaItemData>?,
+        silent: Boolean
+    ) {
+        if (scannedVideos == null && scannedAudios == null) {
+            if (!silent) {
+                Toast.makeText(this, "扫描失败，请稍后重试", Toast.LENGTH_SHORT).show()
+            }
+            return
+        }
+        val scanned = mutableListOf<MediaItemData>()
+        scannedVideos?.let(scanned::addAll)
+        scannedAudios?.let(scanned::addAll)
+        // 查询失败的类型(null)由 pruneDeletedMedia 内部跳过其删除对账
+        val removedCount = pruneDeletedMedia(scannedVideos, scannedAudios)
+        val newItems = if (silent) emptyList() else {
+            val existingKeys = playlist.map { normalizeUri(it.uri) }.toSet()
+            scanned.filter {
+                it.duration >= 5000 && normalizeUri(it.uri) !in existingKeys
+            }
+        }
+        if (newItems.isEmpty() && removedCount == 0) {
+            if (!silent) {
+                Toast.makeText(this, "没有新文件", Toast.LENGTH_SHORT).show()
+            }
+            return
+        }
+        playlist.addAll(newItems)
+        for (item in newItems) {
+            controller?.addMediaItem(M3MediaItem.fromUri(item.uri))
+        }
+        refreshPlaylist()
+        savePlaylist()
+        if (!silent) {
+            val parts = mutableListOf<String>()
+            if (removedCount > 0) parts.add("删除 $removedCount 个已消失文件")
+            if (newItems.isNotEmpty()) parts.add("添加 ${newItems.size} 个文件")
+            Toast.makeText(this, parts.joinToString("，"), Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    /**
+     * 用扫描结果对账播放列表，移除文件已从媒体库删除的条目。
      *
-     * 权限保护：API 34+ 用户可能只授予「仅选中的照片/视频」(READ_MEDIA_VISUAL_USER_SELECTED)，
-     * 此时 MediaStore 查询结果只含被选中的文件，若会把……「误删未授权但
-     * 仍存在的文件。因此仅当拿到对应媒体类型的完整读取权限时才执行该类型的删除对账。
-     * 同理，某类型查询失败（[scannedVideos]/[scannedAudios] 为 null）时也跳过该类型的
-     * 删除对账：查询失败 ≠ 空结果，把失败当空集会整类误删。
-     *
-     * @param scannedVideos 本次扫描到的视频集合，null 表示本次视频查询失败
-     * @param scannedAudios 本次扫描到的音频集合，null 表示本次音频查询失败
-     * @return 被移除的条数
+     * 权限保护：API 34+ 的「仅选中的照片/视频」部分授权下，查询结果只含被选中文件，
+     * 直接对账会误删未授权文件，因此仅在全量权限时才执行该类型删除；
+     * 查询失败（参数为 null）同理跳过——失败 ≠ 空集，当空集处理会整类误删。
      */
     private fun pruneDeletedMedia(
         scannedVideos: List<MediaItemData>?,
@@ -509,7 +442,7 @@ class MainActivity : AppCompatActivity() {
         val videoPrefix = MediaStore.Video.Media.EXTERNAL_CONTENT_URI.toString()
         val audioPrefix = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI.toString()
         var removed = 0
-        // 逆序遍历，保证删除过程下标不失效（playlist 与控制器队列保持同步）
+        // 逆序遍历，删除时下标不失效
         for (i in playlist.indices.reversed()) {
             val item = playlist[i]
             val uriStr = item.uri.toString()
@@ -519,14 +452,10 @@ class MainActivity : AppCompatActivity() {
                 else -> null
             }
             if (keys != null && normalizeUri(item.uri) !in keys) {
-                clearProgress(item.uri)
-                playlist.removeAt(i)
-                controller?.removeMediaItem(i)
-                if (i < currentIndex) currentIndex--
+                removeItemAt(i)
                 removed++
             }
         }
-        // 有删除时同步校正适配器高亮下标，避免删除后播放项高亮漂移
         if (removed > 0) {
             adapter.setCurrentPlaying(
                 currentIndex.takeIf { it in playlist.indices } ?: -1,
@@ -547,20 +476,16 @@ class MainActivity : AppCompatActivity() {
         gestures = GestureController(this, binding.playerView, binding.gestureOverlay) { controller }
         fullscreenPip = FullscreenPipHelper(this, binding) { controller }
 
-        // 构建列表适配器：点击播放（优先断点续播），删除移除。
-        // 回调收到的是条目 uri（适配器 items 异步 diff 存在下标错位窗口），处理时现查下标
+        // 回调回传 uri 而非下标：适配器 items 异步 diff 存在下标错位窗口，处理时现查下标
         adapter = MediaListAdapter(
             onClick = { uri ->
-                // 用 uri 现查下标：点击与 diff 回写竞态时旧下标会指向错位条目
                 val index = playlist.indexOfFirst { it.uri.toString() == uri }
                 if (index >= 0) {
-                    // 切走前先把当前播放项(A)的精确进度同时记录到内存与磁盘(saveCurrentProgress 更新
-                    // 续播所读的内存值；flushCurrentPosition 排队落盘)。因 onMediaItemTransition 触发
-                    // 时 controller 已切到新条目、读不到旧项位置，必须在 seekTo 之前记录。
+                    // 切走前先记录当前项精确进度：transition 触发后 controller 已切到新项，
+                    // 读不到旧项位置，必须在 seekTo 之前落盘
                     saveCurrentProgress()
                     PlayerService.flushCurrentPosition()
                     val item = playlist[index]
-                    // 统一续播位置：优先磁盘权威进度，磁盘无记录才回退内存
                     val pos = resolveResumePosition(item)
                     if (pos > 0 && (item.duration !in 1..pos)) {
                         controller?.seekTo(index, pos)
@@ -577,7 +502,7 @@ class MainActivity : AppCompatActivity() {
                     .setTitle("删除条目")
                     .setMessage("确定从播放列表中删除「${item.name}」吗？\n该文件的播放进度也会被清除。")
                     .setPositiveButton("删除") { _, _ ->
-                        // 对话框存续期间列表可能位移（后台扫描对账/其它删除），确认时按 uri 重新定位
+                        // 对话框存续期间列表可能位移，确认时按 uri 重新定位
                         playlist.indexOfFirst { it.uri.toString() == uri }
                             .takeIf { it >= 0 }?.let { removeItemFromPlaylist(it) }
                     }
@@ -588,7 +513,6 @@ class MainActivity : AppCompatActivity() {
         binding.recyclerPlaylist.adapter = adapter
         binding.recyclerPlaylist.layoutManager = LinearLayoutManager(this)
 
-        // 扫描按钮：先检查存储权限
         binding.btnScan.setOnClickListener {
             if (hasStoragePermission()) {
                 scanLocalMedia()
@@ -597,7 +521,6 @@ class MainActivity : AppCompatActivity() {
             }
         }
         binding.btnPip.setOnClickListener { fullscreenPip.enterPipMode() }
-        // 溢出菜单（⋮）：手动检查更新
         binding.btnMore.setOnClickListener { anchor ->
             val popup = PopupMenu(this, anchor)
             popup.menu.add(0, MENU_ID_CHECK_UPDATE, 0, R.string.check_update)
@@ -615,7 +538,6 @@ class MainActivity : AppCompatActivity() {
         binding.playerView.setFullscreenButtonClickListener { enabled ->
             fullscreenPip.setFullscreen(enabled)
         }
-        // 返回键：全屏时先退出全屏，否则退出界面
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
                 if (fullscreenPip.isFullscreen) {
@@ -629,36 +551,30 @@ class MainActivity : AppCompatActivity() {
         setupControllerExtras()
         gestures.setup()
 
-        // API 33+ 申请通知权限
         if (Build.VERSION.SDK_INT >= 33) {
             notifPermission.launch(android.Manifest.permission.POST_NOTIFICATIONS)
         }
 
         updateManager.registerReceivers()
-        // 冷启动静默检查一次新版本（失败不打扰）
         updateManager.checkForUpdate(manual = false)
     }
 
     override fun onStart() {
         super.onStart()
-        // 用户已在设置页授权「安装未知应用」：继续完成被挂起的更新安装
         updateManager.resumePendingInstall()
-        // 监听本地媒体库变化，实现新增/修改时的去重增量自动扫描
         contentResolver.registerContentObserver(
             MediaStore.Video.Media.EXTERNAL_CONTENT_URI, true, mediaChangeObserver
         )
         contentResolver.registerContentObserver(
             MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, true, mediaChangeObserver
         )
-        // 回前台对账：后台期间文件被外部删除时 MediaStore 通知已错过，主动移除已消失的条目
-        pruneDeletedMediaOnResume()
-        // 通过 SessionToken 异步连接后台服务中的播放器
+        // 回前台静默对账：后台期间删除文件的通知已错过，主动移除已消失条目
+        scanLocalMedia(silent = true)
         val sessionToken = SessionToken(this, ComponentName(this, PlayerService::class.java))
         val future = MediaController.Builder(this, sessionToken).buildAsync()
         controllerFuture = future
         future.addListener({
-            // 关键点（项目记忆）：回调可能晚于 onStop 触发导致 future 已被释放，
-            // 因此必须用 controllerFuture !== future 判空，避免 NPE 或重挂已释放控制器
+            // 回调可能晚于 onStop（future 已释放），必须用 !== 判空防 NPE 或重挂已释放控制器
             if (controllerFuture !== future) return@addListener
             val ctrl = try {
                 future.get()
@@ -670,20 +586,16 @@ class MainActivity : AppCompatActivity() {
             ctrl.addListener(playerListener)
             currentIndex = ctrl.currentMediaItemIndex
             adapter.setCurrentPlaying(currentIndex, ctrl.isPlaying)
-            // 数据相关部分等仓库一次性加载完成（通常早已就绪）后再执行，
-            // 挂起恢复后重新读取 ctrl 状态，无过期读取风险
             lifecycleScope.launch {
                 PlayerRepository.awaitLoaded(this@MainActivity)
-                // 首次进入才从持久层恢复列表，避免服务存活重建时重复加载
                 if (!playlistLoaded) {
                     loadPlaylist()
                     playlistLoaded = true
                 } else {
-                    // 回前台：用持久层(Service 已完成的清理)校正内存，防止后台播完项的残留进度复活
+                    // 回前台：用持久层校正内存，防止后台播完项的残留进度复活
                     reconcileProgressFromDisk()
                 }
-                // 队列与内存列表数量不一致时(含控制器尚为空/重连失步)全量重灌自愈；
-                // 空队列时 cur 为 null，天然不触发 seek
+                // 队列与内存列表失不时（控制器为空/重连错位）全量重灌自愈
                 if (playlist.isNotEmpty() && ctrl.mediaItemCount != playlist.size) {
                     val cur = ctrl.currentMediaItem
                     val curUri = cur?.localConfiguration?.uri?.toString()
@@ -697,7 +609,6 @@ class MainActivity : AppCompatActivity() {
                         ctrl.seekTo(curIdx, curPos)
                     }
                 }
-                // 冷启动/服务重建后恢复上次播放项(仅定位 + 断点，等用户按播放)
                 restoreLastPlayed()
                 refreshPlaylist()
             }
@@ -705,14 +616,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onStop() {
-        // 停止监听媒体库变化，并取消尚未触发的延时扫描
         contentResolver.unregisterContentObserver(mediaChangeObserver)
         scanHandler.removeCallbacks(debouncedScanRunnable)
-        // PiP 关闭返回前台时暂停播放，并复位 PiP 状态
         fullscreenPip.onStopped()
         gestures.cancelPendingHide()
         saveCurrentProgress()
-        // 释放控制器与播放器视图的绑定
         binding.playerView.player = null
         controller?.removeListener(playerListener)
         controller = null
@@ -727,7 +635,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
-        // 注销更新相关系统广播（下载完成/应用替换）
         updateManager.unregisterReceivers()
         super.onDestroy()
     }
@@ -742,7 +649,7 @@ class MainActivity : AppCompatActivity() {
 
     // ===== 存储权限 =====
 
-    /** 是否已获得存储读取权限（API 33+ 检查媒体权限，旧版本检查外部存储权限） */
+    /** 是否有存储读取权限（API 33+ 查媒体权限，API 34+ 含「仅选中」授权） */
     private fun hasStoragePermission(): Boolean {
         if (Build.VERSION.SDK_INT < 33) {
             return ContextCompat.checkSelfPermission(
@@ -752,7 +659,6 @@ class MainActivity : AppCompatActivity() {
         val fullOrAudio =
             ContextCompat.checkSelfPermission(this, android.Manifest.permission.READ_MEDIA_VIDEO) == PackageManager.PERMISSION_GRANTED
                 || ContextCompat.checkSelfPermission(this, android.Manifest.permission.READ_MEDIA_AUDIO) == PackageManager.PERMISSION_GRANTED
-        // API 34+ 用户可选「仅访问选中的照片/视频」，此时授予 READ_MEDIA_VISUAL_USER_SELECTED
         return if (Build.VERSION.SDK_INT >= 34) {
             fullOrAudio || ContextCompat.checkSelfPermission(
                 this, android.Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED
@@ -762,7 +668,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 请求存储读取权限（按系统版本选择对应权限组合） */
+    /** 按系统版本请求对应权限组合 */
     private fun requestStoragePermission() {
         if (Build.VERSION.SDK_INT >= 34) {
             storagePermission.launch(

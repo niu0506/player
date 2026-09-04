@@ -18,49 +18,31 @@ import androidx.media3.session.MediaSessionService
 import kotlin.time.Duration.Companion.milliseconds
 
 /**
- * 后台播放媒体服务。
- *
- * 继承 [MediaSessionService]，让播放能力在 App 离开前台后依然存活（例如锁屏、后台、
- * 画中画），并通过 [MediaSession] 与前端（MainActivity 的 MediaController）通信。
- *
- * 职责划分：
- * - 持有真正的播放器 [ExoPlayer]，向前端暴露控制能力
- * - 音频焦点交给 ExoPlayer 内建托管（handleAudioFocus=true）：暂时丢失暂停、可闪避时降音量、
- *   永久丢失仅暂停不含自动抢播，避免手动焦点管理带来的"双 App 同放"等边角问题
- * - 周期性把播放进度写入磁盘（每 2 秒），并在关键时刻立即落盘
- * - 处理「播放到末尾自动切换」时清理上一项旧进度，防止残留进度复活
- * - 用 URI（而非下标）跟踪上一播放项，避免删除列表项导致的下标悬空
+ * 后台播放媒体服务：持有 ExoPlayer 并经 MediaSession 暴露给前端控制器。
+ * 音频焦点交给 ExoPlayer 内建托管；周期（2 秒）+关键时刻落盘进度；
+ * 用 URI（而非下标）跟踪上一播放项，避免删除列表项导致下标悬空。
  */
 class PlayerService : MediaSessionService() {
 
-    /** 当前媒体会话，通过它暴露 player 给前端控制器 */
     private var mediaSession: MediaSession? = null
-    /** 主线程 Handler，用于排定周期的进度上报任务 */
     private val mainHandler = Handler(Looper.getMainLooper())
-    /** 内存中的播放进度缓存（uri -> 播放位置毫秒） */
+    /** 内存进度缓存（uri -> 位置毫秒） */
     private val progressCache = mutableMapOf<String, Long>()
     /**
      * 需要从磁盘「删除」进度记录的 uri 集合。
-     * 见项目记忆：writeToDisk 是合并非追加逻辑，播放到末尾的项必须显式标记删除，
-     * 否则旧的近末尾进度会被重新合并回磁盘（残留进度复活）。
+     * writeToDisk 是合并逻辑，播放到末尾的项必须显式标记删除，
+     * 否则旧进度会被重新合并回磁盘（残留进度复活）。
      */
     private val removedUris = mutableSetOf<String>()
-    /** 上次已持久化的进度快照，用于比较是否需要写盘（避免空闲时的无谓 IO） */
+    /** 上次已持久化的进度快照，未变化时跳过写盘 */
     private var lastPersistedSnapshot: Map<String, Long> = emptyMap()
     /**
-     * 上一个播放项的 uri，用于在自动切换(播放到末尾)时得知「哪一项刚播完」。
-     * 用 uri 而非下标跟踪：删除当前项之前的条目会使下标前移但不触发 transition，
-     * 下标跟踪会悬空，导致误删/漏删其它条目的进度。
+     * 上一个播放项的 uri，用于自动切换(播完)时得知「哪一项刚播完」。
+     * 用 uri 而非下标：删除前项不触发 transition，下标会悬空。
      */
     private var lastPlayedUri: String? = null
 
-    /** 播放器事件监听：处理进度清理、落盘与「上一播放项」记录 */
     private val playerEventListener = object : Player.Listener {
-        /**
-         * 发生媒体切换时：若为自然播放到末尾自动切换，则清理上一项(lastPlayedUri)的旧进度，
-         * 防止其近末尾进度在下次合并写盘时「复活」。用 uri 定位，避免删除前项导致的下标悬空。
-         * 同时在切换时把当前播放项 uri 持久化，供前端冷启动恢复。
-         */
         override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
             val player = mediaSession?.player
             if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO) {
@@ -70,8 +52,7 @@ class PlayerService : MediaSessionService() {
                     progressCache.remove(prevUri)
                     removedUris.add(prevUri)
                 }
-                // 顺序播放(不循环 REPEAT_MODE_OFF)：每个文件播完即停，不自动播下一个。
-                // 单曲循环/列表循环时重复模式非 OFF，仍按各自规则循环。
+                // 顺序播放(REPEAT_MODE_OFF)时每个文件播完即停
                 if (player != null && player.repeatMode == Player.REPEAT_MODE_OFF) {
                     player.pause()
                 }
@@ -81,32 +62,25 @@ class PlayerService : MediaSessionService() {
             persistProgress()
         }
 
-        /** 播放状态变化：停止播放时立即落盘 */
         override fun onIsPlayingChanged(isPlaying: Boolean) {
             if (!isPlaying) persistProgress()
         }
 
-        /** 位置发生不连续跳变（用户拖动进度条 seek，或切到别的条目）时立即落盘 */
         override fun onPositionDiscontinuity(
             oldPosition: Player.PositionInfo,
             newPosition: Player.PositionInfo,
             reason: Int
         ) {
+            // 切到别的条目时 player.currentMediaItem 已指向新项，
+            // 只有 oldPosition 还记着旧项的最终位置，据此精确抓取旧项进度
             if (reason == Player.DISCONTINUITY_REASON_SEEK && oldPosition.mediaItemIndex != newPosition.mediaItemIndex) {
-                // 切到别的条目(点列表/播放器"下一集"/通知栏下一条)时，
-                // onMediaItemTransition 触发后 player.currentMediaItem 已指向新项，
-                // 只有 oldPosition 还记着被换掉旧项的最终位置。先精确抓取旧项进度再落盘，
-                // 避免「正在播放的进度丢失」。
                 cacheOldPosition(oldPosition)
             }
             persistProgress()
         }
     }
 
-    /**
-     * 进度上报主循环：每 2 秒尝试持久化一次。
-     * persistProgress 内部会先缓存当前进度，且快照未变化时自动跳过写盘，避免空闲 IO。
-     */
+    /** 每 2 秒持久化一次（快照未变化时自动跳过） */
     private val progressTicker = object : Runnable {
         override fun run() {
             persistProgress(sync = false)
@@ -119,12 +93,8 @@ class PlayerService : MediaSessionService() {
         super.onCreate()
         instance = this
 
-        // 构建播放器：
-        // - setAudioAttributes(DEFAULT, true) 把音频焦点交给 ExoPlayer 托管：
-        //   获得焦点才播放、暂时丢失暂停并在恢复时续播、可闪避时降音量、永久丢失只暂停不抢播，
-        //   比手写 `AUTOFOCUS_LOSS` 也启动轮询恢复更符合系统焦点礼仪。
-        // - setHandleAudioBecomingNoisy(true) 拔出耳机等导致音频「变为嘈杂」时自动暂停
-        // - 设置快退/快进各为 15 秒，供控制器及手势使用
+        // 音频焦点交给 ExoPlayer 托管（暂时丢失暂停并续播、可闪避时降音量、永久丢失只暂停）；
+        // 拔出耳机自动暂停；快退/快进各 15 秒
         val player = ExoPlayer.Builder(this)
             .setAudioAttributes(
                 AudioAttributes.DEFAULT,
@@ -140,12 +110,11 @@ class PlayerService : MediaSessionService() {
         mainHandler.post(progressTicker)
     }
 
-    /** 把本服务持有的会话返回给请求的控制器 */
     override fun onGetSession(info: MediaSession.ControllerInfo): MediaSession? {
         return mediaSession
     }
 
-    /** 任务被从最近任务列表移除时：立即落盘；若未在播放则停止自身 */
+    /** 从最近任务移除：立即落盘；未在播放则停止自身 */
     override fun onTaskRemoved(rootIntent: Intent?) {
         persistProgress(sync = true)
         val player = mediaSession?.player
@@ -155,8 +124,8 @@ class PlayerService : MediaSessionService() {
     }
 
     /**
-     * 把播放器的当前进度写入内存缓存。
-     * 若已播放到末尾则改为「删除该进度」；若位置为 0 且已有旧进度则忽略（防止覆写）。
+     * 当前进度写入内存缓存。
+     * 播到末尾改为「删除该进度」；位置为 0 且已有旧进度则忽略（防覆写）。
      */
     private fun cacheCurrentPosition(player: Player) {
         val item = player.currentMediaItem ?: return
@@ -172,11 +141,7 @@ class PlayerService : MediaSessionService() {
         progressCache[uri] = position
     }
 
-    /**
-     * 切换前被换掉的那一项的精确进度写入缓存。
-     * 因为在 seek 到另一个条目后，player.currentMediaItem 已指向新项，常规读取抓不到旧项位置；
-     * 而切换前的 [oldPosition] 仍记录着旧项的 mediaItemIndex 与 positionMs，据此精确保存。
-     */
+    /** 切换前被换掉项的精确进度写入缓存（oldPosition 仍记着旧项的 index 与位置） */
     private fun cacheOldPosition(oldPosition: Player.PositionInfo) {
         val player = mediaSession?.player ?: return
         if (oldPosition.positionMs <= 0) return
@@ -187,11 +152,7 @@ class PlayerService : MediaSessionService() {
         progressCache[uri] = oldPosition.positionMs
     }
 
-    /**
-     * 尝试持久化当前进度。
-     * 若快照未变化且没有待删除项，则跳过（避免空闲时的磁盘 IO）。
-     * @param sync true 用 commit 同步落盘，false 用 apply 异步落盘
-     */
+    /** 持久化当前进度；快照未变且无待删除项时跳过 */
     private fun persistProgress(sync: Boolean = false) {
         val player = mediaSession?.player ?: return
         cacheCurrentPosition(player)
@@ -201,17 +162,8 @@ class PlayerService : MediaSessionService() {
     }
 
     /**
-     * 把进度写入 Room 数据库（经 [PlayerRepository]）。
-     *
-     * 这是进度落盘的唯一写入点（进度只存于 "progress" 表这一份数据，playlist 不再携带
-     * lastPosition 字段，避免「双份数据源」的重复解析/序列化开销）。
-     *
-     * 语义为「合并」而非「追加」（由 mergeProgressMap 保证）：
-     * - 先移除 [removedUris] 中记录（播放到末尾/被删除的项）
-     * - 再写入进度，且只写入大于 0 的值（0 不得覆盖已有非零进度的硬约束）
-     *
-     * @param sync true 阻塞等待落盘完成（任务移除/销毁等需保证写盘的场景），
-     * false 异步落盘（周期上报等高频场景不阻塞主线程）
+     * 进度写入 Room（经 [PlayerRepository]），进度落盘的唯一写入点。
+     * 语义为「合并」（mergeProgressMap 保证）：先移除 [removedUris]，再写入仅 >0 的值。
      */
     private fun writeToDisk(progress: Map<String, Long>, sync: Boolean = true) {
         // 仓库同步捕获本次写入/删除集合并更新内存镜像，之后 clear 不会影响已提交内容
@@ -219,22 +171,19 @@ class PlayerService : MediaSessionService() {
         removedUris.clear()
         lastPersistedSnapshot = progress
         if (sync) {
-            // 阻塞等待已提交写任务落库（有 2 秒上限，等价于旧的 commit 同步写盘）
             runBlocking { withTimeoutOrNull(2_000.milliseconds) { PlayerRepository.flush() } }
         }
     }
 
-    /** 内存不足时立即落盘，避免进度丢失（commit 同步写：进程可能随后被杀，apply 的排队写会丢） */
+    /** 内存不足时同步落盘（进程可能随后被杀，排队的异步写会丢） */
     override fun onTrimMemory(level: Int) {
         super.onTrimMemory(level)
         persistProgress(sync = true)
     }
 
     override fun onDestroy() {
-        // 移除定时任务并最终落盘
         mainHandler.removeCallbacks(progressTicker)
         persistProgress(sync = true)
-        // 释放播放器与会话
         mediaSession?.run {
             player.release()
             release()
@@ -257,15 +206,9 @@ class PlayerService : MediaSessionService() {
         }
 
         /**
-         * 供前端在「切到别的条目」之前调用，把当前正在播放项的精确进度立即持久化。
-         * 背景：onMediaItemTransition 触发时播放器已经切到新条目，此时按 currentItem 读取
-         * 拿到的是新条目位置，旧的正在播放项进度会因此丢失（只能靠 2 秒周期上报兜底）。
-         * 因此在 seekTo 切换前先同步抓取当前项位置并立即持久化。
-         *
-         * 落盘采用异步（sync=false）：进度值已同步抓进缓存并按提交顺序排队落库，
-         * 续播正确性不受影响；此前 sync=true 会在主线程 runBlocking 等待磁盘 IO，
-         * 每次点列表项最坏阻塞 2 秒。磁盘可靠性由周期上报 + seek 触发的
-         * onPositionDiscontinuity 落盘多层兜底。
+         * 供前端在「切到别的条目」之前调用，立即持久化当前项的精确进度
+         * （transition 触发后读到的是新项位置）。异步落盘：进度值已同步进缓存
+         * 按序排队，磁盘可靠性由周期上报 + seek 落盘多层兜底。
          */
         fun flushCurrentPosition() {
             val svc = instance ?: return
