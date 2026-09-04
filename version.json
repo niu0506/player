@@ -1,5 +1,5 @@
 {
-  "version": "1.4.0",
-  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.4.0/player-v1.4.0-release.apk",
-  "notes": "内部重构：源码扁平化为单包结构，移除 model/data/playback/ui/update 子包，11 个主源码文件合并为 5 个（MainActivity/PlayerRepository/PlayerService/PlayerUi/UpdateManager），测试合并为单文件；行为无变化，32 个单元测试全部通过。"
+  "version": "1.4.1",
+  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.4.1/player-v1.4.1-release.apk",
+  "notes": "稳定性修复：扫描查询失败/空结果正确区分，对账仅跳过失败类型，防止瞬时异常清空整类媒体条目与进度；点击列表项时的进度落盘改为异步，消除主线程最坏 2 秒阻塞；列表点击/删除回调改传 URI 现查下标，规避异步差分刷新窗口期下标错位；isScanning 加 volatile 保证跨线程可见。"
 }
