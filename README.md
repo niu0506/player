@@ -13,7 +13,7 @@
 - **音轨/字幕选择**：多音轨视频可切换音轨，内嵌字幕可切换
 - **变速播放**：0.5x ~ 3.0x 共 7 档倍速
 - **后台播放**：前台服务（`MediaSessionService`）常驻，退到后台/锁屏仍持续播放，通知栏可控
-- **耳机断开自动暂停**：拔掉耳机自动暂停；音频焦点由 ExoPlayer 托管，避免「双 App 同放」
+- **耳机断开自动暂停**：拔掉耳机自动暂停；音频焦点由 MediaSession 会话托管的播放器内建处理（暂时丢失暂停并续播、可闪避时降音量、永久丢失只暂停），避免「双 App 同放」，被暂时打断时界面给出提示
 
 ### 进度续播
 
@@ -47,7 +47,7 @@
 - 播放器：androidx.media3 1.5.1（ExoPlayer + MediaSession + MediaController）
 - 架构：前台服务（`PlayerService`）+ 单 Activity（`MainActivity`），经 MediaController 通信；源码扁平化为单包 5 文件，UI 逻辑拆分为 `GestureController`、`FullscreenPipHelper`、`MediaStoreScanner` 等职责类（见 `PlayerUi.kt` / `PlayerRepository.kt` / `UpdateManager.kt`）
 - 持久化：Room 数据库（播放列表、进度映射、KV 分表存储，统一「合并写」入口；首次启动自动迁移旧 SharedPreferences 数据）
-- 更新下载：系统 DownloadManager + FileProvider 暴露 APK 给安装器
+- 更新下载：系统 DownloadManager 写入 MediaStore.Downloads（API ≤28 回退公共 Download 目录）；安装器经 content URI 授权直读（旧版本经 FileProvider）
 - UI：ViewBinding + RecyclerView（DiffUtil 后台差分刷新）
 - 构建：AGP + Kotlin DSL (Gradle)，GitHub Actions CI 自动构建
 

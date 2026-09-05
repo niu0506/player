@@ -19,7 +19,7 @@
     <!-- 老版本（API <= 32）读取本地媒体 -->
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
         android:maxSdkVersion="32" />
-    <!-- 仅 Android 9 及以下：DownloadManager 写公共 Download 需要此权限（API 29+ 走 MediaStore，无需） -->
+    <!-- 仅 Android 9 及以下：DownloadManager 写公共 Download 需要此权限（API 29+ 经 MediaStore.Downloads 写入，无需） -->
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
         android:maxSdkVersion="28" />
     <!-- App 内更新：Android 8+ 调起系统安装器需要（用户需在设置中授予「安装未知应用」） -->

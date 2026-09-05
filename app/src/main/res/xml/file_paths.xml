@@ -1,10 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- FileProvider 路径声明：应用专属外部目录下的 Download 子目录（更新包下载位置） -->
+<!-- FileProvider 路径声明：API <= 28 时更新包经公共 Download 目录暴露给安装器
+     （API 29+ 下载至 MediaStore.Downloads，安装器直接读其 content URI，无需 FileProvider） -->
 <paths xmlns:android="http://schemas.android.com/apk/res/android">
-    <external-files-path
-        name="update_downloads"
-        path="Download/" />
-    <!-- 公共 Download 目录：更新包改存于此，供系统安装器访问 -->
+    <!-- 公共 Download 目录：旧版本更新包下载位置，供系统安装器访问 -->
     <external-path
         name="public_downloads"
         path="Download/" />

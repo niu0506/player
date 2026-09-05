@@ -229,6 +229,13 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        override fun onPlaybackSuppressionReasonChanged(playbackSuppressionReason: Int) {
+            // 暂时性焦点丢失（来电等）：播放被抑制，焦点归还后自动续播
+            if (playbackSuppressionReason == Player.PLAYBACK_SUPPRESSION_REASON_TRANSIENT_AUDIO_FOCUS_LOSS) {
+                Toast.makeText(this@MainActivity, "已被其他应用暂时打断，稍后自动续播", Toast.LENGTH_SHORT).show()
+            }
+        }
+
         @RequiresApi(Build.VERSION_CODES.O)
         override fun onVideoSizeChanged(videoSize: VideoSize) {
             if (fullscreenPip.isInPipMode) fullscreenPip.updatePipAspectRatio(videoSize)

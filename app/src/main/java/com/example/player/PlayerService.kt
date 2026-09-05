@@ -19,7 +19,7 @@ import kotlin.time.Duration.Companion.milliseconds
 
 /**
  * 后台播放媒体服务：持有 ExoPlayer 并经 MediaSession 暴露给前端控制器。
- * 音频焦点交给 ExoPlayer 内建托管；周期（2 秒）+关键时刻落盘进度；
+ * 音频焦点由 MediaSession 会话托管的播放器内建处理；周期（2 秒）+关键时刻落盘进度；
  * 用 URI（而非下标）跟踪上一播放项，避免删除列表项导致下标悬空。
  */
 class PlayerService : MediaSessionService() {
@@ -93,11 +93,16 @@ class PlayerService : MediaSessionService() {
         super.onCreate()
         instance = this
 
-        // 音频焦点交给 ExoPlayer 托管（暂时丢失暂停并续播、可闪避时降音量、永久丢失只暂停）；
-        // 拔出耳机自动暂停；快退/快进各 15 秒
+        // 音频焦点由 MediaSession 会话托管的播放器内建处理
+        // （暂时丢失暂停并续播、可闪避时降音量、永久丢失只暂停）；
+        // 拔出耳机自动暂停；快退/快进各 15 秒。
+        // 影音类播放显式声明 CONTENT_TYPE_MOVIE，便于系统路由于空间音频处理
         val player = ExoPlayer.Builder(this)
             .setAudioAttributes(
-                AudioAttributes.DEFAULT,
+                AudioAttributes.Builder()
+                    .setUsage(C.USAGE_MEDIA)
+                    .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
+                    .build(),
                 true
             )
             .setHandleAudioBecomingNoisy(true)

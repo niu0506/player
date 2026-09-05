@@ -1,5 +1,5 @@
 {
-  "version": "1.4.3",
-  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.4.3/player-v1.4.3-release.apk",
-  "notes": "清理冗余代码并精简注释：合并重复的条目删除、媒体扫描/对账、全屏与 PiP 样式、进度落盘等逻辑，删除无引用的图标资源；播放行为与功能保持不变。"
+  "version": "1.4.4",
+  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.4.4/player-v1.4.4-release.apk",
+  "notes": "更新包下载迁移至 MediaStore.Downloads（Android 10+ 无需存储权限，安装器直读 content URI）；完善音频焦点配置（USAGE_MEDIA + CONTENT_TYPE_MOVIE），被其他应用暂时打断播放时界面给出提示。"
 }
