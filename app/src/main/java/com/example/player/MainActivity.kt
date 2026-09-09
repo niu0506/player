@@ -37,6 +37,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import androidx.media3.common.MediaItem as M3MediaItem
+import androidx.media3.common.MediaMetadata as M3MediaMetadata
 
 /** 应用入口：进程启动即触发仓库一次性加载（Room 建库 + 旧 prefs 迁移） */
 class PlayerApp : Application() {
@@ -242,6 +243,18 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * 构建带元数据的 MediaItem：title 用于通知栏/锁屏媒体控制显示文件名，
+     * 不设置时系统通知会显示「未知」占位。
+     */
+    private fun buildMediaItem(item: MediaItemData): M3MediaItem =
+        M3MediaItem.Builder()
+            .setUri(item.uri)
+            .setMediaMetadata(
+                M3MediaMetadata.Builder().setTitle(item.name).build()
+            )
+            .build()
+
     /** 续播位置：优先持久层（Service 落盘的权威值），无记录才回退内存缓存 */
     private fun resolveResumePosition(item: MediaItemData): Long {
         val disk = PlayerRepository.getProgress(item.uri.toString())
@@ -417,7 +430,7 @@ class MainActivity : AppCompatActivity() {
         }
         playlist.addAll(newItems)
         for (item in newItems) {
-            controller?.addMediaItem(M3MediaItem.fromUri(item.uri))
+            controller?.addMediaItem(buildMediaItem(item))
         }
         refreshPlaylist()
         savePlaylist()
@@ -609,7 +622,7 @@ class MainActivity : AppCompatActivity() {
                     val curPos = ctrl.currentPosition
                     ctrl.clearMediaItems()
                     for (item in playlist) {
-                        ctrl.addMediaItem(M3MediaItem.fromUri(item.uri))
+                        ctrl.addMediaItem(buildMediaItem(item))
                     }
                     val curIdx = curUri?.let { u -> playlist.indexOfFirst { it.uri.toString() == u } }
                     if (curIdx != null && curIdx >= 0) {

@@ -1,5 +1,5 @@
 {
-  "version": "1.4.4",
-  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.4.4/player-v1.4.4-release.apk",
-  "notes": "更新包下载迁移至 MediaStore.Downloads（Android 10+ 无需存储权限，安装器直读 content URI）；完善音频焦点配置（USAGE_MEDIA + CONTENT_TYPE_MOVIE），被其他应用暂时打断播放时界面给出提示。"
+  "version": "1.4.5",
+  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.4.5/player-v1.4.5-release.apk",
+  "notes": "通知栏/锁屏媒体控制显示当前播放文件名（为 MediaItem 补充元数据）；升级 media3 至 1.11.0、compileSdk 36 与 Gradle 9.7.1。"
 }

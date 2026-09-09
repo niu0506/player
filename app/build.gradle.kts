@@ -21,13 +21,14 @@ fun envOrProp(envKey: String, propKey: String): String? =
 
 android {
     namespace = "com.example.player"
-    compileSdk = 35
+    // media3 1.11 的传递依赖（androidx.core 1.18 等）要求 compileSdk 36+；targetSdk 仍为 35，运行时行为不变
+    compileSdk = 36
     defaultConfig {
         applicationId = "com.example.player"
         minSdk = 24
         targetSdk = 35
-        versionCode = 24
-        versionName = "1.4.4"
+        versionCode = 25
+        versionName = "1.4.5"
     }
 
     signingConfigs {
@@ -68,12 +69,12 @@ android {
 }
 
 dependencies {
-    implementation("androidx.media3:media3-exoplayer:1.5.1")
-    implementation("androidx.media3:media3-ui:1.5.1")
-    implementation("androidx.media3:media3-session:1.5.1")
+    implementation("androidx.media3:media3-exoplayer:1.11.0")
+    implementation("androidx.media3:media3-ui:1.11.0")
+    implementation("androidx.media3:media3-session:1.11.0")
     implementation("androidx.appcompat:appcompat:1.7.0")
-    implementation("androidx.recyclerview:recyclerview:1.3.2")
-    implementation("androidx.activity:activity-ktx:1.9.3")
+    implementation("androidx.recyclerview:recyclerview:1.4.0")
+    implementation("androidx.activity:activity-ktx:1.13.0")
     implementation("com.google.android.material:material:1.12.0")
     testImplementation("junit:junit:4.13.2")
     // 本地单测中 android.jar 的 org.json 是空 stub（方法全部返回默认值），
