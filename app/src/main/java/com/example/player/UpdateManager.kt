@@ -228,7 +228,6 @@ class UpdateManager(private val activity: AppCompatActivity) {
     private val downloadAccelerators = listOf(
         "https://gh-proxy.com/",
         "https://ghproxy.net/",
-        "https://mirror.ghproxy.com/",
     )
     private val downloadSources: List<String> =
         downloadAccelerators.map { it.trimEnd('/') + "/" } + ""
