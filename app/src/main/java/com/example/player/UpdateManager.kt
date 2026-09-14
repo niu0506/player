@@ -2,19 +2,15 @@ package com.example.player
 
 import android.app.DownloadManager
 import android.content.BroadcastReceiver
-import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
-import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
 import android.provider.Settings
 import android.widget.Toast
-import androidx.activity.result.contract.ActivityResultContracts
-import androidx.annotation.RequiresApi
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
@@ -138,7 +134,7 @@ class UpdateChecker {
 
 /**
  * 应用内更新管家：版本检查 → 确认对话框 → DownloadManager 下载
- * （API 29+ 写入 MediaStore.Downloads，旧版回退公共 Download 目录；CDN 加速、失败自动换源）
+ * （目标为应用外部私有 Download 目录，全版本免存储权限；CDN 加速、失败自动换源）
  * → 调起安装器（含 Android 8+ 安装未知应用授权接力）→ 替换后清理更新包。
  * 需在 Activity onCreate 构造，并调用 registerReceivers/unregisterReceivers/resumePendingInstall。
  */
@@ -158,24 +154,11 @@ class UpdateManager(private val activity: AppCompatActivity) {
     private var lastDownloadId = -1L
     /** 等待「安装未知应用」授权后再安装的 APK（content URI） */
     private var pendingInstallUri: Uri? = null
-    /** API 29+ 的下载目标（MediaStore.Downloads 行 content URI） */
-    private var pendingDownloadUri: Uri? = null
-    /** API ≤28 的下载目标（公共 Download 下的文件） */
+    /** 下载目标（应用外部私有 Download 目录下的文件） */
     private var pendingDownloadFile: File? = null
     private var pendingDownloadVersion = ""
     /** 待尝试的下载源队列（CDN 加速在前，GitHub 直连兜底） */
     private var pendingDownloadUrls: ArrayDeque<String> = ArrayDeque()
-
-    /** 写外部存储权限（仅 Android 9 及以下需要） */
-    private val writePermission = activity.registerForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { granted ->
-        if (granted) {
-            pendingDownloadUrls.removeFirstOrNull()?.let { enqueueDownload(it) }
-        } else {
-            Toast.makeText(activity, "缺少存储权限，无法保存到下载目录", Toast.LENGTH_SHORT).show()
-        }
-    }
 
     /** 应用被新版本替换后清理下载目录里的更新包 */
     private val packageReplacedReceiver = object : BroadcastReceiver() {
@@ -299,30 +282,22 @@ class UpdateManager(private val activity: AppCompatActivity) {
             .show()
     }
 
-    /** 下载更新包：API 29+ 写 MediaStore.Downloads，旧版写公共 Download；CDN 加速、失败换源 */
+    /**
+     * 下载更新包：写入应用外部私有 Download 目录（getExternalFilesDir，免存储权限，
+     * 分区存储下 DownloadManager 也无法直接写公共/MediaStore 目标——setDestinationUri 仅接受 file://
+     * 传 content:// 会抛 IllegalArgumentException，这就是旧版点「立即更新」闪退的原因）。
+     */
     private fun downloadApk(release: UpdateChecker.Release) {
         pendingDownloadVersion = release.version
         pendingDownloadUrls = ArrayDeque(
             downloadSources.map { prefix -> prefix + release.apkUrl }
         )
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            // 分区存储：经 MediaStore.Downloads 写公共下载目录，无需存储权限
-            pendingDownloadUri = createMediaStoreDestination(apkFileName(release.version))
-            if (pendingDownloadUri == null) {
-                Toast.makeText(activity, "创建下载文件失败，请手动下载安装", Toast.LENGTH_SHORT).show()
-                return
-            }
-        } else {
-            // Android 9 及以下需 WRITE_EXTERNAL_STORAGE 写公共 Download
-            @Suppress("DEPRECATION")
-            val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-            pendingDownloadFile = File(dir, apkFileName(release.version))
-            if (!hasWritePermission()) {
-                writePermission.launch(android.Manifest.permission.WRITE_EXTERNAL_STORAGE)
-                Toast.makeText(activity, "需要存储权限以保存更新包到下载目录", Toast.LENGTH_SHORT).show()
-                return
-            }
+        val dir = activity.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
+        if (dir == null) {
+            Toast.makeText(activity, "存储不可用，无法下载更新包", Toast.LENGTH_SHORT).show()
+            return
         }
+        pendingDownloadFile = File(dir, apkFileName(release.version))
         enqueueDownload(pendingDownloadUrls.removeFirst())
         Toast.makeText(activity, "开始下载，完成后自动弹出安装", Toast.LENGTH_SHORT).show()
     }
@@ -330,76 +305,43 @@ class UpdateManager(private val activity: AppCompatActivity) {
     private fun apkFileName(version: String): String =
         "$APK_NAME_PREFIX$version$APK_NAME_SUFFIX"
 
-    /**
-     * 在 MediaStore.Downloads 创建下载占位行，返回其 content URI。
-     * 先删同名旧行：MediaStore 遇重名自动改 "xxx (1)"，会破坏后续按名清理。
-     */
-    @RequiresApi(Build.VERSION_CODES.Q)
-    private fun createMediaStoreDestination(fileName: String): Uri? {
-        val resolver = activity.contentResolver
-        resolver.delete(
-            MediaStore.Downloads.EXTERNAL_CONTENT_URI,
-            "${MediaStore.MediaColumns.DISPLAY_NAME} = ?",
-            arrayOf(fileName)
-        )
-        val values = ContentValues().apply {
-            put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
-            put(MediaStore.MediaColumns.MIME_TYPE, APK_MIME)
-            put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
-        }
-        return resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-    }
-
-    /** 发起一次下载（旧路径先清同名文件；重试沿用同一目标覆写残包） */
+    /** 发起一次下载（先清同名残包；重试沿用同一目标覆写） */
     private fun enqueueDownload(url: String) {
+        val file = pendingDownloadFile ?: return
         val request = DownloadManager.Request(url.toUri())
             .setTitle("影音盒 v$pendingDownloadVersion")
             .setDescription("正在下载更新包")
             .setMimeType(APK_MIME)
             .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            val uri = pendingDownloadUri ?: return
-            request.setDestinationUri(uri)
-        } else {
-            val file = pendingDownloadFile ?: return
-            file.delete()
-            @Suppress("DEPRECATION")
-            request.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, file.name)
-        }
+        file.delete()
+        request.setDestinationInExternalFilesDir(activity, Environment.DIRECTORY_DOWNLOADS, file.name)
         lastDownloadId = downloadManager.enqueue(request)
     }
 
-    /**
-     * 下载完成后交给安装器的 URI：API 29+ 为 MediaStore content URI（可直接授权给系统安装器）；
-     * 旧版为公共 Download 文件，经 FileProvider 暴露。用启动下载时记下的目标，避免取到历史版本包。
-     */
-    private fun downloadedInstallUri(): Uri? {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) return pendingDownloadUri
-        return pendingDownloadFile?.takeIf { it.exists() }?.let {
+    /** 下载完成后交给安装器的 APK：私有 Download 文件经 FileProvider 暴露。用启动下载时记下的目标，避免取到历史版本包。 */
+    private fun downloadedInstallUri(): Uri? =
+        pendingDownloadFile?.takeIf { it.exists() }?.let {
             FileProvider.getUriForFile(activity, "${activity.packageName}.file-provider", it)
         }
-    }
 
-    private fun hasWritePermission(): Boolean =
-        Build.VERSION.SDK_INT > Build.VERSION_CODES.P ||
-            ContextCompat.checkSelfPermission(
-                activity, android.Manifest.permission.WRITE_EXTERNAL_STORAGE
-            ) == PackageManager.PERMISSION_GRANTED
-
-    /** 安装成功后清理下载目录更新包（含历史版本）：API 29+ 删 MediaStore 行，旧版删公共 Download 文件 */
+    /**
+     * 安装成功后清理更新包（含历史版本）：删除应用私有 Download 目录下的文件；
+     * Android 10+ 顺带清理旧版本遗留的 MediaStore.Downloads 0 字节占位行（闪退版本的残留）。
+     */
     private fun deleteInstalledUpdateApk() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            activity.contentResolver.delete(
-                MediaStore.Downloads.EXTERNAL_CONTENT_URI,
-                "${MediaStore.MediaColumns.DISPLAY_NAME} LIKE ?",
-                arrayOf("$APK_NAME_PREFIX%$APK_NAME_SUFFIX")
-            )
-        } else {
-            @Suppress("DEPRECATION")
-            val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-            dir.listFiles { f -> f.name.startsWith(APK_NAME_PREFIX) && f.name.endsWith(APK_NAME_SUFFIX) }
-                ?.forEach { it.delete() }
+            try {
+                activity.contentResolver.delete(
+                    MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                    "${MediaStore.MediaColumns.DISPLAY_NAME} LIKE ?",
+                    arrayOf("$APK_NAME_PREFIX%$APK_NAME_SUFFIX")
+                )
+            } catch (_: Exception) {
+            }
         }
+        activity.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
+            ?.listFiles { f -> f.name.startsWith(APK_NAME_PREFIX) && f.name.endsWith(APK_NAME_SUFFIX) }
+            ?.forEach { it.delete() }
     }
 
     /** 经 content URI 暴露 APK 给系统安装器；Android 8+ 需「安装未知应用」授权接力 */

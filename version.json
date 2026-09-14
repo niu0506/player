@@ -1,5 +1,5 @@
 {
-  "version": "1.4.7",
-  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.4.7/player-v1.4.7-release.apk",
-  "notes": "全量重写代码注释，统一为简洁风格（保留关键边界与历史 bug 教训说明），播放逻辑无改动。"
+  "version": "1.4.8",
+  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.4.8/player-v1.4.8-release.apk",
+  "notes": "修复 Android 10+ 上点「立即更新」闪退的问题：更新包改为下载至应用私有 Download 目录（免存储权限），下载与安装流程全版本统一。"
 }
