@@ -1,5 +1,5 @@
 {
-  "version": "1.4.8",
-  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.4.8/player-v1.4.8-release.apk",
-  "notes": "修复 Android 10+ 上点「立即更新」闪退的问题：更新包改为下载至应用私有 Download 目录（免存储权限），下载与安装流程全版本统一。"
+  "version": "1.4.9",
+  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.4.9/player-v1.4.9-release.apk",
+  "notes": "简化进度写调度：移除仅理论可达的预加载写队列，所有写入统一为「等待数据库加载完成后落盘」语义，加载失败时丢弃本次写入并记日志；同步校正相关注释。无功能行为变化。"
 }

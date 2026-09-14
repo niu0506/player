@@ -228,9 +228,6 @@ object PlayerRepository {
     private var loadJob: Deferred<Unit>? = null
     private val loadLock = Any()
 
-    /** 初始化前到达的写任务暂存队列，加载完成后补执行（异常时丢数据容错） */
-    private val pendingWrites = mutableListOf<suspend () -> Unit>()
-
     /** 内存镜像：不可变快照 + copy-on-write，读方永远见一致状态 */
     @Volatile
     private var playlistState: List<MediaItemData> = emptyList()
@@ -350,41 +347,19 @@ object PlayerRepository {
         e
     }
 
-    /** 写任务调度：已初始化则链到加载后执行；未初始化则入队补执行，防半加载合并 */
+    /**
+     * 写任务调度：已初始化则链到加载完成后执行；加载失败（[awaitOrNull] 返回非 null）则丢弃该写，
+     * 防半加载合并。loadJob 由 PlayerApp 进程启动即经 [ensureLoaded] 保证非空，兜底分支仅作防御。
+     */
     private fun runWhenReady(block: suspend () -> Unit) {
-        val job: Deferred<Unit>? = synchronized(loadLock) {
-            if (loadJob == null) {
-                pendingWrites.add(block)
-                null
-            } else {
-                loadJob
-            }
-        }
+        val job: Deferred<Unit>? = synchronized(loadLock) { loadJob }
         if (job == null) {
+            Log.w(TAG, "仓库尚未初始化，丢弃一次写任务")
             return
         }
         persistScope.launch {
             if (job.awaitOrNull() != null) return@launch
             block()
-        }
-    }
-
-    /** 加载完成后补执行积压的写任务；失败仅记日志，不阻断其余与加载完成 */
-    private suspend fun drainPendingWrites() {
-        val backlog: List<suspend () -> Unit>
-        synchronized(loadLock) {
-            backlog = pendingWrites.toList()
-            pendingWrites.clear()
-        }
-        if (backlog.isEmpty()) return
-        Log.w(TAG, "补执行未初始化期间积压的 ${backlog.size} 个写任务")
-        for (task in backlog) {
-            try {
-                task()
-            } catch (e: Exception) {
-                if (e is CancellationException) throw e
-                Log.e(TAG, "积压写任务执行失败", e)
-            }
         }
     }
 
@@ -418,7 +393,6 @@ object PlayerRepository {
         }
         progressState = database.progressDao().getAll().associate { it.uri to it.positionMs }
         lastItemState = database.kvDao().get(KEY_LAST_ITEM)
-        drainPendingWrites()
     }
 
     /** 旧 prefs 一次性迁移：单事务写 Room + 打标记，提交成功后才清旧文件（中途被杀下次重试） */
