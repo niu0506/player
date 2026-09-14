@@ -40,7 +40,7 @@ import kotlinx.coroutines.withContext
 import androidx.media3.common.MediaItem as M3MediaItem
 import androidx.media3.common.MediaMetadata as M3MediaMetadata
 
-/** 应用入口：进程启动即触发仓库一次性加载（Room 建库 + 旧 prefs 迁移） */
+/** 应用入口：进程启动即触发仓库一次性加载（建库 + 迁移旧 prefs） */
 class PlayerApp : Application() {
     override fun onCreate() {
         super.onCreate()
@@ -49,22 +49,22 @@ class PlayerApp : Application() {
 }
 
 /**
- * 主界面：播放器 + 播放列表面板。经 MediaController 控制 PlayerService 中的播放器，
- * 负责本地媒体扫描、播放进度恢复/保存、倍速与音轨/字幕选择；
+ * 主界面：播放器 + 播放列表面板。
+ * 经 MediaController 控制 PlayerService 播放器，负责扫描、进度恢复/保存、倍速与轨道选择；
  * 全屏/PiP、手势、更新分别委托给 [FullscreenPipHelper]、[GestureController]、[UpdateManager]。
  */
 class MainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
     private lateinit var adapter: MediaListAdapter
     private val playlist = mutableListOf<MediaItemData>()
-    /** 异步构建 MediaController 的 Future（用于返回前台重新连接） */
+    /** 异步构建 MediaController 的 Future（用于回前台重连） */
     private var controllerFuture: com.google.common.util.concurrent.ListenableFuture<MediaController>? = null
     private var controller: MediaController? = null
     /** 当前播放项下标，-1 表示无 */
     private var currentIndex = -1
-    /** 列表是否已从磁盘加载过（防止重复加载） */
+    /** 列表是否已从磁盘加载过（防重复加载） */
     private var playlistLoaded = false
-    /** 内存进度缓存（uri -> 位置毫秒） */
+    /** 内存进度缓存（uri → 位置毫秒） */
     private val cachedProgress = mutableMapOf<String, Long>()
 
     private val scanner = MediaStoreScanner(this)
@@ -90,10 +90,7 @@ class MainActivity : AppCompatActivity() {
 
     // ===== 播放列表管理 =====
 
-    /**
-     * 移除指定下标的条目（清理进度/控制器队列并校正 currentIndex），不含 UI 刷新与落盘。
-     * 删除当前项之前的条目不触发 transition，必须手动校正下标，否则残留下标会让「播完进度」复活。
-     */
+    /** 移除指定下标条目（清进度/控制器队列并校正 currentIndex），不含 UI 与落盘 */
     private fun removeItemAt(index: Int) {
         if (index !in playlist.indices) return
         clearProgress(playlist[index].uri)
@@ -115,7 +112,7 @@ class MainActivity : AppCompatActivity() {
         Toast.makeText(this, "已删除", Toast.LENGTH_SHORT).show()
     }
 
-    /** 刷新列表、顶部计数与空态提示 */
+    /** 刷新列表、顶部计数与空态 */
     private fun refreshPlaylist() {
         adapter.setProgress(cachedProgress)
         adapter.submitList(playlist.toList())
@@ -123,25 +120,17 @@ class MainActivity : AppCompatActivity() {
         binding.tvEmpty.visibility = if (playlist.isEmpty()) View.VISIBLE else View.GONE
     }
 
-    /** 列表与进度快照交给仓库持久化（主线程先做快照，防 IO 侧遍历期间列表被修改） */
+    /** 列表与进度快照交给仓库持久化（主线程先快照，防 IO 侧列表被改） */
     private fun savePlaylist() {
         PlayerRepository.savePlaylist(playlist.toList(), cachedProgress.toMap())
     }
 
-    /**
-     * 当前播放列表的 normalizeUri 键集合，作为「已存在」判定的共用基准：
-     * loadPlaylist 据此去重（防历史脏数据），reconcileScanResult 据此过滤
-     * 扫描重复项；两处共用同一实现，防止「已存在」的定义各自漂移。
-     */
+    /** normalizeUri 键集合，「已存在」判定的共用基准（去重与对账共用，防漂移） */
     private fun existingUriKeys(): Set<String> = playlist.map { normalizeUri(it.uri) }.toSet()
 
-    /**
-     * 从仓库恢复播放列表（按 uri 去重）。只加载数据，不同步控制器——
-     * 媒体项同步只发生在 onStart 且数量失不时，否则服务存活重建会重复添加队列。
-     */
+    /** 从仓库恢复播放列表（按 uri 去重）。只加载数据，不同步控制器 */
     private fun loadPlaylist() {
         val progressMap = PlayerRepository.getProgressMap()
-        // toMutableSet：循环内逐个 add，连带对「本次加载列表内部」的重复去重
         val existingKeys = existingUriKeys().toMutableSet()
         for (item in PlayerRepository.getPlaylist()) {
             val key = normalizeUri(item.uri)
@@ -155,10 +144,7 @@ class MainActivity : AppCompatActivity() {
 
     // ===== 播放进度管理 =====
 
-    /**
-     * 用持久层的权威进度校正内存缓存与列表进度条。
-     * 后台播完切集时前台监听已解绑、内存残留「播完进度」，不校正会在下次落盘时复活。
-     */
+    /** 用持久层权威进度校正内存缓存与列表进度条（防后台播完残留复活） */
     private fun reconcileProgressFromDisk() {
         val diskMap = PlayerRepository.getProgressMap()
         for (i in playlist.indices) {
@@ -171,18 +157,13 @@ class MainActivity : AppCompatActivity() {
                     adapter.updateProgress(i, diskVal)
                 }
             } else if (memVal != null) {
-                // 磁盘已无该进度（播完被清理/删除）：移除内存残留
                 cachedProgress.remove(uri)
                 adapter.updateProgress(i, 0L)
             }
         }
     }
 
-    /**
-     * 保存当前项进度到内存缓存并刷新进度条。
-     * 写入/清除/跳过的判定统一由 decideProgressWrite 裁决（唯一权威实现），
-     * 这里只负责把结果落到 cachedProgress 与列表进度条
-     */
+    /** 保存当前项进度到内存缓存并刷新进度条（裁决统一走 decideProgressWrite） */
     private fun saveCurrentProgress() {
         val ctrl = controller ?: return
         val index = ctrl.currentMediaItemIndex
@@ -190,7 +171,6 @@ class MainActivity : AppCompatActivity() {
         val uri = playlist[index].uri.toString()
         when (val decision = decideProgressWrite(ctrl.currentPosition, ctrl.duration)) {
             is ProgressWriteDecision.Clear -> {
-                // 播到末尾视为看完：清除进度，进度条归零
                 cachedProgress.remove(uri)
                 adapter.updateProgress(index, 0)
             }
@@ -213,7 +193,7 @@ class MainActivity : AppCompatActivity() {
     private val playerListener = object : Player.Listener {
         override fun onMediaItemTransition(mediaItem: M3MediaItem?, reason: Int) {
             saveCurrentProgress()
-            // 自然播完自动切换时，用「上一项的下标」清掉其近末尾进度
+            // 自然播完切集时清掉上一项近末尾进度
             if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO
                 && currentIndex in playlist.indices
                 && currentIndex != controller?.currentMediaItemIndex
@@ -247,18 +227,13 @@ class MainActivity : AppCompatActivity() {
 
         override fun onPlayerError(error: PlaybackException) {
             val ctrl = controller ?: return
-            // 出错文件名：列表可能为空或下标尚未同步，先做边界检查防下标越界
             val index = currentIndex
             val name = playlist.getOrNull(index)?.name ?: "未知文件"
 
-            // 「文件找不到」类 IO 错误才移除条目：MediaStore 的 content:// 地址
-            // 在文件被删除后正是报 ERROR_CODE_IO_FILE_NOT_FOUND；
-            // 解码失败等其他错误只提示不删——文件本身还在，不排除换环境后能播
+            // 仅「文件不存在」类错误移除条目，其它只提示不删
             val isFileGone = error.errorCode == PlaybackException.ERROR_CODE_IO_FILE_NOT_FOUND
 
-            // 尝试跳到下一项继续播放，避免用户卡在一个坏文件上。
-            // 出错后播放器处于 IDLE：seek 只移动位置不会自动恢复播放，
-            // 需要 prepare 清除错误状态重新准备（已切到下一项）再起播
+            // 跳到下一项并 prepare 清除错误状态后起播，避免卡在坏文件
             if (ctrl.hasNextMediaItem()) {
                 ctrl.seekToNextMediaItem()
                 ctrl.prepare()
@@ -267,10 +242,7 @@ class MainActivity : AppCompatActivity() {
 
             if (isFileGone && index in playlist.indices) {
                 Toast.makeText(this@MainActivity, "无法读取「$name」", Toast.LENGTH_SHORT).show()
-                // 顺手移除失效文件并清理其进度，避免反复点到同一个坏文件。
-                // 必须放在上面的 seekToNext 之后：MediaController 命令按序送达服务端，
-                // 先 seek 再 remove，队列下标前移后恰好落在紧邻的下一项上；
-                // 若先删后跳，「下一项」已前移一位，会再越过一个文件
+                // 先 seek 后删：队列下标前移后恰好落在下一项，避免再跳过一个文件
                 removeItemFromPlaylist(index)
             } else {
                 Toast.makeText(this@MainActivity, "播放出错：$name", Toast.LENGTH_SHORT).show()
@@ -278,7 +250,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         override fun onPlaybackSuppressionReasonChanged(playbackSuppressionReason: Int) {
-            // 暂时性焦点丢失（来电等）：播放被抑制，焦点归还后自动续播
+            // 暂时性焦点丢失（来电等）：焦点归还后自动续播
             if (playbackSuppressionReason == Player.PLAYBACK_SUPPRESSION_REASON_TRANSIENT_AUDIO_FOCUS_LOSS) {
                 Toast.makeText(this@MainActivity, "已被其他应用暂时打断，稍后自动续播", Toast.LENGTH_SHORT).show()
             }
@@ -290,10 +262,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /**
-     * 构建带元数据的 MediaItem：title 用于通知栏/锁屏媒体控制显示文件名，
-     * 不设置时系统通知会显示「未知」占位。
-     */
+    /** 构建带元数据的 MediaItem：title 供通知栏/锁屏显示文件名 */
     private fun buildMediaItem(item: MediaItemData): M3MediaItem =
         M3MediaItem.Builder()
             .setUri(item.uri)
@@ -302,7 +271,7 @@ class MainActivity : AppCompatActivity() {
             )
             .build()
 
-    /** 续播位置：优先持久层（Service 落盘的权威值），无记录才回退内存缓存 */
+    /** 续播位置：优先持久层权威值，无记录才回退内存缓存 */
     private fun resolveResumePosition(item: MediaItemData): Long {
         val disk = PlayerRepository.getProgress(item.uri.toString())
         if (disk != null && disk > 0) return disk
@@ -327,8 +296,7 @@ class MainActivity : AppCompatActivity() {
         val lastUri = PlayerRepository.getLastItem() ?: return
         val idx = playlist.indexOfFirst { it.uri.toString() == lastUri }
         if (idx !in playlist.indices) return
-        // 不因「当前正好在下标 0」提前 return：冷启动重建队列时下标 0 是默认值，
-        // 并非真实进度，必须走到 seekTo 才能恢复断点（重复 seek 到同位置无副作用）
+        // 不因「下标为 0」提前 return：冷启动重建队列时下标 0 是默认值，须走 seekTo 才恢复断点
         val pos = resolveResumePosition(playlist[idx])
         if (pos > 0) ctrl.seekTo(idx, pos) else ctrl.seekToDefaultPosition(idx)
         currentIndex = idx
@@ -425,8 +393,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 扫描本地音视频并对账播放列表（IO 线程，带重入保护）。
-     * @param silent true 为回前台静默对账：只删不增、不弹提示、无权限时跳过
+     * 扫描本地音视频并对账（IO 线程，带重入保护）。
+     * @param silent true 为回前台静默对账：只删不增、不弹提示、无权限跳过
      */
     private fun scanLocalMedia(silent: Boolean = false) {
         if (isScanning) return
@@ -445,9 +413,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /**
-     * 主线程消化扫描结果：先对账移除已删除的条目，非静默时再合并新增（过滤 <5 秒与重复）。
-     */
+    /** 消化扫描结果：先对账移除已删除项，非静默时再合并新增（过滤 <5 秒与重复） */
     private fun reconcileScanResult(
         scannedVideos: List<MediaItemData>?,
         scannedAudios: List<MediaItemData>?,
@@ -459,11 +425,8 @@ class MainActivity : AppCompatActivity() {
             }
             return
         }
-        // 查询失败的类型(null)由 pruneDeletedMedia 内部跳过其删除对账
         val removedCount = pruneDeletedMedia(scannedVideos, scannedAudios)
         val newItems = if (silent) emptyList() else {
-            // scanned 合并只服务「找新增」，构建收敛到非静默分支：
-            // silent（每次回前台对账）路径不做这次全量合并
             val scanned = mutableListOf<MediaItemData>()
             scannedVideos?.let(scanned::addAll)
             scannedAudios?.let(scanned::addAll)
@@ -493,11 +456,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 用扫描结果对账播放列表，移除文件已从媒体库删除的条目。
-     *
-     * 权限保护：API 34+ 的「仅选中的照片/视频」部分授权下，查询结果只含被选中文件，
-     * 直接对账会误删未授权文件，因此仅在全量权限时才执行该类型删除；
-     * 查询失败（参数为 null）同理跳过——失败 ≠ 空集，当空集处理会整类误删。
+     * 用扫描结果对账播放列表，移除媒体库中已删除的条目。
+     * 仅在全量权限/查询成功时才删除该类型，否则跳过（部分授权查询结果≠全量）。
      */
     private fun pruneDeletedMedia(
         scannedVideos: List<MediaItemData>?,
@@ -546,13 +506,12 @@ class MainActivity : AppCompatActivity() {
         gestures = GestureController(this, binding.playerView, binding.gestureOverlay) { controller }
         fullscreenPip = FullscreenPipHelper(this, binding) { controller }
 
-        // 回调回传 uri 而非下标：适配器 items 异步 diff 存在下标错位窗口，处理时现查下标
+        // 回调回传 uri 而非下标：适配器 diff 存在下标错位窗口，处理时现查下标
         adapter = MediaListAdapter(
             onClick = { uri ->
                 val index = playlist.indexOfFirst { it.uri.toString() == uri }
                 if (index >= 0) {
-                    // 切走前先记录当前项精确进度：transition 触发后 controller 已切到新项，
-                    // 读不到旧项位置，必须在 seekTo 之前落盘
+                    // 切走前先记录当前项精确进度（transition 后读不到旧项位置）
                     saveCurrentProgress()
                     PlayerService.flushCurrentPosition()
                     val item = playlist[index]
@@ -642,7 +601,7 @@ class MainActivity : AppCompatActivity() {
         val future = MediaController.Builder(this, sessionToken).buildAsync()
         controllerFuture = future
         future.addListener({
-            // 回调可能晚于 onStop（future 已释放），必须用 !== 判空防 NPE 或重挂已释放控制器
+            // 回调可能晚于 onStop（future 已释放），须用 !== 判空防 NPE 或重挂
             if (controllerFuture !== future) return@addListener
             val ctrl = try {
                 future.get()
@@ -655,8 +614,7 @@ class MainActivity : AppCompatActivity() {
             currentIndex = ctrl.currentMediaItemIndex
             adapter.setCurrentPlaying(currentIndex, ctrl.isPlaying)
             lifecycleScope.launch {
-                // 最后一道防线：仓库侧已把加载异常降级为空数据，这里兜住极端漏网
-                // 情况，失败时提示并跳过后续加载逻辑，保证 App 仍能启动进入界面
+                // 兜住仓库侧漏网的加载异常，失败提示并跳过后续逻辑，保证仍能启动
                 try {
                     PlayerRepository.awaitLoaded(this@MainActivity)
                 } catch (_: Exception) {
@@ -667,13 +625,12 @@ class MainActivity : AppCompatActivity() {
                     loadPlaylist()
                     playlistLoaded = true
                 } else {
-                    // 回前台：用持久层校正内存，防止后台播完项的残留进度复活
+                    // 回前台：用持久层校正内存，防后台播完残留进度复活
                     reconcileProgressFromDisk()
                 }
-                // 回前台静默对账：等播放列表加载完成后再扫，确保冷启动时
-                // 对账能基于已填充的 playlist 删除已消失文件（只删不增、无权限跳过）
+                // 回前台静默对账：等列表加载完后再扫，确保能删已消失文件
                 scanLocalMedia(silent = true)
-                // 队列与内存列表失不时（控制器为空/重连错位）全量重灌自愈
+                // 队列与内存列表失不时全量重灌自愈
                 if (playlist.isNotEmpty() && ctrl.mediaItemCount != playlist.size) {
                     val cur = ctrl.currentMediaItem
                     val curUri = cur?.localConfiguration?.uri?.toString()
@@ -708,8 +665,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onPause() {
         super.onPause()
-        // 进度保存只放 onPause：离开前台必然先 onPause 再 onStop，后者再存属重复；
-        // 且弹对话框/覆盖透明 Activity 只触发 onPause 不触发 onStop，这里覆盖面更全
+        // 进度只在 onPause 存：离开前台必先 onPause 再 onStop；弹窗/透明 Activity 只触发 onPause
         saveCurrentProgress()
     }
 

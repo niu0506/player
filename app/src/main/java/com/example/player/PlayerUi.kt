@@ -77,9 +77,7 @@ class FullscreenPipHelper(
     /** 依据是否 PiP / 全屏调整视频容器样式 */
     private fun applyPipVideoSurface(inPip: Boolean) {
         when {
-            // PiP：ZOOM 填满小窗
             inPip -> applyEdgeToEdgeSurface(AspectRatioFrameLayout.RESIZE_MODE_ZOOM)
-            // 全屏：FIT 保留完整画面，超出留黑边
             isFullscreen -> applyEdgeToEdgeSurface(AspectRatioFrameLayout.RESIZE_MODE_FIT)
             else -> applyNormalVideoSurfaceStyle()
         }
@@ -94,7 +92,7 @@ class FullscreenPipHelper(
         binding.playerCard.layoutParams = lp
     }
 
-    /** 普通非全屏、非 PiP 的卡片样式：FIT + 12dp 边距 + 18dp 圆角 */
+    /** 普通非全屏、非 PiP 卡片样式：FIT + 12dp 边距 + 18dp 圆角 */
     private fun applyNormalVideoSurfaceStyle() {
         binding.playerView.setResizeMode(AspectRatioFrameLayout.RESIZE_MODE_FIT)
         val lp = binding.playerCard.layoutParams as ViewGroup.MarginLayoutParams
@@ -134,7 +132,7 @@ class FullscreenPipHelper(
             .show(WindowInsetsCompat.Type.systemBars())
     }
 
-    /** 进入 PiP 小窗，失败时回退并提示 */
+    /** 进入 PiP 小窗；失败时恢复 UI 并提示 */
     fun enterPipMode() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
             Toast.makeText(activity, "系统不支持小窗播放", Toast.LENGTH_SHORT).show()
@@ -152,7 +150,7 @@ class FullscreenPipHelper(
         binding.playerView.useController = false
         applyPipVideoSurface(true)
         try {
-            // 以视频宽高比作为小窗比例，解析失败时回退 16:9
+            // 以视频宽高比作小窗比例，解析失败回退 16:9
             val ratio = try {
                 Rational(vs.width, vs.height)
             } catch (_: Exception) {
@@ -161,7 +159,6 @@ class FullscreenPipHelper(
             if (activity.enterPictureInPictureMode(buildPipParams(ratio))) return
         } catch (_: Exception) {
         }
-        // 进入失败：恢复原有 UI
         setChromeVisible(true)
         binding.playerView.useController = true
         applyPipVideoSurface(false)
@@ -270,7 +267,7 @@ class GestureController(
             ): Boolean {
                 val start = e1 ?: return false
                 val ctrl = controllerProvider() ?: return false
-                // 手势刚开始时确定模式
+                // 手势开始时确定模式
                 if (gestureMode == GESTURE_NONE) {
                     if (playerView.isControllerFullyVisible) {
                         playerView.hideController()
@@ -382,17 +379,14 @@ class MediaListAdapter(
 ) : RecyclerView.Adapter<MediaListAdapter.VH>() {
 
     private val items = mutableListOf<MediaItemData>()
-    /** 各条目进度（uri -> 毫秒），独立于条目数据，跨 submitList 存活 */
+    /** 各条目进度（uri → 毫秒），独立于条目数据，跨 submitList 存活 */
     private val progressMap = mutableMapOf<String, Long>()
     private var currentPlayingIndex = -1
     private var isPlaying = false
     private val diffScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
     private var diffJob: Job? = null
 
-    /**
-     * 用新列表刷新数据。DiffUtil 在后台线程计算、结果回主线程 dispatch，
-     * 避免大列表在主线程同步计算掉帧。
-     */
+    /** 用新列表刷新数据；DiffUtil 后台计算、结果回主线程 dispatch，防主线程掉帧 */
     fun submitList(list: List<MediaItemData>) {
         val oldItems = ArrayList(items)
         diffJob?.cancel()
@@ -416,9 +410,8 @@ class MediaListAdapter(
     }
 
     /**
-     * 设置当前播放项，只刷新新旧两个位置。
-     * 传入下标来自 ExoPlayer 队列，items 可能尚未跟上 diff 回写，
-     * 因此与 updateDuration/updateProgress 一样做双向边界检查，越界时仅记录状态。
+     * 设置当前播放项，只刷新新旧两处。传入下标来自 ExoPlayer 队列（items 可能尚未跟上 diff 回写），
+     * 做双向边界检查，越界仅记录状态。
      */
     fun setCurrentPlaying(index: Int, playing: Boolean = false) {
         val old = currentPlayingIndex
@@ -473,7 +466,7 @@ class MediaListAdapter(
             context.getColor(if (isActive) R.color.accent else R.color.text_primary)
         )
 
-        // 有进度时展示进度条；播放中的项显示「已播时长」，否则显示「已播/总时长」
+        // 有进度展示进度条；播放中显示「已播时长」，否则显示「已播/总时长」
         val progress = progressMap[item.uri.toString()] ?: 0L
         if (progress > 0 && item.duration > 0) {
             val percent = (progress * 100 / item.duration).toInt().coerceIn(0, 100)
@@ -504,7 +497,7 @@ class MediaListAdapter(
 
     /** inner 以便在 init 中绑定一次点击监听，避免每次绑定重建 lambda */
     inner class VH(val binding: ItemMediaBinding) : RecyclerView.ViewHolder(binding.root) {
-        /** 取点击位置对应条目的 uri；位置无效（含 NO_POSITION）时返回 null */
+        /** 点击位置对应条目的 uri；位置无效（含 NO_POSITION）时返回 null */
         private fun uriAt(position: Int): String? =
             if (position == RecyclerView.NO_POSITION) null
             else items.getOrNull(position)?.uri?.toString()

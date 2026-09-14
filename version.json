@@ -1,5 +1,5 @@
 {
-  "version": "1.4.6",
-  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.4.6/player-v1.4.6-release.apk",
-  "notes": "修复顺序模式无法连播（现播完整个列表才停）；播放出错自动跳下一项，文件已删除时移除列表条目；数据库损坏或磁盘满时降级为空数据启动，不再循环闪退；移除退出时的主线程同步落盘等待，消除 ANR 风险；移除失效下载加速源。"
+  "version": "1.4.7",
+  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.4.7/player-v1.4.7-release.apk",
+  "notes": "全量重写代码注释，统一为简洁风格（保留关键边界与历史 bug 教训说明），播放逻辑无改动。"
 }

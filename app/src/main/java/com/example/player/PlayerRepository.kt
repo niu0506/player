@@ -42,11 +42,7 @@ import java.util.Locale
 
 // ==================== 数据模型 ====================
 
-/**
- * 播放列表中的单个媒体项。只承载元信息（来源、名称、时长），
- * 播放进度统一存在 uri -> position 的进度映射（progress 表 + cachedProgress），
- * 避免同一份进度存多份导致对账复杂化。
- */
+/** 播放列表单个媒体项：仅元信息；进度统一存 uri→positions 映射 */
 data class MediaItemData(
     val uri: Uri,
     val name: String,
@@ -54,17 +50,14 @@ data class MediaItemData(
     val duration: Long = 0L
 )
 
-/** 规整化 Uri 字符串（去 query/末尾斜杠 + 拼接末段路径），作为去重/匹配的稳定 key */
+/** 规整化 Uri 字符串，作为去重/匹配的稳定 key */
 fun normalizeUri(uri: Uri): String {
     val base = uri.buildUpon().clearQuery().build().toString().trimEnd('/')
     val lastSeg = uri.lastPathSegment ?: base
     return "$base|$lastSeg"
 }
 
-/**
- * 毫秒格式化为时长文本（"12:34" / "1:02:03"）。
- * 结果按毫秒值做 LiuCache，列表滚动绑定场景中相同数值被反复请求。
- */
+/** 毫秒格式化时长文本（"12:34"/"1:02:03"），结果按值缓存 */
 private val timeFormatCache = LruCache<Long, String>(512)
 
 fun formatTime(ms: Long): String {
@@ -81,19 +74,16 @@ fun formatTime(ms: Long): String {
 
 // ==================== 本地媒体库扫描 ====================
 
-/** MediaStore 查询与权限判定。只负责「读」，列表合并/对账由上层编排 */
+/** MediaStore 查询与权限判定，只负责读，合并/对账由上层编排 */
 class MediaStoreScanner(private val context: Context) {
 
-    /** 查询全部视频（按名称升序）；查询失败返回 null */
+    /** 查询全部视频（按名称升序）；失败返回 null */
     fun queryVideos(): List<MediaItemData>? = query(MediaStore.Video.Media.EXTERNAL_CONTENT_URI)
 
-    /** 查询全部音频（按名称升序）；查询失败返回 null */
+    /** 查询全部音频（按名称升序）；失败返回 null */
     fun queryAudios(): List<MediaItemData>? = query(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI)
 
-    /**
-     * 查询 MediaStore。失败（异常/拿不到游标）返回 null——必须与「空结果」区分：
-     * 空结果会被上层对账当作「全部已删除」，瞬时失败若会被……吞整类误删。
-     */
+    /** 查询 MediaStore；失败返回 null（与「空结果」区分，避免被当作误删） */
     private fun query(contentUri: Uri): List<MediaItemData>? {
         val items = mutableListOf<MediaItemData>()
         val projection = arrayOf(
@@ -125,10 +115,7 @@ class MediaStoreScanner(private val context: Context) {
         }
     }
 
-    /**
-     * 是否具备指定媒体类型的「全量」读取权限（API 34+ 的「仅选中」授权不算）。
-     * 用于删除对账前保护，避免部分授权下误删未授权文件。
-     */
+    /** 是否具备全量读取权限（API 34+ 的「仅选中」授权不算），用于删除对账前保护 */
     fun hasFullMediaAccess(permission: String): Boolean {
         if (Build.VERSION.SDK_INT < 33) {
             return ContextCompat.checkSelfPermission(
@@ -142,15 +129,11 @@ class MediaStoreScanner(private val context: Context) {
 // ==================== Room 持久化层 ====================
 
 /**
- * 持久化层：Room 数据库 + 内存镜像仓库（替代旧 SharedPreferences）。
- * - 读：全部走内存镜像（@Volatile 不可变快照），保持上层主线程同步读
- * - 写：锁内更新内存（copy-on-write），再按提交顺序异步落库（单线程 + 互斥锁 + 事务）
- * - 加载：进程启动一次性加载（含旧 prefs 迁移），完成前的写自动链到加载之后；
- *   失败（DB 损坏/磁盘满）降级为空数据，绝不让异常逃逸到调用方
- * - flush：Service 销毁等场景同步等待已提交写任务落盘
+ * 持久化层：Room 数据库 + 内存镜像。
+ * 读走内存镜像（主线程同步可见）；写在锁内更新镜像，再按提交顺序异步落库。
  */
 
-/** 播放列表条目（sortOrder 维护列表顺序） */
+/** 播放列表条目（sortOrder 维护顺序） */
 @Entity(tableName = "playlist")
 data class PlaylistItemEntity(
     @PrimaryKey val uri: String,
@@ -159,14 +142,14 @@ data class PlaylistItemEntity(
     val sortOrder: Int,
 )
 
-/** 播放进度（uri -> 位置毫秒），断点续播的唯一数据源 */
+/** 播放进度（uri → 位置毫秒），断点续播的唯一数据源 */
 @Entity(tableName = "progress")
 data class ProgressEntity(
     @PrimaryKey val uri: String,
     val positionMs: Long,
 )
 
-/** 轻量键值存储：上次播放项、旧数据迁移标记等 */
+/** 轻量键值存储：上次播放项、迁移标记等 */
 @Entity(tableName = "kv")
 data class KvEntity(
     @PrimaryKey @ColumnInfo(name = "key") val key: String,
@@ -184,7 +167,7 @@ interface PlaylistDao {
     @Query("DELETE FROM playlist")
     suspend fun clear()
 
-    /** 全量替换播放列表（clear + insert 原子完成） */
+    /** 全量替换：clear + insert 原子完成 */
     @Transaction
     suspend fun replaceAll(items: List<PlaylistItemEntity>) {
         clear()
@@ -229,12 +212,12 @@ abstract class PlayerDatabase : RoomDatabase() {
 object PlayerRepository {
     private const val TAG = "PlayerRepository"
     private const val DB_NAME = "player.db"
-    /** 旧版 SharedPreferences 文件名（仅用于一次性数据迁移） */
+    /** 旧版 SharedPreferences 文件名（仅一次性迁移用） */
     private const val LEGACY_PREFS = "player"
     private const val KEY_LAST_ITEM = "lastItem"
     private const val KEY_MIGRATED = "migratedFromPrefs"
 
-    /** 单线程 dispatcher + 公平互斥锁，保证 DB 写入顺序严格等于调用顺序 */
+    /** 单线程 dispatcher + 公正互斥锁，保证写序 = 调用序 */
     @OptIn(ExperimentalCoroutinesApi::class)
     private val persistScope =
         CoroutineScope(SupervisorJob() + Dispatchers.IO.limitedParallelism(1))
@@ -245,14 +228,7 @@ object PlayerRepository {
     private var loadJob: Deferred<Unit>? = null
     private val loadLock = Any()
 
-    /**
-     * 「仓库未初始化期间」到达的写任务暂存队列（runWhenReady 的排队兜底）。
-     * 正常流程下 PlayerApp.onCreate 会先触发 ensureLoaded，本队列恒为空；
-     * 一旦初始化约定被破坏（未来新增入口、初始化顺序变化），写入会先排队
-     * 而非静默蒸发。与 loadJob 的判空/赋值共用 [loadLock]：「入队」与
-     * 「开始加载」必须互斥——否则存在「判空后、入队前加载恰好完成并清空
-     * 队列」的交错窗口，任务从此无人消费。
-     */
+    /** 初始化前到达的写任务暂存队列，加载完成后补执行（异常时丢数据容错） */
     private val pendingWrites = mutableListOf<suspend () -> Unit>()
 
     /** 内存镜像：不可变快照 + copy-on-write，读方永远见一致状态 */
@@ -265,7 +241,7 @@ object PlayerRepository {
     @Volatile
     private var lastItemState: String? = null
 
-    /** 启动一次性加载（幂等）。由 PlayerApp.onCreate 触发 */
+    /** 启动一次性加载（幂等），由 PlayerApp.onCreate 触发 */
     fun ensureLoaded(context: Context) {
         synchronized(loadLock) {
             if (loadJob == null) {
@@ -275,21 +251,12 @@ object PlayerRepository {
         }
     }
 
-    /**
-     * 等待一次性加载完成（含旧数据迁移）后再读内存镜像。
-     * 加载失败（DB 损坏/磁盘满等）不再向调用方抛异常：记录日志并把内存镜像
-     * 重置为空状态，让上层以「空列表」继续运行——宁可丢播放列表也不能让 App
-     * 每次启动都闪退（循环闪退会让用户彻底打不开 App）。
-     * 协程取消（CancellationException）不属于加载失败，仍原样上抛，
-     * 以配合调用方作用域的取消语义（如 lifecycleScope 随 Activity 结束）。
-     */
+    /** 等待加载完成；失败时日志并重置镜像为空，绝不向外抛（避免启动闪退） */
     suspend fun awaitLoaded(context: Context) {
         ensureLoaded(context)
         val failure = loadJob!!.awaitOrNull()
         if (failure != null) {
             Log.e(TAG, "数据库加载失败，内存镜像已重置为空", failure)
-            // loadInternal 可能在中途失败（如 playlist 已读出但 progress 查询失败），
-            // 残留半加载状态；统一清空，保证所有调用方看到一致的「空数据」
             synchronized(stateLock) {
                 playlistState = emptyList()
                 progressState = emptyMap()
@@ -298,7 +265,7 @@ object PlayerRepository {
         }
     }
 
-    // ---- 同步读（加载完成后调用；返回不可变快照） ----
+    // ---- 同步读（加载后调用；返回不可变快照） ----
 
     fun getPlaylist(): List<MediaItemData> = playlistState
 
@@ -310,13 +277,9 @@ object PlayerRepository {
 
     // ---- 写：内存即时更新，DB 按调用顺序异步落库 ----
 
-    /**
-     * 「合并非覆盖」式批量更新进度：
-     * 先剔除 [removes]，再合并 [writes]（仅 >0 的值，0 不覆盖已有非零进度）。
-     */
+    /** 批量更新进度：先剔除 [removes]，再合并 [writes]（仅 >0，0 不覆盖） */
     fun applyProgressUpdates(writes: Map<String, Long>, removes: Set<String> = emptySet()) {
         if (writes.isEmpty() && removes.isEmpty()) return
-        // 入口同步快照：调用方在返回后可能立即修改原集合
         val writesSnapshot = writes.toMap()
         val removesSnapshot = removes.toSet()
         runWhenReady {
@@ -362,19 +325,13 @@ object PlayerRepository {
 
     /** 等待一次性加载与所有已提交写任务落盘（Service 销毁等同步路径用） */
     suspend fun flush() {
-        // 加载失败静默放过（awaitOrNull 不抛）：日志与镜像降级已由 awaitLoaded
-        // 承担，这里只负责等已提交的写任务；会把……加让 onDestroy 的
-        // 后台 flush 以未捕获协程异常闪退
         loadJob?.awaitOrNull()
         persistScope.coroutineContext[Job]!!.children.toList().joinAll()
     }
 
     // ---- 内部实现 ----
 
-    /**
-     * 进度写公共段落（必须在 [stateLock] 内调用）：
-     * 更新内存镜像并返回需要落库的增量实体（仅 >0 的值）。
-     */
+    /** 进度写公共段落（须在 [stateLock] 内）：更新内存并返回需落库的 >0 增量 */
     private fun mergeProgressLocked(
         writes: Map<String, Long>,
         removes: Set<String>
@@ -383,13 +340,7 @@ object PlayerRepository {
         return writes.filterValues { it > 0 }.map { ProgressEntity(it.key, it.value) }
     }
 
-    /**
-     * 统一「等待加载协程」的骨架：成功返回 null、失败返回原始异常。
-     * 只收敛 CancellationException 上抛/其余捕获的公共骨架，本身不做任何
-     * 降级动作——三处调用方对失败的处理各不相同（awaitLoaded 记日志并清空
-     * 镜像；flush 与 runWhenReady 静默跳过，避免周期性写在坏 DB 上每 2 秒
-     * 刷一条错误日志），由各调用方依据返回值自行决定。
-     */
+    /** 等待加载协程：成功返回 null，失败返回异常（取消仍上抛）；不做降级 */
     private suspend fun Deferred<Unit>.awaitOrNull(): Exception? = try {
         await()
         null
@@ -399,18 +350,8 @@ object PlayerRepository {
         e
     }
 
-    /**
-     * 写任务调度：已初始化则链到加载完成之后执行（防半加载合并）；
-     * 未初始化（loadJob 为 null）则推入待办队列，由 loadInternal 加载完成后
-     * 按序不执行（见 [drainPendingWrites]）。
-     * 原实现依赖「调用方保证 PlayerApp.onCreate 已先 ensureLoaded」的隐式约定，
-     * 约定一旦被破坏（未来新增入口、初始化顺序变化），写入会被静默丢弃——
-     * 无日志无崩溃，极难排查；现从「依赖调用方保证已初始化」改为「自带排队
-     * 兜底」，约定被破坏时只损失「落库推迟到加载完成」而非「数据丢失」。
-     */
+    /** 写任务调度：已初始化则链到加载后执行；未初始化则入队补执行，防半加载合并 */
     private fun runWhenReady(block: suspend () -> Unit) {
-        // 判空与入队必须原子（共用 loadLock，见 pendingWrites 的 KDoc）；
-        // 若 loadJob 非空，本任务与既有路径一致：链到加载之后执行
         val job: Deferred<Unit>? = synchronized(loadLock) {
             if (loadJob == null) {
                 pendingWrites.add(block)
@@ -420,33 +361,16 @@ object PlayerRepository {
             }
         }
         if (job == null) {
-            // 防御层一：不静默丢弃，入队等 loadInternal 不执行。
-            // 此处不打逐条日志：drainPendingWrites 的带数量汇总日志信息量更大，
-            // 逐条会与之重复；若加载失败致 drain 不执行，已有「数据库加载失败」
-            // 的 Log.e 可查
             return
         }
         persistScope.launch {
-            // 加载失败静默跳过本次写：镜像已重置为空，继续写只会反复撞损坏的 DB；
-            // 不记日志——2 秒周期写会把逐条日志放大成风暴，失败已由 awaitLoaded 记过
             if (job.awaitOrNull() != null) return@launch
             block()
         }
     }
 
-    /**
-     * 不执行「仓库未初始化期间」积压的写任务（runWhenReady 的第二层防御）。
-     * 仅在 loadInternal 末尾（三份镜像就绪后）调用，保证：
-     * - 严格晚于加载完成，不与加载并发，杜绝「半加载合并」；
-     * - 本函数天然运行在 persistScope 单线程上，顺序执行即满足
-     *   「在 persistScope 上逐个执行」；
-     * - 一定先于经 job.await() 链接的后续写任务（它们要等 loadJob 完成），
-     *   「排队在前、链接在后」的真实提交顺序得以保留。
-     * 若加载中途失败（异常上抛）则不会走到这里，队列任务随既有的
-     * 「降级为空数据」策略一并放弃——宁丢数据不闪退。
-     */
+    /** 加载完成后补执行积压的写任务；失败仅记日志，不阻断其余与加载完成 */
     private suspend fun drainPendingWrites() {
-        // 快照 + 清空同锁完成：runWhenReady 的入队可能来自任意线程
         val backlog: List<suspend () -> Unit>
         synchronized(loadLock) {
             backlog = pendingWrites.toList()
@@ -459,17 +383,12 @@ object PlayerRepository {
                 task()
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
-                // 单个积压任务失败不波及其余任务，也不阻断加载完成
                 Log.e(TAG, "积压写任务执行失败", e)
             }
         }
     }
 
-    /**
-     * 单个写任务的 DB 段落：锁 + 事务，与其它写任务严格串行。
-     * 写失败（磁盘满/DB 损坏）只记日志不抛出：本函数跑在 persistScope.launch
-     * 里，未捕获异常同样会闪退 App；内存镜像已更新，本次丢失由下次启动对账兜底
-     */
+    /** 单个写任务的 DB 段落：锁 + 事务，写失败只记日志不上抛（内存已更新） */
     private suspend fun persist(block: suspend PlayerDatabase.() -> Unit) {
         val database = db ?: return
         try {
@@ -479,15 +398,10 @@ object PlayerRepository {
         }
     }
 
-    /** 一次性加载：建库 → 首次启动迁移旧 prefs → 读出三份数据进内存镜像 */
+    /** 一次性加载：建库 → 迁移旧 prefs → 读出三份数据进内存镜像 */
     private suspend fun loadInternal(appCtx: Context) {
         val database = Room.databaseBuilder(appCtx, PlayerDatabase::class.java, DB_NAME)
-            // 当前 DB version = 1、尚无任何迁移，此配置是为未来升 version 2+ 预留的兜底：
-            // 版本升级未提供迁移路径时销毁重建（dropAllTables = true 连 Room 之外的表
-            // 一并清掉，确保重建彻底干净），宁可丢播放列表也不因缺迁移而打不开 App。
-            // 注意：它不覆盖「DB 文件本身损坏」的场景——那种失败由 awaitLoaded 的
-            // 异常捕获 + 重置空状态兜底（无参 fallbackToDestructiveMigration() 在
-            // Room 2.7+ 已废弃，布尔重载是现行 API）
+            // 未来升版本缺迁移时销毁重建，保 App 可打开（不覆盖 DB 文件损坏场景）
             .fallbackToDestructiveMigration(dropAllTables = true)
             .build()
         db = database
@@ -497,7 +411,6 @@ object PlayerRepository {
         } else if (prefs.contains("playlist") || prefs.contains("progress")
             || prefs.contains("lastItem")
         ) {
-            // 迁移事务已提交但旧文件清理被中断（进程被杀）：懒清理兜底
             prefs.edit { clear() }
         }
         playlistState = database.playlistDao().getAll().map {
@@ -505,14 +418,10 @@ object PlayerRepository {
         }
         progressState = database.progressDao().getAll().associate { it.uri to it.positionMs }
         lastItemState = database.kvDao().get(KEY_LAST_ITEM)
-        // 防御层二：三份镜像就绪后，不执行未初始化期间积压的写任务（见 drainPendingWrites）
         drainPendingWrites()
     }
 
-    /**
-     * 旧 SharedPreferences 数据一次性迁移：单事务写入 Room + 打迁移标记，
-     * 提交成功后才清空旧文件。中途被杀则事务回滚，下次启动重试。
-     */
+    /** 旧 prefs 一次性迁移：单事务写 Room + 打标记，提交成功后才清旧文件（中途被杀下次重试） */
     private suspend fun migrateFromPrefs(database: PlayerDatabase, prefs: SharedPreferences) {
         val items = parseLegacyPlaylistJson(prefs.getString("playlist", null))
         val progress = parseLegacyProgressJson(prefs.getString("progress", null))
@@ -533,33 +442,21 @@ object PlayerRepository {
 
 // ==================== 纯函数与旧数据迁移解析 ====================
 
-/**
- * 「单个文件的进度此刻该如何落缓存」判定的封闭结果，三选一：
- * 清除（播到末尾）/ 写入新值 / 跳过（零位置等无效值）。
- */
+/** 单个文件进度落缓存判定结果：清除 / 写入 / 跳过 */
 internal sealed interface ProgressWriteDecision {
-    /** 播到末尾视为看完：应清除该 uri 的进度记录 */
+    /** 播到末尾视为看完：清除该 uri 的进度 */
     data object Clear : ProgressWriteDecision
 
-    /** 正常播放中：应写入 [positionMs] */
+    /** 正常播放中：写入 [positionMs] */
     data class Store(val positionMs: Long) : ProgressWriteDecision
 
-    /** 无效位置：不动作（旧进度保持原样） */
+    /** 无效位置：不动作 */
     data object Skip : ProgressWriteDecision
 }
 
 /**
- * 进度写入判定纯函数：
- * - 播到末尾（[durationMs] > 0 且 [positionMs] >= [durationMs]）→ [ProgressWriteDecision.Clear]
- * - 位置无效（[positionMs] <= 0）→ [ProgressWriteDecision.Skip]（与 [mergeProgressMap]
- *   的「0 值不覆盖」呼应：0 既不清旧值也不写新值）
- * - 其余 → [ProgressWriteDecision.Store]
- * 时长未知时调用方传入 C.TIME_UNSET（负值，天然被 > 0 判定排除，纯函数无需感知该常量）。
- * 这套规则的唯一权威实现，MainActivity.saveCurrentProgress 与
- * PlayerService.cacheCurrentPosition 都据此裁决，防止两侧规则漂移。
- * 历史备注：Service 侧旧实现会在「零位置且缓存无旧值」时写入 0——该 0 值会被
- * mergeProgressMap（仅 >0）在内存镜像与落库两侧全部过滤，属惰性无效写，
- * 统一时收敛为 Skip 而非参数化保留这个无意义差异。
+ * 进度写入判定纯函数（唯一权威实现，调用方据此裁决不各自漂移）：
+ * 播到末尾→Clear；位置<=0→Skip；其余→Store。
  */
 internal fun decideProgressWrite(positionMs: Long, durationMs: Long): ProgressWriteDecision {
     if (durationMs in 1..positionMs) return ProgressWriteDecision.Clear
@@ -568,8 +465,7 @@ internal fun decideProgressWrite(positionMs: Long, durationMs: Long): ProgressWr
 }
 
 /**
- * 进度合并纯函数：先剔除 [removes]，再合并 [writes]（仅 >0）。
- * 「合并非覆盖 + 0 值不覆盖 + removes 优先剔除」语义的唯一权威实现。
+ * 进度合并纯函数（唯一权威实现）：先剔除 [removes]，再合并 [writes]（仅 >0）。
  */
 internal fun mergeProgressMap(
     disk: Map<String, Long>,
@@ -584,7 +480,7 @@ internal fun mergeProgressMap(
     return merged
 }
 
-/** 解析旧 "progress" JSON，仅保留 >0 的值（与旧写盘语义一致） */
+/** 解析旧 "progress" JSON，仅保留 >0 的值 */
 internal fun parseLegacyProgressJson(json: String?): Map<String, Long> {
     if (json.isNullOrEmpty()) return emptyMap()
     return try {
@@ -600,14 +496,14 @@ internal fun parseLegacyProgressJson(json: String?): Map<String, Long> {
     }
 }
 
-/** 旧 "playlist" JSON 条目的纯字符串载体（不依赖 android.net.Uri，便于 JVM 单测） */
+/** 旧 "playlist" JSON 条目的纯字符串载体（不依赖 Uri，便于 JVM 单测） */
 internal data class LegacyPlaylistItem(
     val uri: String,
     val name: String,
     val duration: Long,
 )
 
-/** 解析旧 "playlist" JSON 数组（按 uri 去重）；Uri 转换留给调用方在 Android 运行时做 */
+/** 解析旧 "playlist" JSON 数组（按 uri 去重）；Uri 转换留给运行时处理 */
 internal fun parseLegacyPlaylistJson(json: String?): List<LegacyPlaylistItem> {
     if (json.isNullOrEmpty()) return emptyList()
     return try {

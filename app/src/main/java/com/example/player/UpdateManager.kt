@@ -36,31 +36,27 @@ import java.net.URL
  * 应用内更新检查器。数据源按优先级：
  * 1. GitHub Releases API（数据最新，无 CDN 缓存）
  * 2. jsDelivr @main 的 version.json（大陆可达性好，可能有约 12 小时缓存）
- *
- * 必须在 IO 线程调用 [checkLatest]（内含阻塞网络请求）。
+ * 必须在 IO 线程调用 [checkLatest]（含阻塞网络请求）。
  */
 class UpdateChecker {
 
     /** 一次 Release 检查结果：版本号 + APK 直链 + 更新说明 */
     data class Release(val version: String, val apkUrl: String, val notes: String)
 
-    /**
-     * 从 JSONObject 取字符串：JSON null / 缺失 / 非字符串一律返回空串。
-     * 避免 [JSONObject.optString] 把 JSON null 变成字面量 "null"。
-     */
+    /** 取字符串字段：JSON null/缺失/非字符串一律返回空串（勿用 optString 把 null 变字面量） */
     private fun JSONObject.text(key: String): String = (opt(key) as? String).orEmpty()
 
     /** 版本号归一化：去首尾空白并去掉 v/V 前缀（如 "v1.2.1" → "1.2.1"） */
     private fun normalizeVersion(raw: String): String =
         raw.trim().removePrefix("v").removePrefix("V").trim()
 
-    /** 请求远端最新版本信息；失败/解析不到时返回 null */
+    /** 请求远端最新版本信息；失败/解析不到返回 null */
     fun checkLatest(): Release? {
         fetchFromGitHubApi()?.let { return it }
         return fetchVersionJson()
     }
 
-    /** GET 请求返回响应体；非 200 或异常时返回 null */
+    /** GET 请求返回响应体；非 200 或异常返回 null */
     private fun httpGet(url: String, vararg headers: Pair<String, String>): String? {
         val conn = URL(url).openConnection() as HttpURLConnection
         return try {
@@ -124,7 +120,7 @@ class UpdateChecker {
         private const val CONNECT_TIMEOUT_MS = 10_000
         private const val READ_TIMEOUT_MS = 20_000
 
-        /** 语义化版本比较：remote > current 时返回 true（如 1.1.3 > 1.1.2） */
+        /** 语义化版本比较：remote > current 返回 true（如 1.1.3 > 1.1.2） */
         fun isNewer(remote: String, current: String): Boolean {
             val r = remote.split('.').map { it.toIntOrNull() ?: 0 }
             val c = current.split('.').map { it.toIntOrNull() ?: 0 }
@@ -142,12 +138,9 @@ class UpdateChecker {
 
 /**
  * 应用内更新管家：版本检查 → 确认对话框 → DownloadManager 下载
- * （API 29+ 写入 MediaStore.Downloads，旧版本回退公共 Download 目录；
- * CDN 加速源在前、GitHub 直连兜底，失败自动换源）→ 调起安装器
- * （含 Android 8+ 的「安装未知应用」授权接力）→ 替换后清理更新包。
- *
- * 需在 Activity onCreate 构造，并调用
- * [registerReceivers]/[unregisterReceivers]/[resumePendingInstall]。
+ * （API 29+ 写入 MediaStore.Downloads，旧版回退公共 Download 目录；CDN 加速、失败自动换源）
+ * → 调起安装器（含 Android 8+ 安装未知应用授权接力）→ 替换后清理更新包。
+ * 需在 Activity onCreate 构造，并调用 registerReceivers/unregisterReceivers/resumePendingInstall。
  */
 class UpdateManager(private val activity: AppCompatActivity) {
 
@@ -165,7 +158,7 @@ class UpdateManager(private val activity: AppCompatActivity) {
     private var lastDownloadId = -1L
     /** 等待「安装未知应用」授权后再安装的 APK（content URI） */
     private var pendingInstallUri: Uri? = null
-    /** API 29+ 的下载目标（MediaStore.Downloads 行的 content URI） */
+    /** API 29+ 的下载目标（MediaStore.Downloads 行 content URI） */
     private var pendingDownloadUri: Uri? = null
     /** API ≤28 的下载目标（公共 Download 下的文件） */
     private var pendingDownloadFile: File? = null
@@ -306,21 +299,21 @@ class UpdateManager(private val activity: AppCompatActivity) {
             .show()
     }
 
-    /** 用 DownloadManager 下载更新包：API 29+ 写入 MediaStore.Downloads，旧版本写公共 Download；CDN 加速，失败自动换源 */
+    /** 下载更新包：API 29+ 写 MediaStore.Downloads，旧版写公共 Download；CDN 加速、失败换源 */
     private fun downloadApk(release: UpdateChecker.Release) {
         pendingDownloadVersion = release.version
         pendingDownloadUrls = ArrayDeque(
             downloadSources.map { prefix -> prefix + release.apkUrl }
         )
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            // 分区存储：经 MediaStore.Downloads 写入公共下载目录，无需任何存储权限
+            // 分区存储：经 MediaStore.Downloads 写公共下载目录，无需存储权限
             pendingDownloadUri = createMediaStoreDestination(apkFileName(release.version))
             if (pendingDownloadUri == null) {
                 Toast.makeText(activity, "创建下载文件失败，请手动下载安装", Toast.LENGTH_SHORT).show()
                 return
             }
         } else {
-            // Android 9 及以下需 WRITE_EXTERNAL_STORAGE 才能写入公共 Download
+            // Android 9 及以下需 WRITE_EXTERNAL_STORAGE 写公共 Download
             @Suppress("DEPRECATION")
             val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
             pendingDownloadFile = File(dir, apkFileName(release.version))
@@ -338,8 +331,8 @@ class UpdateManager(private val activity: AppCompatActivity) {
         "$APK_NAME_PREFIX$version$APK_NAME_SUFFIX"
 
     /**
-     * 在 MediaStore.Downloads 创建下载占位行，返回其 content URI 作为下载目的地。
-     * 先删同名旧行：MediaStore 遇到重名会自动改为 "xxx (1)"，会破坏后续按名清理。
+     * 在 MediaStore.Downloads 创建下载占位行，返回其 content URI。
+     * 先删同名旧行：MediaStore 遇重名自动改 "xxx (1)"，会破坏后续按名清理。
      */
     @RequiresApi(Build.VERSION_CODES.Q)
     private fun createMediaStoreDestination(fileName: String): Uri? {
@@ -357,7 +350,7 @@ class UpdateManager(private val activity: AppCompatActivity) {
         return resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
     }
 
-    /** 发起一次下载（旧路径先清同名文件，避免目标已存在被拒；重试沿用同一目标，覆写残包） */
+    /** 发起一次下载（旧路径先清同名文件；重试沿用同一目标覆写残包） */
     private fun enqueueDownload(url: String) {
         val request = DownloadManager.Request(url.toUri())
             .setTitle("影音盒 v$pendingDownloadVersion")
@@ -377,9 +370,8 @@ class UpdateManager(private val activity: AppCompatActivity) {
     }
 
     /**
-     * 下载完成后交给安装器的 URI：API 29+ 为 MediaStore content URI
-     * （自身插入的行，可直接授权给系统安装器）；旧版本为公共 Download 文件，
-     * 经 FileProvider 暴露。直接用启动下载时记下的目标，避免误取历史版本包。
+     * 下载完成后交给安装器的 URI：API 29+ 为 MediaStore content URI（可直接授权给系统安装器）；
+     * 旧版为公共 Download 文件，经 FileProvider 暴露。用启动下载时记下的目标，避免取到历史版本包。
      */
     private fun downloadedInstallUri(): Uri? {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) return pendingDownloadUri
@@ -394,7 +386,7 @@ class UpdateManager(private val activity: AppCompatActivity) {
                 activity, android.Manifest.permission.WRITE_EXTERNAL_STORAGE
             ) == PackageManager.PERMISSION_GRANTED
 
-    /** 安装成功后清理下载目录中的更新包（含历史版本）：API 29+ 删 MediaStore.Downloads 行，旧版本删公共 Download 文件 */
+    /** 安装成功后清理下载目录更新包（含历史版本）：API 29+ 删 MediaStore 行，旧版删公共 Download 文件 */
     private fun deleteInstalledUpdateApk() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             activity.contentResolver.delete(
