@@ -93,9 +93,14 @@ class PlayerService : MediaSessionService() {
 
             val player = mediaSession?.player ?: return
             val errorUri = player.currentMediaItem?.localConfiguration?.uri?.toString() ?: return
-            // 延迟片刻仍停在出错项的 IDLE，说明无人处理（典型：后台播放），自动跳下一项续播。
-            // 用 uri（而非下标）比对，防前台「跳转后又删旧项」致下标回退误判
+            // 同一 uri 再度出错：先清上一次可能残留的「前台已处理」标记，防误吞本次兜底
+            foregroundHandledErrorUris.remove(errorUri)
+            // 延迟片刻仍无前台处理信号（典型：后台播放），自动跳下一项续播。
+            // 双保险：前台处理完会调 notifyErrorHandled 打标记，到点先消费标记（正常路径）；
+            // 极端卡顿致标记未及时打上时，仍靠「当前 uri 是否仍停在错误项 + STATE_IDLE」兜底，
+            // 防止对已切到的不相关项误跳（用 uri 而非下标比对，防前台删项致下标回退误判）
             mainHandler.postDelayed({
+                if (foregroundHandledErrorUris.remove(errorUri)) return@postDelayed
                 val p = mediaSession?.player ?: return@postDelayed
                 val stillOnError =
                     errorUri == p.currentMediaItem?.localConfiguration?.uri?.toString()
@@ -171,15 +176,23 @@ class PlayerService : MediaSessionService() {
         }
     }
 
-    /** 切换前被换掉项的精确进度写入缓存（oldPosition 仍记着旧项 index 与位置） */
+    /** 切换前被换掉项的精确进度写入缓存（oldPosition 仍记着旧项 index 与位置）；裁决与 cacheCurrentPosition 统一走 decideProgressWrite */
     private fun cacheOldPosition(oldPosition: Player.PositionInfo) {
         val player = mediaSession?.player ?: return
-        if (oldPosition.positionMs <= 0) return
         if (oldPosition.mediaItemIndex !in 0 until player.currentTimeline.windowCount) return
         val window = Timeline.Window()
         player.currentTimeline.getWindow(oldPosition.mediaItemIndex, window)
         val uri = window.mediaItem.localConfiguration?.uri?.toString() ?: return
-        progressCache[uri] = oldPosition.positionMs
+        // 时长未知（TIME_UNSET 等 <=0 值）时裁决退化为「位置 >0 即 Store」，即原兜底语义
+        when (val decision = decideProgressWrite(oldPosition.positionMs, window.durationMs)) {
+            is ProgressWriteDecision.Clear -> {
+                // 旧项已播到近末尾：按播完处理，清内存并标记磁盘删除，防合并写盘「复活」
+                progressCache.remove(uri)
+                removedUris.add(uri)
+            }
+            is ProgressWriteDecision.Store -> progressCache[uri] = decision.positionMs
+            ProgressWriteDecision.Skip -> Unit // 零位置不覆盖旧进度
+        }
     }
 
     /** 持久化当前进度（异步提交）；快照未变且无待删项时跳过 */
@@ -230,6 +243,14 @@ class PlayerService : MediaSessionService() {
         /** 当前存活的 Service 实例，供静态方法直接操作其内存缓存 */
         @Volatile
         private var instance: PlayerService? = null
+
+        /** 已由前台（MainActivity）处理的错误 uri 标记；后台 500ms 兜底到点消费，防双跳（均主线程访问） */
+        private val foregroundHandledErrorUris = mutableSetOf<String>()
+
+        /** 前台处理完播放错误后立即调用：后台延迟兜底据此明确让位，不再靠状态推断 */
+        fun notifyErrorHandled(uri: String) {
+            foregroundHandledErrorUris.add(uri)
+        }
 
         /** 供外部（MainActivity）请求删除某个 uri 的进度记录 */
         fun dropProgress(uri: String) {

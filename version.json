@@ -1,5 +1,5 @@
 {
-  "version": "1.4.9",
-  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.4.9/player-v1.4.9-release.apk",
-  "notes": "简化进度写调度：移除仅理论可达的预加载写队列，所有写入统一为「等待数据库加载完成后落盘」语义，加载失败时丢弃本次写入并记日志；同步校正相关注释。无功能行为变化。"
+  "version": "1.4.10",
+  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.4.10/player-v1.4.10-release.apk",
+  "notes": "修复三处问题：回前台静默扫描对账改为顺序等待，完成后再执行队列自愈重灌与断点恢复；播放出错的前台跳过与后台 500ms 兜底增加显式协作标记，消除极端卡顿下的双跳竞态；手动切歌记录旧曲目进度统一走 decideProgressWrite 裁决，旧曲目已播到近结尾时按播完清除处理。"
 }

@@ -229,6 +229,8 @@ class MainActivity : AppCompatActivity() {
             val ctrl = controller ?: return
             val index = currentIndex
             val name = playlist.getOrNull(index)?.name ?: "未知文件"
+            // 与 Service 侧兜底用的是同一 uri（跳转前从控制器取），用于事后打「已处理」标记
+            val errorUri = ctrl.currentMediaItem?.localConfiguration?.uri?.toString()
 
             // 仅「文件不存在」类错误移除条目，其它只提示不删
             val isFileGone = error.errorCode == PlaybackException.ERROR_CODE_IO_FILE_NOT_FOUND
@@ -239,6 +241,8 @@ class MainActivity : AppCompatActivity() {
                 ctrl.prepare()
                 ctrl.play()
             }
+            // 告知 Service 本次错误已由前台处理，其 500ms 兜底据此让位，防双跳
+            errorUri?.let { PlayerService.notifyErrorHandled(it) }
 
             if (isFileGone && index in playlist.indices) {
                 Toast.makeText(this@MainActivity, "无法读取「$name」", Toast.LENGTH_SHORT).show()
@@ -374,7 +378,7 @@ class MainActivity : AppCompatActivity() {
 
     // ===== 本地媒体扫描与对账 =====
 
-    /** 是否正在扫描（重入保护）。主线程读写、IO 线程复位，需保证可见性 */
+    /** 是否正在扫描（重入保护）。主线程读写、复位，@Volatile 保守保证可见性 */
     @Volatile
     private var isScanning = false
 
@@ -393,23 +397,40 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 扫描本地音视频并对账（IO 线程，带重入保护）。
+     * 扫描本地音视频并对账（fire-and-forget 入口，带重入保护）。
      * @param silent true 为回前台静默对账：只删不增、不弹提示、无权限跳过
      */
     private fun scanLocalMedia(silent: Boolean = false) {
         if (isScanning) return
         isScanning = true
-        lifecycleScope.launch(Dispatchers.IO) {
+        lifecycleScope.launch {
             try {
-                if (silent && !hasStoragePermission()) return@launch
-                val videos = scanner.queryVideos()
-                val audios = scanner.queryAudios()
-                withContext(Dispatchers.Main) {
-                    reconcileScanResult(videos, audios, silent)
-                }
+                scanLocalMediaInternal(silent)
             } finally {
                 isScanning = false
             }
+        }
+    }
+
+    /** suspend 版扫描：对账（reconcileScanResult）完成后才返回，供需顺序执行的调用方 await 用 */
+    private suspend fun scanLocalMediaSuspend(silent: Boolean = false) {
+        if (isScanning) return
+        isScanning = true
+        try {
+            scanLocalMediaInternal(silent)
+        } finally {
+            isScanning = false
+        }
+    }
+
+    /** 扫描与对账公共实现：IO 线程查询，主线程对账 */
+    private suspend fun scanLocalMediaInternal(silent: Boolean) {
+        if (silent && !hasStoragePermission()) return
+        val (videos, audios) = withContext(Dispatchers.IO) {
+            scanner.queryVideos() to scanner.queryAudios()
+        }
+        withContext(Dispatchers.Main) {
+            reconcileScanResult(videos, audios, silent)
         }
     }
 
@@ -628,8 +649,8 @@ class MainActivity : AppCompatActivity() {
                     // 回前台：用持久层校正内存，防后台播完残留进度复活
                     reconcileProgressFromDisk()
                 }
-                // 回前台静默对账：等列表加载完后再扫，确保能删已消失文件
-                scanLocalMedia(silent = true)
+                // 回前台静默对账：等列表加载完后再扫，并等对账完成再走后续自愈/恢复
+                scanLocalMediaSuspend(silent = true)
                 // 队列与内存列表失不时全量重灌自愈
                 if (playlist.isNotEmpty() && ctrl.mediaItemCount != playlist.size) {
                     val cur = ctrl.currentMediaItem
