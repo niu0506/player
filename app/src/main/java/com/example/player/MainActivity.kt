@@ -606,7 +606,6 @@ class MainActivity : AppCompatActivity() {
         }
 
         updateManager.registerReceivers()
-        updateManager.checkForUpdate(manual = false)
     }
 
     override fun onStart() {
@@ -688,6 +687,11 @@ class MainActivity : AppCompatActivity() {
         super.onPause()
         // 进度只在 onPause 存：离开前台必先 onPause 再 onStop；弹窗/透明 Activity 只触发 onPause
         saveCurrentProgress()
+    }
+
+    override fun onUserLeaveHint() {
+        super.onUserLeaveHint()
+        fullscreenPip.enterPipWhenPlayingVideo()
     }
 
     override fun onDestroy() {

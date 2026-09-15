@@ -132,16 +132,23 @@ class FullscreenPipHelper(
             .show(WindowInsetsCompat.Type.systemBars())
     }
 
-    /** 进入 PiP 小窗；失败时恢复 UI 并提示 */
-    fun enterPipMode() {
+    /** 正在播放视频时，离开 App 自动进入 PiP。 */
+    fun enterPipWhenPlayingVideo(): Boolean {
+        val ctrl = controllerProvider() ?: return false
+        if (!ctrl.isPlaying || !hasVideo(ctrl.videoSize)) return false
+        return enterPipMode(showError = false)
+    }
+
+    /** 进入 PiP 小窗；失败时恢复 UI，并按需提示。 */
+    fun enterPipMode(showError: Boolean = true): Boolean {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
-            Toast.makeText(activity, "系统不支持小窗播放", Toast.LENGTH_SHORT).show()
-            return
+            if (showError) Toast.makeText(activity, "系统不支持小窗播放", Toast.LENGTH_SHORT).show()
+            return false
         }
         val vs = controllerProvider()?.videoSize
-        if (vs == null || vs.width <= 0) {
-            Toast.makeText(activity, "当前没有正在播放的视频", Toast.LENGTH_SHORT).show()
-            return
+        if (vs == null || !hasVideo(vs)) {
+            if (showError) Toast.makeText(activity, "当前没有正在播放的视频", Toast.LENGTH_SHORT).show()
+            return false
         }
         if (isFullscreen) {
             setFullscreen(false)
@@ -156,14 +163,18 @@ class FullscreenPipHelper(
             } catch (_: Exception) {
                 Rational(16, 9)
             }
-            if (activity.enterPictureInPictureMode(buildPipParams(ratio))) return
+            if (activity.enterPictureInPictureMode(buildPipParams(ratio))) return true
         } catch (_: Exception) {
         }
         setChromeVisible(true)
         binding.playerView.useController = true
         applyPipVideoSurface(false)
-        Toast.makeText(activity, "无法进入小窗模式", Toast.LENGTH_SHORT).show()
+        if (showError) Toast.makeText(activity, "无法进入小窗模式", Toast.LENGTH_SHORT).show()
+        return false
     }
+
+    private fun hasVideo(videoSize: VideoSize): Boolean =
+        videoSize.width > 0 && videoSize.height > 0
 
     /** 构建指定宽高比的 PiP 参数；seamless resize 仅 API 31+ 支持 */
     @RequiresApi(Build.VERSION_CODES.O)

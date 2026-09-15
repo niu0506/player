@@ -1,5 +1,5 @@
 {
-  "version": "1.4.10",
-  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.4.10/player-v1.4.10-release.apk",
-  "notes": "修复三处问题：回前台静默扫描对账改为顺序等待，完成后再执行队列自愈重灌与断点恢复；播放出错的前台跳过与后台 500ms 兜底增加显式协作标记，消除极端卡顿下的双跳竞态；手动切歌记录旧曲目进度统一走 decideProgressWrite 裁决，旧曲目已播到近结尾时按播完清除处理。"
+  "version": "1.4.11",
+  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.4.11/player-v1.4.11-release.apk",
+  "notes": "调整更新与小窗体验：取消启动时自动检查更新，保留右上角菜单手动检查；视频播放中切到后台时自动进入小窗播放；整理小窗入口逻辑，减少重复判断。"
 }
