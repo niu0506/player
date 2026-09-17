@@ -392,7 +392,8 @@ class MediaListAdapter(
     private val items = mutableListOf<MediaItemData>()
     /** 各条目进度（uri → 毫秒），独立于条目数据，跨 submitList 存活 */
     private val progressMap = mutableMapOf<String, Long>()
-    private var currentPlayingIndex = -1
+    /** 当前播放项 uri（null 表示无播放项） */
+    private var currentPlayingUri: String? = null
     private var isPlaying = false
     private val diffScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
     private var diffJob: Job? = null
@@ -421,15 +422,21 @@ class MediaListAdapter(
     }
 
     /**
-     * 设置当前播放项，只刷新新旧两处。传入下标来自 ExoPlayer 队列（items 可能尚未跟上 diff 回写），
-     * 做双向边界检查，越界仅记录状态。
+     * 设置当前播放项，只刷新新旧两处。items 经异步 diff 回写存在窗口期，下标可能错位；
+     * uri 是稳定身份，与「点击回调回传 uri 而非下标」的设计一致，无效下标直接跳过。
      */
-    fun setCurrentPlaying(index: Int, playing: Boolean = false) {
-        val old = currentPlayingIndex
-        currentPlayingIndex = index
+    fun setCurrentPlaying(uri: String?, playing: Boolean = false) {
+        val old = currentPlayingUri
+        currentPlayingUri = uri
         isPlaying = playing
-        if (old in items.indices) notifyItemChanged(old)
-        if (index in items.indices) notifyItemChanged(index)
+        if (old != null) {
+            val oldIdx = items.indexOfFirst { it.uri.toString() == old }
+            if (oldIdx >= 0) notifyItemChanged(oldIdx)
+        }
+        if (uri != null) {
+            val newIdx = items.indexOfFirst { it.uri.toString() == uri }
+            if (newIdx >= 0) notifyItemChanged(newIdx)
+        }
     }
 
     /** 更新某项时长（仅原先为 0 时写入） */
@@ -470,7 +477,7 @@ class MediaListAdapter(
             context.getString(R.string.list_item_index, position + 1)
         holder.binding.tvName.text = item.name
         holder.binding.tvDuration.text = if (item.duration > 0) formatTime(item.duration) else ""
-        val isActive = position == currentPlayingIndex && isPlaying
+        val isActive = item.uri.toString() == currentPlayingUri && isPlaying
         holder.binding.imgPlaying.visibility = if (isActive) View.VISIBLE else View.GONE
         holder.binding.tvIndex.visibility = if (isActive) View.GONE else View.VISIBLE
         holder.binding.tvName.setTextColor(

@@ -104,7 +104,7 @@ class MainActivity : AppCompatActivity() {
         if (index !in playlist.indices) return
         removeItemAt(index)
         adapter.setCurrentPlaying(
-            currentIndex.takeIf { it in playlist.indices } ?: -1,
+            controller?.currentMediaItem?.localConfiguration?.uri?.toString(),
             controller?.isPlaying == true
         )
         refreshPlaylist()
@@ -203,12 +203,18 @@ class MainActivity : AppCompatActivity() {
                 adapter.updateProgress(finishedIndex, 0)
             }
             currentIndex = controller?.currentMediaItemIndex ?: -1
-            adapter.setCurrentPlaying(currentIndex, controller?.isPlaying == true)
+            adapter.setCurrentPlaying(
+                controller?.currentMediaItem?.localConfiguration?.uri?.toString(),
+                controller?.isPlaying == true
+            )
             restoreProgressIfNeeded()
         }
 
         override fun onIsPlayingChanged(isPlaying: Boolean) {
-            adapter.setCurrentPlaying(currentIndex, isPlaying)
+            adapter.setCurrentPlaying(
+                controller?.currentMediaItem?.localConfiguration?.uri?.toString(),
+                isPlaying
+            )
             if (!isPlaying) {
                 saveCurrentProgress()
             }
@@ -275,6 +281,19 @@ class MainActivity : AppCompatActivity() {
             )
             .build()
 
+    /**
+     * 队列与内存列表的 uri 集合是否一致。
+     * 仅比较 count 在「删除数==新增数」的边界下会漏判（内存有、队列无的漂移被数量巧合掩盖），
+     * 故按 uri 集合对比；集合相同即视为一致（以 playlist 顺序为权威），集合不同则触发重灌。
+     */
+    private fun queueMatchesPlaylist(ctrl: MediaController): Boolean {
+        val queueUris = mutableSetOf<String>()
+        for (i in 0 until ctrl.mediaItemCount) {
+            ctrl.getMediaItemAt(i).localConfiguration?.uri?.toString()?.let { queueUris.add(it) }
+        }
+        return queueUris == playlist.map { it.uri.toString() }.toSet()
+    }
+
     /** 续播位置：优先持久层权威值，无记录才回退内存缓存 */
     private fun resolveResumePosition(item: MediaItemData): Long {
         val disk = PlayerRepository.getProgress(item.uri.toString())
@@ -304,7 +323,7 @@ class MainActivity : AppCompatActivity() {
         val pos = resolveResumePosition(playlist[idx])
         if (pos > 0) ctrl.seekTo(idx, pos) else ctrl.seekToDefaultPosition(idx)
         currentIndex = idx
-        adapter.setCurrentPlaying(idx, ctrl.isPlaying)
+        adapter.setCurrentPlaying(playlist[idx].uri.toString(), ctrl.isPlaying)
     }
 
     // ===== 播放器自定义控件（倍速/音轨/字幕） =====
@@ -509,7 +528,7 @@ class MainActivity : AppCompatActivity() {
         }
         if (removed > 0) {
             adapter.setCurrentPlaying(
-                currentIndex.takeIf { it in playlist.indices } ?: -1,
+                controller?.currentMediaItem?.localConfiguration?.uri?.toString(),
                 controller?.isPlaying == true
             )
         }
@@ -632,7 +651,10 @@ class MainActivity : AppCompatActivity() {
             binding.playerView.player = ctrl
             ctrl.addListener(playerListener)
             currentIndex = ctrl.currentMediaItemIndex
-            adapter.setCurrentPlaying(currentIndex, ctrl.isPlaying)
+            adapter.setCurrentPlaying(
+                ctrl.currentMediaItem?.localConfiguration?.uri?.toString(),
+                ctrl.isPlaying
+            )
             lifecycleScope.launch {
                 // 兜住仓库侧漏网的加载异常，失败提示并跳过后续逻辑，保证仍能启动
                 try {
@@ -641,6 +663,10 @@ class MainActivity : AppCompatActivity() {
                     Toast.makeText(this@MainActivity, "数据加载失败", Toast.LENGTH_SHORT).show()
                     return@launch
                 }
+                // MediaController release 后调用方法为静默 no-op（不抛异常），协程在挂起点
+                // 被 onStop 跨越后若继续操作已 release 的 ctrl 会静默失效，甚至与新 onStart
+                // 的协程重复执行自愈/恢复；故每个挂起点恢复后须重新校验有效性
+                if (controllerFuture !== future || controller !== ctrl) return@launch
                 if (!playlistLoaded) {
                     loadPlaylist()
                     playlistLoaded = true
@@ -650,8 +676,10 @@ class MainActivity : AppCompatActivity() {
                 }
                 // 回前台静默对账：等列表加载完后再扫，并等对账完成再走后续自愈/恢复
                 scanLocalMediaSuspend(silent = true)
-                // 队列与内存列表失不时全量重灌自愈
-                if (playlist.isNotEmpty() && ctrl.mediaItemCount != playlist.size) {
+                // 挂起点 2（静默扫描）后同样校验
+                if (controllerFuture !== future || controller !== ctrl) return@launch
+                // 队列与内存列表失配时全量重灌自愈
+                if (playlist.isNotEmpty() && !queueMatchesPlaylist(ctrl)) {
                     val cur = ctrl.currentMediaItem
                     val curUri = cur?.localConfiguration?.uri?.toString()
                     val curPos = ctrl.currentPosition
