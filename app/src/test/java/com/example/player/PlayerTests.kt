@@ -1,5 +1,6 @@
 package com.example.player
 
+import android.net.FakeUri
 import androidx.recyclerview.widget.RecyclerView
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -163,12 +164,12 @@ class LegacyPrefsMigrationTest {
 /**
  * MediaListAdapter.setCurrentPlaying 边界检查测试。
  *
- * 传入下标来自 ExoPlayer 队列，items 经异步 diff 后才回写，存在越界窗口，
- * 越界 position 传给 RecyclerView 会抛 IndexOutOfBoundsException。
+ * uri 是稳定身份：items 经异步 diff 后才回写，下标存在错位窗口，高亮按 uri 定位；
+ * 不在 items 中的 uri 只记录状态不通知，待 items 追上后高亮不丢失。
  *
- * 纯 JVM 限制：items 为私有字段且 MediaItemData 依赖 android.net.Uri 无法构造，
- * 用反射填充占位；AdapterDataObservable 来自 mockable android.jar（空 stub），
- * 需反射注入观察者列表让 notifyItemChanged 回调可被记录。
+ * 纯 JVM 限制：MediaItemData 依赖 android.net.Uri，stub jar 无法构造真实实例，
+ * 用同包占位实现 [FakeUri]（仅 toString 参与）；AdapterDataObservable 来自
+ * mockable android.jar（空 stub），需反射注入观察者列表让 notifyItemChanged 回调可被记录。
  */
 class MediaListAdapterCurrentPlayingTest {
 
@@ -179,6 +180,8 @@ class MediaListAdapterCurrentPlayingTest {
             repeat(itemCount) { changedPositions.add(positionStart + it) }
         }
     }
+
+    private fun item(s: String) = MediaItemData(FakeUri(s), s)
 
     private lateinit var adapter: MediaListAdapter
     private lateinit var observer: RecordingObserver
@@ -219,60 +222,60 @@ class MediaListAdapterCurrentPlayingTest {
         return field.get(adapter) as MutableList<Any>
     }
 
-    private fun currentPlayingIndex(): Int {
-        val field = MediaListAdapter::class.java.getDeclaredField("currentPlayingIndex")
+    private fun currentPlayingUri(): String? {
+        val field = MediaListAdapter::class.java.getDeclaredField("currentPlayingUri")
         field.isAccessible = true
-        return field.getInt(adapter)
+        return field.get(adapter) as String?
     }
 
     @Test
-    fun `index beyond empty items notifies nothing`() {
-        adapter.setCurrentPlaying(0, true)
-        adapter.setCurrentPlaying(5, true)
+    fun `uri beyond empty items notifies nothing`() {
+        adapter.setCurrentPlaying("u0", true)
+        adapter.setCurrentPlaying("u5", true)
         assertTrue(observer.changedPositions.isEmpty())
     }
 
     @Test
-    fun `negative index notifies nothing`() {
-        adapter.setCurrentPlaying(-1)
-        adapter.setCurrentPlaying(-1, true)
+    fun `null uri notifies nothing`() {
+        adapter.setCurrentPlaying(null)
+        adapter.setCurrentPlaying(null, true)
         assertTrue(observer.changedPositions.isEmpty())
     }
 
     @Test
-    fun `in bounds index and old index both notify`() {
-        repeat(3) { items().add(Any()) }
-        adapter.setCurrentPlaying(1)
+    fun `known uri and old uri both notify`() {
+        repeat(3) { items().add(item("u$it")) }
+        adapter.setCurrentPlaying("u1")
         assertEquals(listOf(1), observer.changedPositions)
         // 切换到新位置：旧位置 1 与新位置 2 都在界内，均应刷新
-        adapter.setCurrentPlaying(2, true)
+        adapter.setCurrentPlaying("u2", true)
         assertEquals(listOf(1, 1, 2), observer.changedPositions)
     }
 
     @Test
-    fun `state is recorded even when notify is suppressed`() {
-        // 越界时仅记录状态不通知：等 items 追上后，下一次状态变化会把
-        // 旧高亮（越界期间的 5）与新位置一并刷新，高亮不丢失
-        adapter.setCurrentPlaying(5, true)
-        assertEquals(5, currentPlayingIndex())
+    fun `state is recorded even when uri is not in items yet`() {
+        // items 未含该 uri 时仅记录状态不通知：等 items 追上后，下一次状态变化会把
+        // 旧高亮（追上前的 u5）与新位置一并刷新，高亮不丢失
+        adapter.setCurrentPlaying("u5", true)
+        assertEquals("u5", currentPlayingUri())
         assertTrue(observer.changedPositions.isEmpty())
 
-        repeat(6) { items().add(Any()) }
-        adapter.setCurrentPlaying(2, true)
+        repeat(6) { items().add(item("u$it")) }
+        adapter.setCurrentPlaying("u2", true)
         assertEquals(listOf(5, 2), observer.changedPositions)
     }
 
     @Test
-    fun `stale old index is suppressed after list shrinks`() {
-        repeat(2) { items().add(Any()) }
-        adapter.setCurrentPlaying(1)
+    fun `stale old uri is suppressed after list shrinks`() {
+        repeat(2) { items().add(item("u$it")) }
+        adapter.setCurrentPlaying("u1")
         assertEquals(listOf(1), observer.changedPositions)
 
         items().clear()
         observer.changedPositions.clear()
 
-        // 空列表时 old=1 与 index=0 均越界，不应产生任何回调
-        adapter.setCurrentPlaying(0)
+        // 空列表时旧 u1 与新 u0 均找不到，不应产生任何回调
+        adapter.setCurrentPlaying("u0")
         assertTrue(observer.changedPositions.isEmpty())
     }
 }

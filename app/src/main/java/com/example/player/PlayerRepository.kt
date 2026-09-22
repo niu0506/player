@@ -130,7 +130,8 @@ class MediaStoreScanner(private val context: Context) {
 
 /**
  * 持久化层：Room 数据库 + 内存镜像。
- * 读走内存镜像（主线程同步可见）；写在锁内更新镜像，再按提交顺序异步落库。
+ * 读走内存镜像（主线程同步可见）；一次性加载完成后，写在调用线程锁内同步更新镜像
+ * （写方法返回即对读方可见），DB 段按提交顺序异步落库；加载完成前的写整体排队到加载后执行。
  */
 
 /** 播放列表条目（sortOrder 维护顺序） */
@@ -238,6 +239,10 @@ object PlayerRepository {
     @Volatile
     private var lastItemState: String? = null
 
+    /** 一次性加载是否已成功完成；完成后写方法在调用线程同步更新镜像 */
+    @Volatile
+    private var loadSucceeded = false
+
     /** 启动一次性加载（幂等），由 PlayerApp.onCreate 触发 */
     fun ensureLoaded(context: Context) {
         synchronized(loadLock) {
@@ -272,52 +277,50 @@ object PlayerRepository {
 
     fun getLastItem(): String? = lastItemState
 
-    // ---- 写：内存即时更新，DB 按调用顺序异步落库 ----
+    // ---- 写：加载完成后内存同步更新（调用线程），DB 按调用顺序异步落库 ----
 
     /** 批量更新进度：先剔除 [removes]，再合并 [writes]（仅 >0，0 不覆盖） */
     fun applyProgressUpdates(writes: Map<String, Long>, removes: Set<String> = emptySet()) {
         if (writes.isEmpty() && removes.isEmpty()) return
         val writesSnapshot = writes.toMap()
         val removesSnapshot = removes.toSet()
-        runWhenReady {
-            val delta: List<ProgressEntity>
-            synchronized(stateLock) {
-                delta = mergeProgressLocked(writesSnapshot, removesSnapshot)
-            }
-            persist {
+        var delta: List<ProgressEntity> = emptyList()
+        dispatchWrite(
+            memPart = { delta = mergeProgressLocked(writesSnapshot, removesSnapshot) },
+            dbPart = {
                 if (removesSnapshot.isNotEmpty()) progressDao().deleteAll(removesSnapshot)
                 if (delta.isNotEmpty()) progressDao().upsertAll(delta)
             }
-        }
+        )
     }
 
     /** 全量替换播放列表并合并进度，两段写在同一事务中原子完成 */
     fun savePlaylist(items: List<MediaItemData>, progressWrites: Map<String, Long>) {
         val itemsSnapshot = items.toList()
         val progressSnapshot = progressWrites.toMap()
-        runWhenReady {
-            val entities: List<PlaylistItemEntity>
-            val delta: List<ProgressEntity>
-            synchronized(stateLock) {
+        var entities: List<PlaylistItemEntity> = emptyList()
+        var delta: List<ProgressEntity> = emptyList()
+        dispatchWrite(
+            memPart = {
                 playlistState = itemsSnapshot
                 entities = itemsSnapshot.mapIndexed { i, it ->
                     PlaylistItemEntity(it.uri.toString(), it.name, it.duration, i)
                 }
                 delta = mergeProgressLocked(progressSnapshot, emptySet())
-            }
-            persist {
+            },
+            dbPart = {
                 playlistDao().replaceAll(entities)
                 if (delta.isNotEmpty()) progressDao().upsertAll(delta)
             }
-        }
+        )
     }
 
     /** 记录上次播放项 uri（供冷启动恢复定位） */
     fun setLastItem(uri: String) {
-        runWhenReady {
-            lastItemState = uri
-            persist { kvDao().put(KvEntity(KEY_LAST_ITEM, uri)) }
-        }
+        dispatchWrite(
+            memPart = { lastItemState = uri },
+            dbPart = { kvDao().put(KvEntity(KEY_LAST_ITEM, uri)) }
+        )
     }
 
     /** 等待一次性加载与所有已提交写任务落盘（Service 销毁等同步路径用） */
@@ -348,18 +351,29 @@ object PlayerRepository {
     }
 
     /**
-     * 写任务调度：已初始化则链到加载完成后执行；加载失败（[awaitOrNull] 返回非 null）则丢弃该写，
-     * 防半加载合并。loadJob 由 PlayerApp 进程启动即经 [ensureLoaded] 保证非空，兜底分支仅作防御。
+     * 写任务调度：一次性加载成功后，[memPart]（镜像更新，须在 [stateLock] 内执行）
+     * 在调用线程同步完成、写方法返回即对读方可见，[dbPart] 按提交顺序进入
+     * persistScope 异步落库；加载尚未完成则两段一起排队到加载后执行
+     * （防镜像先写、随后被加载结果覆盖）；加载失败则丢弃该写，防半加载合并。
+     * 注：跨越加载完成边界的两次同键写，镜像合并顺序可能与提交顺序相反
+     * （仅进程启动瞬间的极窄窗口），DB 侧仍严格按提交序、重启后以 DB 为准，可接受。
+     * loadJob 由 PlayerApp 进程启动即经 [ensureLoaded] 保证非空，兜底分支仅作防御。
      */
-    private fun runWhenReady(block: suspend () -> Unit) {
+    private fun dispatchWrite(memPart: () -> Unit, dbPart: suspend PlayerDatabase.() -> Unit) {
         val job: Deferred<Unit>? = synchronized(loadLock) { loadJob }
         if (job == null) {
             Log.w(TAG, "仓库尚未初始化，丢弃一次写任务")
             return
         }
-        persistScope.launch {
-            if (job.awaitOrNull() != null) return@launch
-            block()
+        if (loadSucceeded) {
+            synchronized(stateLock) { memPart() }
+            persistScope.launch { persist(dbPart) }
+        } else {
+            persistScope.launch {
+                if (job.awaitOrNull() != null) return@launch
+                synchronized(stateLock) { memPart() }
+                persist(dbPart)
+            }
         }
     }
 
@@ -393,6 +407,9 @@ object PlayerRepository {
         }
         progressState = database.progressDao().getAll().associate { it.uri to it.positionMs }
         lastItemState = database.kvDao().get(KEY_LAST_ITEM)
+        // 置于最后：三份镜像赋值对 loadSucceeded 的读方 happens-before，
+        // 此后的写方法走调用线程同步更新镜像的快路径
+        loadSucceeded = true
     }
 
     /** 旧 prefs 一次性迁移：单事务写 Room + 打标记，提交成功后才清旧文件（中途被杀下次重试） */

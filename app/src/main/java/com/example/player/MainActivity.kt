@@ -282,16 +282,18 @@ class MainActivity : AppCompatActivity() {
             .build()
 
     /**
-     * 队列与内存列表的 uri 集合是否一致。
-     * 仅比较 count 在「删除数==新增数」的边界下会漏判（内存有、队列无的漂移被数量巧合掩盖），
-     * 故按 uri 集合对比；集合相同即视为一致（以 playlist 顺序为权威），集合不同则触发重灌。
+     * 队列与内存列表是否逐位一致（按 uri 有序比较，以 playlist 顺序为权威）。
+     * 有序比较严格强于集合比较：集合相同但顺序错位时，按下标读写进度/时长的代码
+     * 会把 A 文件的数据持续写到 B 名下并持久化，故顺序漂移必须触发重灌；
+     * 合法变更（增删）均两侧同步修改且保序，不会引起多余重灌。
      */
     private fun queueMatchesPlaylist(ctrl: MediaController): Boolean {
-        val queueUris = mutableSetOf<String>()
-        for (i in 0 until ctrl.mediaItemCount) {
-            ctrl.getMediaItemAt(i).localConfiguration?.uri?.toString()?.let { queueUris.add(it) }
+        if (ctrl.mediaItemCount != playlist.size) return false
+        for (i in playlist.indices) {
+            val queueUri = ctrl.getMediaItemAt(i).localConfiguration?.uri?.toString() ?: return false
+            if (queueUri != playlist[i].uri.toString()) return false
         }
-        return queueUris == playlist.map { it.uri.toString() }.toSet()
+        return true
     }
 
     /** 续播位置：优先持久层权威值，无记录才回退内存缓存 */

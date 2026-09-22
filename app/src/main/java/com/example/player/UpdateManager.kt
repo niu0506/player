@@ -135,16 +135,38 @@ class UpdateChecker {
 /**
  * 应用内更新管家：版本检查 → 确认对话框 → DownloadManager 下载
  * （目标为应用外部私有 Download 目录，全版本免存储权限；CDN 加速、失败自动换源）
- * → 调起安装器（含 Android 8+ 安装未知应用授权接力）→ 替换后清理更新包。
+ * → 调起安装器（含 Android 8+ 安装未知应用授权接力）。
+ * 替换后的更新包清理由 manifest 静态注册的 [PackageReplacedReceiver] 负责
+ * （替换时旧进程已被杀，动态注册的 receiver 收不到该广播）。
  * 需在 Activity onCreate 构造，并调用 registerReceivers/unregisterReceivers/resumePendingInstall。
  */
 class UpdateManager(private val activity: AppCompatActivity) {
 
-    private companion object {
+    companion object {
         const val APK_MIME = "application/vnd.android.package-archive"
         /** 更新包文件名：player-v<版本>-release.apk（清理历史版本按此模式匹配） */
         const val APK_NAME_PREFIX = "player-v"
         const val APK_NAME_SUFFIX = "-release.apk"
+
+        /**
+         * 安装成功后清理更新包（含历史版本）：删除应用私有 Download 目录下的文件；
+         * Android 10+ 顺带清理旧版本遗留的 MediaStore.Downloads 0 字节占位行（闪退版本的残留）。
+         */
+        fun cleanupUpdateApks(context: Context) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                try {
+                    context.contentResolver.delete(
+                        MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                        "${MediaStore.MediaColumns.DISPLAY_NAME} LIKE ?",
+                        arrayOf("$APK_NAME_PREFIX%$APK_NAME_SUFFIX")
+                    )
+                } catch (_: Exception) {
+                }
+            }
+            context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
+                ?.listFiles { f -> f.name.startsWith(APK_NAME_PREFIX) && f.name.endsWith(APK_NAME_SUFFIX) }
+                ?.forEach { it.delete() }
+        }
     }
 
     private val updateChecker = UpdateChecker()
@@ -159,13 +181,6 @@ class UpdateManager(private val activity: AppCompatActivity) {
     private var pendingDownloadVersion = ""
     /** 待尝试的下载源队列（CDN 加速在前，GitHub 直连兜底） */
     private var pendingDownloadUrls: ArrayDeque<String> = ArrayDeque()
-
-    /** 应用被新版本替换后清理下载目录里的更新包 */
-    private val packageReplacedReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context, intent: Intent) {
-            if (intent.action == Intent.ACTION_MY_PACKAGE_REPLACED) deleteInstalledUpdateApk()
-        }
-    }
 
     /** 下载完成：成功调起安装器；失败换下一个源重试 */
     private val downloadCompleteReceiver = object : BroadcastReceiver() {
@@ -214,20 +229,11 @@ class UpdateManager(private val activity: AppCompatActivity) {
             IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE),
             ContextCompat.RECEIVER_NOT_EXPORTED
         )
-        ContextCompat.registerReceiver(
-            activity, packageReplacedReceiver,
-            IntentFilter(Intent.ACTION_MY_PACKAGE_REPLACED),
-            ContextCompat.RECEIVER_NOT_EXPORTED
-        )
     }
 
     fun unregisterReceivers() {
         try {
             activity.unregisterReceiver(downloadCompleteReceiver)
-        } catch (_: Exception) {
-        }
-        try {
-            activity.unregisterReceiver(packageReplacedReceiver)
         } catch (_: Exception) {
         }
     }
@@ -324,26 +330,6 @@ class UpdateManager(private val activity: AppCompatActivity) {
             FileProvider.getUriForFile(activity, "${activity.packageName}.file-provider", it)
         }
 
-    /**
-     * 安装成功后清理更新包（含历史版本）：删除应用私有 Download 目录下的文件；
-     * Android 10+ 顺带清理旧版本遗留的 MediaStore.Downloads 0 字节占位行（闪退版本的残留）。
-     */
-    private fun deleteInstalledUpdateApk() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            try {
-                activity.contentResolver.delete(
-                    MediaStore.Downloads.EXTERNAL_CONTENT_URI,
-                    "${MediaStore.MediaColumns.DISPLAY_NAME} LIKE ?",
-                    arrayOf("$APK_NAME_PREFIX%$APK_NAME_SUFFIX")
-                )
-            } catch (_: Exception) {
-            }
-        }
-        activity.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
-            ?.listFiles { f -> f.name.startsWith(APK_NAME_PREFIX) && f.name.endsWith(APK_NAME_SUFFIX) }
-            ?.forEach { it.delete() }
-    }
-
     /** 经 content URI 暴露 APK 给系统安装器；Android 8+ 需「安装未知应用」授权接力 */
     private fun installApk(apkUri: Uri) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
@@ -372,6 +358,20 @@ class UpdateManager(private val activity: AppCompatActivity) {
             activity.startActivity(intent)
         } catch (_: Exception) {
             Toast.makeText(activity, "无法启动安装器，请在下载通知中手动安装", Toast.LENGTH_SHORT).show()
+        }
+    }
+}
+
+/**
+ * 应用被新版本替换后清理下载目录里的更新包。
+ * 必须在 manifest 静态注册：替换安装时系统先杀掉旧进程，随后发出的
+ * ACTION_MY_PACKAGE_REPLACED 只会投递给 manifest 声明的 receiver（为其拉起新进程），
+ * Activity 动态注册的 receiver 随旧进程一同消亡，永远收不到该广播。
+ */
+class PackageReplacedReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent) {
+        if (intent.action == Intent.ACTION_MY_PACKAGE_REPLACED) {
+            UpdateManager.cleanupUpdateApks(context)
         }
     }
 }

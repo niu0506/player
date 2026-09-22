@@ -59,6 +59,15 @@
             </intent-filter>
         </service>
 
+        <!-- 应用被替换后清理更新包：须静态注册（旧进程连同动态 receiver 已被杀，收不到该广播） -->
+        <receiver
+            android:name=".PackageReplacedReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
         <!-- 暴露下载好的更新 APK 给系统安装器（FileProvider） -->
         <provider
             android:name="androidx.core.content.FileProvider"
