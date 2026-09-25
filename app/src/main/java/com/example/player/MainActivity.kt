@@ -64,8 +64,6 @@ class MainActivity : AppCompatActivity() {
     private var currentIndex = -1
     /** 列表是否已从磁盘加载过（防重复加载） */
     private var playlistLoaded = false
-    /** 内存进度缓存（uri → 位置毫秒） */
-    private val cachedProgress = mutableMapOf<String, Long>()
 
     private val scanner = MediaStoreScanner(this)
     private lateinit var updateManager: UpdateManager
@@ -103,118 +101,115 @@ class MainActivity : AppCompatActivity() {
     private fun removeItemFromPlaylist(index: Int) {
         if (index !in playlist.indices) return
         removeItemAt(index)
-        adapter.setCurrentPlaying(
-            controller?.currentMediaItem?.localConfiguration?.uri?.toString(),
-            controller?.isPlaying == true
-        )
+        syncAdapterPlayingState()
         refreshPlaylist()
         savePlaylist()
         Toast.makeText(this, "已删除", Toast.LENGTH_SHORT).show()
     }
 
-    /** 刷新列表、顶部计数与空态 */
+    /** 刷新列表、顶部计数与空态（进度条无需单独喂：绑定时经 getProgress 现查仓库） */
     private fun refreshPlaylist() {
-        adapter.setProgress(cachedProgress)
         adapter.submitList(playlist.toList())
         binding.tvCount.text = if (playlist.isEmpty()) "空" else "${playlist.size} 个"
         binding.tvEmpty.visibility = if (playlist.isEmpty()) View.VISIBLE else View.GONE
     }
 
-    /** 列表与进度快照交给仓库持久化（主线程先快照，防 IO 侧列表被改） */
+    /** 同步适配器当前播放项高亮（统一读控制器最新状态，消除多处重复调用） */
+    private fun syncAdapterPlayingState() {
+        adapter.setCurrentPlaying(
+            controller?.currentMediaItem?.localConfiguration?.uri?.toString(),
+            controller?.isPlaying == true
+        )
+    }
+
+    /**
+     * 时长单一写口：playlist 为权威数据，adapter 就地同步 diff 视图（避免全量 re-diff）。
+     * 值未变化时直接返回，两侧不产生多余写与 notify。
+     */
+    private fun updateDurationAt(index: Int, duration: Long) {
+        if (index !in playlist.indices || playlist[index].duration == duration) return
+        playlist[index] = playlist[index].copy(duration = duration)
+        adapter.updateDuration(index, duration)
+    }
+
+    /** 列表快照交给仓库持久化（主线程先快照，防 IO 侧列表被改）；进度已直写仓库 */
     private fun savePlaylist() {
-        PlayerRepository.savePlaylist(playlist.toList(), cachedProgress.toMap())
+        PlayerRepository.savePlaylist(playlist.toList())
     }
 
     /** normalizeUri 键集合，「已存在」判定的共用基准（去重与对账共用，防漂移） */
     private fun existingUriKeys(): Set<String> = playlist.map { normalizeUri(it.uri) }.toSet()
 
-    /** 从仓库恢复播放列表（按 uri 去重）。只加载数据，不同步控制器 */
+    /** 从仓库恢复播放列表（按 uri 去重）。只加载数据，不同步控制器；进度由仓库直读，不再复制 */
     private fun loadPlaylist() {
-        val progressMap = PlayerRepository.getProgressMap()
         val existingKeys = existingUriKeys().toMutableSet()
         for (item in PlayerRepository.getPlaylist()) {
             val key = normalizeUri(item.uri)
             if (key in existingKeys) continue
             existingKeys.add(key)
-            val lastPos = progressMap[item.uri.toString()] ?: 0L
-            if (lastPos > 0) cachedProgress[item.uri.toString()] = lastPos
             playlist.add(item)
         }
     }
 
     // ===== 播放进度管理 =====
+    // 进度权威源是 PlayerRepository.progressState（写后内存镜像同步生效），
+    // Activity 不再持有副本：读直查 getProgress，写直发 applyProgressUpdates，
+    // UI 刷新经 adapter.refreshProgress/refreshAllProgress（重绑时现查）。
 
-    /** 用持久层权威进度校正内存缓存与列表进度条（防后台播完残留复活） */
-    private fun reconcileProgressFromDisk() {
-        val diskMap = PlayerRepository.getProgressMap()
-        for (i in playlist.indices) {
-            val uri = playlist[i].uri.toString()
-            val diskVal = diskMap[uri]
-            val memVal = cachedProgress[uri]
-            if (diskVal != null && diskVal > 0) {
-                if (memVal != diskVal) {
-                    cachedProgress[uri] = diskVal
-                    adapter.updateProgress(i, diskVal)
-                }
-            } else if (memVal != null) {
-                cachedProgress.remove(uri)
-                adapter.updateProgress(i, 0L)
-            }
-        }
-    }
-
-    /** 保存当前项进度到内存缓存并刷新进度条（裁决统一走 decideProgressWrite） */
+    /** 保存当前项进度到仓库并刷新进度条（裁决统一走 decideProgressWrite） */
     private fun saveCurrentProgress() {
         val ctrl = controller ?: return
         val index = ctrl.currentMediaItemIndex
         if (index < 0 || index >= playlist.size) return
         val uri = playlist[index].uri.toString()
-        when (val decision = decideProgressWrite(ctrl.currentPosition, ctrl.duration)) {
-            is ProgressWriteDecision.Clear -> {
-                cachedProgress.remove(uri)
-                adapter.updateProgress(index, 0)
+        applyProgressDecision(
+            decideProgressWrite(ctrl.currentPosition, ctrl.duration),
+            uri,
+            store = { u, pos ->
+                // 镜像同步更新，随后 refresh 重绑即读到新值
+                PlayerRepository.applyProgressUpdates(mapOf(u to pos))
+                adapter.refreshProgress(index)
+            },
+            clear = { u ->
+                PlayerRepository.applyProgressUpdates(emptyMap(), setOf(u))
+                adapter.refreshProgress(index)
             }
-            is ProgressWriteDecision.Store -> {
-                cachedProgress[uri] = decision.positionMs
-                adapter.updateProgress(index, decision.positionMs)
-            }
-            ProgressWriteDecision.Skip -> Unit // 零位置不覆盖旧进度
-        }
+        ) // Skip：零位置不覆盖旧进度
     }
 
-    /** 清除某个 uri 的进度：内存、Service 缓存、持久层三处一致删除 */
+    /** 清除某个 uri 的进度：Service 写缓冲与仓库权威源一致删除（防合并写盘「复活」） */
     private fun clearProgress(uri: Uri) {
         val key = uri.toString()
-        cachedProgress.remove(key)
         PlayerService.dropProgress(key)
         PlayerRepository.applyProgressUpdates(emptyMap(), setOf(key))
     }
 
     private val playerListener = object : Player.Listener {
         override fun onMediaItemTransition(mediaItem: M3MediaItem?, reason: Int) {
-            saveCurrentProgress()
+            // 此处不 saveCurrentProgress()：回调时 currentMediaItemIndex 已指向新项，
+            // 读到的是新项初始位置（decideProgressWrite 判 Skip，调用空跑）；
+            // 旧项最终进度由 PlayerService.onPositionDiscontinuity/cacheOldPosition、
+            // onIsPlayingChanged(false) 的 saveCurrentProgress 及点击切项前的
+            // flushCurrentPosition() 负责保存
             // 自然播完切集时清掉上一项近末尾进度
             if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO
                 && currentIndex in playlist.indices
                 && currentIndex != controller?.currentMediaItemIndex
             ) {
+                // 清掉上一项（播完）进度，防重启后「复活」（镜像同步更新，refresh 现查即新值）
                 val finishedIndex = currentIndex
-                cachedProgress.remove(playlist[finishedIndex].uri.toString())
-                adapter.updateProgress(finishedIndex, 0)
+                PlayerRepository.applyProgressUpdates(
+                    emptyMap(), setOf(playlist[finishedIndex].uri.toString())
+                )
+                adapter.refreshProgress(finishedIndex)
             }
             currentIndex = controller?.currentMediaItemIndex ?: -1
-            adapter.setCurrentPlaying(
-                controller?.currentMediaItem?.localConfiguration?.uri?.toString(),
-                controller?.isPlaying == true
-            )
+            syncAdapterPlayingState()
             restoreProgressIfNeeded()
         }
 
         override fun onIsPlayingChanged(isPlaying: Boolean) {
-            adapter.setCurrentPlaying(
-                controller?.currentMediaItem?.localConfiguration?.uri?.toString(),
-                isPlaying
-            )
+            syncAdapterPlayingState()
             if (!isPlaying) {
                 saveCurrentProgress()
             }
@@ -225,8 +220,7 @@ class MainActivity : AppCompatActivity() {
                 val index = controller?.currentMediaItemIndex ?: -1
                 val duration = controller?.duration ?: C.TIME_UNSET
                 if (duration != C.TIME_UNSET && duration > 0 && index in playlist.indices) {
-                    adapter.updateDuration(index, duration)
-                    playlist[index] = playlist[index].copy(duration = duration)
+                    updateDurationAt(index, duration)
                 }
             }
         }
@@ -296,12 +290,9 @@ class MainActivity : AppCompatActivity() {
         return true
     }
 
-    /** 续播位置：优先持久层权威值，无记录才回退内存缓存 */
-    private fun resolveResumePosition(item: MediaItemData): Long {
-        val disk = PlayerRepository.getProgress(item.uri.toString())
-        if (disk != null && disk > 0) return disk
-        return cachedProgress[item.uri.toString()] ?: 0L
-    }
+    /** 续播位置：仓库唯一权威值（未加载完成时镜像为空，返回 0，与旧内存缓存为空的行为一致） */
+    private fun resolveResumePosition(item: MediaItemData): Long =
+        PlayerRepository.getProgress(item.uri.toString()) ?: 0L
 
     /** 当前项有保存进度（>0）则 seek 到该位置，实现断点续播 */
     private fun restoreProgressIfNeeded() {
@@ -325,7 +316,7 @@ class MainActivity : AppCompatActivity() {
         val pos = resolveResumePosition(playlist[idx])
         if (pos > 0) ctrl.seekTo(idx, pos) else ctrl.seekToDefaultPosition(idx)
         currentIndex = idx
-        adapter.setCurrentPlaying(playlist[idx].uri.toString(), ctrl.isPlaying)
+        syncAdapterPlayingState()
     }
 
     // ===== 播放器自定义控件（倍速/音轨/字幕） =====
@@ -418,19 +409,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 扫描本地音视频并对账（fire-and-forget 入口，带重入保护）。
+     * 扫描本地音视频并对账（fire-and-forget 入口，重入保护在 suspend 版本内）。
      * @param silent true 为回前台静默对账：只删不增、不弹提示、无权限跳过
      */
     private fun scanLocalMedia(silent: Boolean = false) {
-        if (isScanning) return
-        isScanning = true
-        lifecycleScope.launch {
-            try {
-                scanLocalMediaInternal(silent)
-            } finally {
-                isScanning = false
-            }
-        }
+        lifecycleScope.launch { scanLocalMediaSuspend(silent) }
     }
 
     /** suspend 版扫描：对账（reconcileScanResult）完成后才返回，供需顺序执行的调用方 await 用 */
@@ -529,10 +512,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
         if (removed > 0) {
-            adapter.setCurrentPlaying(
-                controller?.currentMediaItem?.localConfiguration?.uri?.toString(),
-                controller?.isPlaying == true
-            )
+            syncAdapterPlayingState()
         }
         return removed
     }
@@ -579,7 +559,9 @@ class MainActivity : AppCompatActivity() {
                     }
                     .setNegativeButton("取消", null)
                     .show()
-            }
+            },
+            // 进度唯一权威源是仓库镜像，绑定/刷新时现查（不引入本地副本）
+            getProgress = { uri -> PlayerRepository.getProgress(uri) ?: 0L }
         )
         binding.recyclerPlaylist.adapter = adapter
         binding.recyclerPlaylist.layoutManager = LinearLayoutManager(this)
@@ -653,18 +635,10 @@ class MainActivity : AppCompatActivity() {
             binding.playerView.player = ctrl
             ctrl.addListener(playerListener)
             currentIndex = ctrl.currentMediaItemIndex
-            adapter.setCurrentPlaying(
-                ctrl.currentMediaItem?.localConfiguration?.uri?.toString(),
-                ctrl.isPlaying
-            )
+            syncAdapterPlayingState()
             lifecycleScope.launch {
-                // 兜住仓库侧漏网的加载异常，失败提示并跳过后续逻辑，保证仍能启动
-                try {
-                    PlayerRepository.awaitLoaded(this@MainActivity)
-                } catch (_: Exception) {
-                    Toast.makeText(this@MainActivity, "数据加载失败", Toast.LENGTH_SHORT).show()
-                    return@launch
-                }
+                // 失败已在仓库内部处理（日志 + 镜像重置为空），不吞 CancellationException
+                PlayerRepository.awaitLoaded(this@MainActivity)
                 // MediaController release 后调用方法为静默 no-op（不抛异常），协程在挂起点
                 // 被 onStop 跨越后若继续操作已 release 的 ctrl 会静默失效，甚至与新 onStart
                 // 的协程重复执行自愈/恢复；故每个挂起点恢复后须重新校验有效性
@@ -673,8 +647,8 @@ class MainActivity : AppCompatActivity() {
                     loadPlaylist()
                     playlistLoaded = true
                 } else {
-                    // 回前台：用持久层校正内存，防后台播完残留进度复活
-                    reconcileProgressFromDisk()
+                    // 回前台：进度权威值已在仓库镜像，无需对账，仅刷新可见行展示
+                    adapter.refreshAllProgress()
                 }
                 // 回前台静默对账：等列表加载完后再扫，并等对账完成再走后续自愈/恢复
                 scanLocalMediaSuspend(silent = true)

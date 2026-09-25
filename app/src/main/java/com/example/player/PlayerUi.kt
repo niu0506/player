@@ -383,15 +383,15 @@ class GestureController(
 /**
  * 播放列表适配器。交互回调回传条目 uri 而非下标：
  * items 经 submitList 异步 diff 后才回写，存在下标错位窗口，uri 是稳定身份。
+ * 进度不落地本类：绑定时经构造注入的 [getProgress] 现查权威源（默认恒 0，便于纯 UI 复用/测试）。
  */
 class MediaListAdapter(
     private val onClick: (String) -> Unit,
-    private val onDelete: (String) -> Unit
+    private val onDelete: (String) -> Unit,
+    private val getProgress: (String) -> Long = { 0L }
 ) : RecyclerView.Adapter<MediaListAdapter.VH>() {
 
     private val items = mutableListOf<MediaItemData>()
-    /** 各条目进度（uri → 毫秒），独立于条目数据，跨 submitList 存活 */
-    private val progressMap = mutableMapOf<String, Long>()
     /** 当前播放项 uri（null 表示无播放项） */
     private var currentPlayingUri: String? = null
     private var isPlaying = false
@@ -400,6 +400,7 @@ class MediaListAdapter(
 
     /** 用新列表刷新数据；DiffUtil 后台计算、结果回主线程 dispatch，防主线程掉帧 */
     fun submitList(list: List<MediaItemData>) {
+        if (items == list) return // 内容未变短路跳过（比较已提交的 items，性能优化不改行为）
         val oldItems = ArrayList(items)
         diffJob?.cancel()
         diffJob = diffScope.launch {
@@ -424,11 +425,19 @@ class MediaListAdapter(
     /**
      * 设置当前播放项，只刷新新旧两处。items 经异步 diff 回写存在窗口期，下标可能错位；
      * uri 是稳定身份，与「点击回调回传 uri 而非下标」的设计一致，无效下标直接跳过。
+     * uri 不变仅播放状态变化时只 notify 该项一次（旧实现会重复 notify 同一 position）。
      */
     fun setCurrentPlaying(uri: String?, playing: Boolean = false) {
         val old = currentPlayingUri
         currentPlayingUri = uri
         isPlaying = playing
+        if (old == uri) {
+            if (uri != null) {
+                val idx = items.indexOfFirst { it.uri.toString() == uri }
+                if (idx >= 0) notifyItemChanged(idx)
+            }
+            return
+        }
         if (old != null) {
             val oldIdx = items.indexOfFirst { it.uri.toString() == old }
             if (oldIdx >= 0) notifyItemChanged(oldIdx)
@@ -439,28 +448,22 @@ class MediaListAdapter(
         }
     }
 
-    /** 更新某项时长（仅原先为 0 时写入） */
+    /** 同步某项时长到 diff 视图（与权威 playlist 保持一致；值未变化时不通知） */
     fun updateDuration(index: Int, duration: Long) {
-        if (index in items.indices && items[index].duration == 0L) {
+        if (index in items.indices && items[index].duration != duration) {
             items[index] = items[index].copy(duration = duration)
             notifyItemChanged(index)
         }
     }
 
-    /** 批量同步进度（冷启动/回前台刷进列表），只收录 >0 的有效值 */
-    fun setProgress(progress: Map<String, Long>) {
-        progressMap.clear()
-        for ((uri, pos) in progress) {
-            if (pos > 0) progressMap[uri] = pos
-        }
+    /** 刷新某项进度展示（进度值经 [getProgress] 现查权威源，重绑即最新） */
+    fun refreshProgress(index: Int) {
+        if (index in items.indices) notifyItemChanged(index)
     }
 
-    /** 更新某项进度并刷新该项 */
-    fun updateProgress(index: Int, position: Long) {
-        if (index in items.indices) {
-            progressMap[items[index].uri.toString()] = position
-            notifyItemChanged(index)
-        }
+    /** 刷新全部条目进度展示（回前台等批量场景） */
+    fun refreshAllProgress() {
+        if (itemCount > 0) notifyItemRangeChanged(0, itemCount)
     }
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): VH {
@@ -485,7 +488,7 @@ class MediaListAdapter(
         )
 
         // 有进度展示进度条；播放中显示「已播时长」，否则显示「已播/总时长」
-        val progress = progressMap[item.uri.toString()] ?: 0L
+        val progress = getProgress(item.uri.toString())
         if (progress > 0 && item.duration > 0) {
             val percent = (progress * 100 / item.duration).toInt().coerceIn(0, 100)
             holder.binding.progressRow.visibility = View.VISIBLE

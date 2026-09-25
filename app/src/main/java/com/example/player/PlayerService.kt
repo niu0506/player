@@ -165,15 +165,16 @@ class PlayerService : MediaSessionService() {
     private fun cacheCurrentPosition(player: Player) {
         val item = player.currentMediaItem ?: return
         val uri = item.localConfiguration?.uri?.toString() ?: return
-        when (val decision = decideProgressWrite(player.currentPosition, player.duration)) {
-            is ProgressWriteDecision.Clear -> {
+        applyProgressDecision(
+            decideProgressWrite(player.currentPosition, player.duration),
+            uri,
+            store = { u, pos -> progressCache[u] = pos },
+            clear = { u ->
                 // 播到末尾：清内存并标记磁盘删除，防合并写盘「复活」
-                progressCache.remove(uri)
-                removedUris.add(uri)
+                progressCache.remove(u)
+                removedUris.add(u)
             }
-            is ProgressWriteDecision.Store -> progressCache[uri] = decision.positionMs
-            ProgressWriteDecision.Skip -> Unit // 零位置不覆盖旧进度
-        }
+        )
     }
 
     /** 切换前被换掉项的精确进度写入缓存（oldPosition 仍记着旧项 index 与位置）；裁决与 cacheCurrentPosition 统一走 decideProgressWrite */
@@ -184,15 +185,16 @@ class PlayerService : MediaSessionService() {
         player.currentTimeline.getWindow(oldPosition.mediaItemIndex, window)
         val uri = window.mediaItem.localConfiguration?.uri?.toString() ?: return
         // 时长未知（TIME_UNSET 等 <=0 值）时裁决退化为「位置 >0 即 Store」，即原兜底语义
-        when (val decision = decideProgressWrite(oldPosition.positionMs, window.durationMs)) {
-            is ProgressWriteDecision.Clear -> {
+        applyProgressDecision(
+            decideProgressWrite(oldPosition.positionMs, window.durationMs),
+            uri,
+            store = { u, pos -> progressCache[u] = pos },
+            clear = { u ->
                 // 旧项已播到近末尾：按播完处理，清内存并标记磁盘删除，防合并写盘「复活」
-                progressCache.remove(uri)
-                removedUris.add(uri)
+                progressCache.remove(u)
+                removedUris.add(u)
             }
-            is ProgressWriteDecision.Store -> progressCache[uri] = decision.positionMs
-            ProgressWriteDecision.Skip -> Unit // 零位置不覆盖旧进度
-        }
+        )
     }
 
     /** 持久化当前进度（异步提交）；快照未变且无待删项时跳过 */
@@ -205,8 +207,9 @@ class PlayerService : MediaSessionService() {
     }
 
     /**
-     * 进度写入 Room（经 [PlayerRepository]），进度落盘唯一写点。
-     * 语义为合并：先移除 [removedUris]，再写入仅 >0 的值。一律异步提交（不可 runBlocking 等待）。
+     * Service 侧进度写入 Room（经 [PlayerRepository]，落盘前防抖缓冲的出口）。
+     * MainActivity 亦直写仓库同一入口；两路写均为合并语义：先移除 [removedUris]，
+     * 再写入仅 >0 的值。一律异步提交（不可 runBlocking 等待）。
      */
     private fun writeToDisk(progress: Map<String, Long>) {
         PlayerRepository.applyProgressUpdates(progress, removedUris)

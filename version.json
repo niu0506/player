@@ -1,5 +1,5 @@
 {
-  "version": "1.4.11",
-  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.4.11/player-v1.4.11-release.apk",
-  "notes": "调整更新与小窗体验：取消启动时自动检查更新，保留右上角菜单手动检查；视频播放中切到后台时自动进入小窗播放；整理小窗入口逻辑，减少重复判断。"
+  "version": "1.4.14",
+  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.4.14/player-v1.4.14-release.apk",
+  "notes": "播放进度架构重构：进度数据由本地仓库统一管理，修复暂停或切歌瞬间进度可能不保存、后台播放回到前台进度显示不刷新、列表总时长与实际播放不符等问题；优化列表刷新与重复刷新性能。"
 }

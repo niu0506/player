@@ -271,8 +271,6 @@ object PlayerRepository {
 
     fun getPlaylist(): List<MediaItemData> = playlistState
 
-    fun getProgressMap(): Map<String, Long> = progressState
-
     fun getProgress(uri: String): Long? = progressState[uri]
 
     fun getLastItem(): String? = lastItemState
@@ -294,24 +292,18 @@ object PlayerRepository {
         )
     }
 
-    /** 全量替换播放列表并合并进度，两段写在同一事务中原子完成 */
-    fun savePlaylist(items: List<MediaItemData>, progressWrites: Map<String, Long>) {
+    /** 全量替换播放列表；进度统一经 [applyProgressUpdates] 写入，不再借列表落盘搭车 */
+    fun savePlaylist(items: List<MediaItemData>) {
         val itemsSnapshot = items.toList()
-        val progressSnapshot = progressWrites.toMap()
         var entities: List<PlaylistItemEntity> = emptyList()
-        var delta: List<ProgressEntity> = emptyList()
         dispatchWrite(
             memPart = {
                 playlistState = itemsSnapshot
                 entities = itemsSnapshot.mapIndexed { i, it ->
                     PlaylistItemEntity(it.uri.toString(), it.name, it.duration, i)
                 }
-                delta = mergeProgressLocked(progressSnapshot, emptySet())
             },
-            dbPart = {
-                playlistDao().replaceAll(entities)
-                if (delta.isNotEmpty()) progressDao().upsertAll(delta)
-            }
+            dbPart = { playlistDao().replaceAll(entities) }
         )
     }
 
@@ -453,6 +445,24 @@ internal fun decideProgressWrite(positionMs: Long, durationMs: Long): ProgressWr
     if (durationMs in 1..positionMs) return ProgressWriteDecision.Clear
     if (positionMs <= 0) return ProgressWriteDecision.Skip
     return ProgressWriteDecision.Store(positionMs)
+}
+
+/**
+ * 进度裁决应用纯函数：把 [decideProgressWrite] 的结果分发到 [store]/[clear]，
+ * Skip 不动作。调用方传入各自存储介质的操作（Service 的 progressCache/removedUris、
+ * Activity 的仓库直写等），保证各处裁决应用行为完全一致。
+ */
+internal fun applyProgressDecision(
+    decision: ProgressWriteDecision,
+    uri: String,
+    store: (uri: String, positionMs: Long) -> Unit,
+    clear: (uri: String) -> Unit,
+) {
+    when (decision) {
+        is ProgressWriteDecision.Clear -> clear(uri)
+        is ProgressWriteDecision.Store -> store(uri, decision.positionMs)
+        ProgressWriteDecision.Skip -> Unit
+    }
 }
 
 /**
