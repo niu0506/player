@@ -19,12 +19,14 @@ import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.OptIn
 import androidx.annotation.RequiresApi
+import androidx.annotation.StringRes
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import androidx.media3.common.C
 import androidx.media3.common.PlaybackException
+import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
 import androidx.media3.common.VideoSize
 import androidx.media3.common.util.RepeatModeUtil
@@ -82,7 +84,7 @@ class MainActivity : AppCompatActivity() {
         ActivityResultContracts.RequestMultiplePermissions()
     ) { grants: Map<String, Boolean> ->
         if (grants.values.any { it }) {
-            Toast.makeText(this, "权限已授予，请点击扫描", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, R.string.toast_permission_granted, Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -104,13 +106,14 @@ class MainActivity : AppCompatActivity() {
         syncAdapterPlayingState()
         refreshPlaylist()
         savePlaylist()
-        Toast.makeText(this, "已删除", Toast.LENGTH_SHORT).show()
+        Toast.makeText(this, R.string.toast_deleted, Toast.LENGTH_SHORT).show()
     }
 
     /** 刷新列表、顶部计数与空态（进度条无需单独喂：绑定时经 getProgress 现查仓库） */
     private fun refreshPlaylist() {
         adapter.submitList(playlist.toList())
-        binding.tvCount.text = if (playlist.isEmpty()) "空" else "${playlist.size} 个"
+        binding.tvCount.text = if (playlist.isEmpty()) getString(R.string.list_count_empty)
+        else getString(R.string.list_count, playlist.size)
         binding.tvEmpty.visibility = if (playlist.isEmpty()) View.VISIBLE else View.GONE
     }
 
@@ -245,19 +248,34 @@ class MainActivity : AppCompatActivity() {
             errorUri?.let { PlayerService.notifyErrorHandled(it) }
 
             if (isFileGone && index in playlist.indices) {
-                Toast.makeText(this@MainActivity, "无法读取「$name」", Toast.LENGTH_SHORT).show()
+                Toast.makeText(
+                    this@MainActivity,
+                    getString(R.string.toast_file_unreadable, name),
+                    Toast.LENGTH_SHORT
+                ).show()
                 // 先 seek 后删：队列下标前移后恰好落在下一项，避免再跳过一个文件
                 removeItemFromPlaylist(index)
             } else {
-                Toast.makeText(this@MainActivity, "播放出错：$name", Toast.LENGTH_SHORT).show()
+                Toast.makeText(
+                    this@MainActivity,
+                    getString(R.string.toast_playback_error, name),
+                    Toast.LENGTH_SHORT
+                ).show()
             }
         }
 
         override fun onPlaybackSuppressionReasonChanged(playbackSuppressionReason: Int) {
             // 暂时性焦点丢失（来电等）：焦点归还后自动续播
             if (playbackSuppressionReason == Player.PLAYBACK_SUPPRESSION_REASON_TRANSIENT_AUDIO_FOCUS_LOSS) {
-                Toast.makeText(this@MainActivity, "已被其他应用暂时打断，稍后自动续播", Toast.LENGTH_SHORT).show()
+                Toast.makeText(
+                    this@MainActivity, R.string.toast_playback_interrupted, Toast.LENGTH_SHORT
+                ).show()
             }
+        }
+
+        override fun onPlaybackParametersChanged(playbackParameters: PlaybackParameters) {
+            // 变速的单一回填点：本 Activity 或外部（通知栏/其它 controller）改速都经此同步按钮文案
+            syncSpeedLabel()
         }
 
         @RequiresApi(Build.VERSION_CODES.O)
@@ -331,17 +349,28 @@ class MainActivity : AppCompatActivity() {
         binding.playerView.setShowShuffleButton(true)
         binding.playerView.keepScreenOn = true
 
-        val speedBtn = binding.playerView.findViewById<TextView>(R.id.btn_speed)
-        speedBtn?.setOnClickListener {
-            showSpeedSelection(speedBtn)
+        binding.playerView.findViewById<View>(R.id.btn_speed)?.setOnClickListener {
+            showSpeedSelection()
         }
 
         binding.playerView.findViewById<View>(R.id.btn_audio)?.setOnClickListener {
-            showTrackSelection(C.TRACK_TYPE_AUDIO, "选择音轨")
+            showTrackSelection(C.TRACK_TYPE_AUDIO, R.string.track_select_audio_title)
         }
         binding.playerView.findViewById<View>(R.id.btn_subtitle)?.setOnClickListener {
-            showTrackSelection(C.TRACK_TYPE_TEXT, "选择字幕")
+            showTrackSelection(C.TRACK_TYPE_TEXT, R.string.track_select_subtitle_title)
         }
+    }
+
+    /**
+     * 倍速按钮文案与播放器真实速度对齐。
+     * 倍速由 Service 侧播放器持有，controller 每次重连读到的都是当前真实值；
+     * 因此本方法在 controller 连接后与 [Player.Listener.onPlaybackParametersChanged] 中
+     * 都必须调用 —— 否则用户设过 2x 后回前台（或 Activity 重建）时，
+     * 播放仍以 2x 运行而按钮却停留在布局默认的 "1x"。
+     */
+    private fun syncSpeedLabel() {
+        val speed = controller?.playbackParameters?.speed ?: return
+        binding.playerView.findViewById<TextView>(R.id.btn_speed)?.text = formatSpeed(speed)
     }
 
     /** 倍速档位下标，找不到时回退 1.0x */
@@ -352,18 +381,19 @@ class MainActivity : AppCompatActivity() {
         return if (one >= 0) one else 0
     }
 
-    private fun showSpeedSelection(speedBtn: TextView) {
+    private fun showSpeedSelection() {
         val ctrl = controller ?: return
         val labels = speedLevels.map { formatSpeed(it) }.toTypedArray()
         val checked = speedsIndex(ctrl.playbackParameters.speed)
         AlertDialog.Builder(this)
-            .setTitle("倍速播放")
+            .setTitle(R.string.speed_dialog_title)
             .setSingleChoiceItems(labels, checked) { dialog, which ->
+                // 只设速度，文案由 onPlaybackParametersChanged → syncSpeedLabel 统一回填，
+                // 避免「对话框直改文案」与「监听器回填」两条路径出现不一致
                 ctrl.setPlaybackSpeed(speedLevels[which])
-                speedBtn.text = formatSpeed(speedLevels[which])
                 dialog.dismiss()
             }
-            .setNegativeButton("取消", null)
+            .setNegativeButton(R.string.cancel, null)
             .show()
     }
 
@@ -373,18 +403,18 @@ class MainActivity : AppCompatActivity() {
     }
 
     @OptIn(UnstableApi::class)
-    private fun showTrackSelection(trackType: Int, title: String) {
+    private fun showTrackSelection(trackType: Int, @StringRes titleRes: Int) {
         val ctrl = controller ?: run {
-            Toast.makeText(this, "播放器未连接", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, R.string.toast_player_not_connected, Toast.LENGTH_SHORT).show()
             return
         }
         try {
-            TrackSelectionDialogBuilder(this, title, ctrl, trackType)
+            TrackSelectionDialogBuilder(this, getString(titleRes), ctrl, trackType)
                 .setShowDisableOption(false)
                 .build()
                 .show()
         } catch (_: Exception) {
-            Toast.makeText(this, "当前视频没有可选的轨道", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, R.string.toast_no_tracks, Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -446,7 +476,7 @@ class MainActivity : AppCompatActivity() {
     ) {
         if (scannedVideos == null && scannedAudios == null) {
             if (!silent) {
-                Toast.makeText(this, "扫描失败，请稍后重试", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, R.string.toast_scan_failed, Toast.LENGTH_SHORT).show()
             }
             return
         }
@@ -462,7 +492,7 @@ class MainActivity : AppCompatActivity() {
         }
         if (newItems.isEmpty() && removedCount == 0) {
             if (!silent) {
-                Toast.makeText(this, "没有新文件", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, R.string.toast_no_new_media, Toast.LENGTH_SHORT).show()
             }
             return
         }
@@ -474,9 +504,14 @@ class MainActivity : AppCompatActivity() {
         savePlaylist()
         if (!silent) {
             val parts = mutableListOf<String>()
-            if (removedCount > 0) parts.add("删除 $removedCount 个已消失文件")
-            if (newItems.isNotEmpty()) parts.add("添加 ${newItems.size} 个文件")
-            Toast.makeText(this, parts.joinToString("，"), Toast.LENGTH_SHORT).show()
+            if (removedCount > 0) parts.add(getString(R.string.toast_scan_removed, removedCount))
+            if (newItems.isNotEmpty()) parts.add(getString(R.string.toast_scan_added, newItems.size))
+            val message = if (parts.size == 2) {
+                getString(R.string.toast_scan_join, parts[0], parts[1])
+            } else {
+                parts.first()
+            }
+            Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -550,14 +585,14 @@ class MainActivity : AppCompatActivity() {
                 val item = playlist.firstOrNull { it.uri.toString() == uri }
                     ?: return@MediaListAdapter
                 AlertDialog.Builder(this)
-                    .setTitle("删除条目")
-                    .setMessage("确定从播放列表中删除「${item.name}」吗？\n该文件的播放进度也会被清除。")
-                    .setPositiveButton("删除") { _, _ ->
+                    .setTitle(R.string.delete_dialog_title)
+                    .setMessage(getString(R.string.delete_dialog_message, item.name))
+                    .setPositiveButton(R.string.delete) { _, _ ->
                         // 对话框存续期间列表可能位移，确认时按 uri 重新定位
                         playlist.indexOfFirst { it.uri.toString() == uri }
                             .takeIf { it >= 0 }?.let { removeItemFromPlaylist(it) }
                     }
-                    .setNegativeButton("取消", null)
+                    .setNegativeButton(R.string.cancel, null)
                     .show()
             },
             // 进度唯一权威源是仓库镜像，绑定/刷新时现查（不引入本地副本）
@@ -635,6 +670,9 @@ class MainActivity : AppCompatActivity() {
             binding.playerView.player = ctrl
             ctrl.addListener(playerListener)
             currentIndex = ctrl.currentMediaItemIndex
+            // 重连后必须回填倍速文案：速度由 Service 侧播放器持有并跨重连保留，
+            // 而布局默认值是 "1x"，不补齐就会与真实速度脱节
+            syncSpeedLabel()
             syncAdapterPlayingState()
             lifecycleScope.launch {
                 // 失败已在仓库内部处理（日志 + 镜像重置为空），不吞 CancellationException

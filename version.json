@@ -1,5 +1,5 @@
 {
-  "version": "1.4.14",
-  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.4.14/player-v1.4.14-release.apk",
-  "notes": "播放进度架构重构：进度数据由本地仓库统一管理，修复暂停或切歌瞬间进度可能不保存、后台播放回到前台进度显示不刷新、列表总时长与实际播放不符等问题；优化列表刷新与重复刷新性能。"
+  "version": "1.5.0",
+  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.5.0/player-v1.5.0-release.apk",
+  "notes": "修复回前台后倍速按钮文案与真实播放速度不一致的问题；数据库升版本漏写迁移时不再静默清空播放列表与进度，改为明确报错以便发现；全部界面文案抽取为资源；CI 增加单元测试与静态检查门禁。"
 }

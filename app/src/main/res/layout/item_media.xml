@@ -37,7 +37,7 @@
                 android:layout_gravity="center"
                 android:src="@drawable/ic_equalizer"
                 android:visibility="gone"
-                android:contentDescription="正在播放" />
+                android:contentDescription="@string/playing_indicator" />
         </FrameLayout>
 
         <!-- 媒体名称（超长时从中间省略） -->

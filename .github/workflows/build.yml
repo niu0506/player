@@ -31,6 +31,14 @@ jobs:
         run: |
           echo "$KEYSTORE_BASE64" | base64 --decode > $RUNNER_TEMP/release.keystore
 
+      # 门禁：单元测试 + lint 必须先通过，避免回归悄悄进入 release 产物。
+      # 放在签名/构建之前，失败即中止，不浪费后续步骤时间。
+      - name: Run unit tests
+        run: ./gradlew testDebugUnitTest --no-daemon
+
+      - name: Run lint
+        run: ./gradlew lintDebug --no-daemon
+
       - name: Build release APK
         env:
           KEYSTORE_FILE: ${{ runner.temp }}/release.keystore

@@ -11,7 +11,7 @@
 - **本地媒体库扫描**：基于 MediaStore 扫描设备上的视频与音频，自动构建播放列表；自动监听媒体库变化（防抖合并增量扫描），回前台时对账清理已被外部删除的文件
 - **播放控制**：播放/暂停、进度拖动、快退/快进 15s、随机播放、循环模式（顺序/单曲/列表）
 - **音轨/字幕选择**：多音轨视频可切换音轨，内嵌字幕可切换
-- **变速播放**：0.5x ~ 3.0x 共 7 档倍速
+- **变速播放**：0.5x ~ 3.0x 共 7 档倍速；倍速由 Service 侧播放器持有，controller 重连（回前台）后按钮文案会重新同步，不会与真实速度脱节
 - **后台播放**：前台服务（`MediaSessionService`）常驻，退到后台/锁屏仍持续播放，通知栏可控
 - **耳机断开自动暂停**：拔掉耳机自动暂停；音频焦点由 MediaSession 会话托管的播放器内建处理（暂时丢失暂停并续播、可闪避时降音量、永久丢失只暂停），避免「双 App 同放」，被暂时打断时界面给出提示
 
@@ -43,17 +43,17 @@
 ## 技术栈
 
 - 语言：Kotlin
-- 最低支持 / 目标版本：minSdk 24 / targetSdk 35
-- 播放器：androidx.media3 1.5.1（ExoPlayer + MediaSession + MediaController）
+- 最低支持 / 目标版本：minSdk 24 / targetSdk 35（compileSdk 36，由 media3 1.11 的传递依赖要求）
+- 播放器：androidx.media3 1.11.0（ExoPlayer + MediaSession + MediaController）
 - 架构：前台服务（`PlayerService`）+ 单 Activity（`MainActivity`），经 MediaController 通信；源码扁平化为单包 5 文件，UI 逻辑拆分为 `GestureController`、`FullscreenPipHelper`、`MediaStoreScanner` 等职责类（见 `PlayerUi.kt` / `PlayerRepository.kt` / `UpdateManager.kt`）
-- 持久化：Room 数据库（播放列表、进度映射、KV 分表存储，统一「合并写」入口；首次启动自动迁移旧 SharedPreferences 数据）
-- 更新下载：系统 DownloadManager 写入 MediaStore.Downloads（API ≤28 回退公共 Download 目录）；安装器经 content URI 授权直读（旧版本经 FileProvider）
+- 持久化：Room 数据库（播放列表、进度映射、KV 分表存储，统一「合并写」入口；首次启动自动迁移旧 SharedPreferences 数据）；schema 导出至 `app/schemas/` 并纳入版本控制
+- 更新下载：系统 DownloadManager 写入**应用外部私有** `getExternalFilesDir(DIRECTORY_DOWNLOADS)`（全版本免存储权限，分区存储下可用）；安装器经 FileProvider content URI 授权直读。注意 `setDestinationUri` 只接受 `file://`，传 `content://`（MediaStore 目标）会抛 `IllegalArgumentException` —— 这正是 v1.4.8 修复的「点立即更新闪退」根因，勿回退为 MediaStore 目标
 - UI：ViewBinding + RecyclerView（DiffUtil 后台差分刷新）
 - 构建：AGP + Kotlin DSL (Gradle)，GitHub Actions CI 自动构建
 
 ## 构建
 
-需要 JDK 17 与已配置的 Android SDK。
+需要 JDK 17+（Gradle 工具链声明为 21，见 `gradle/gradle-daemon-jvm.properties`）与已配置的 Android SDK。
 
 ```bash
 # 构建调试版 APK
@@ -62,9 +62,24 @@
 
 # 运行本地单元测试
 ./gradlew testDebugUnitTest
+
+# 静态检查（CI 同样会执行）
+./gradlew lintDebug
 ```
 
 构建依赖的 SDK 路径在本地 `local.properties`（`sdk.dir=...`）中配置，该文件已被 `.gitignore` 忽略。
+
+### 数据库迁移（重要）
+
+`PlayerRepository` 的 Room 数据库**没有**启用 `fallbackToDestructiveMigration`：升级 `@Database(version = ...)` 时若缺少对应 `Migration`，应用会在打开数据库时报错（`IllegalStateException: A migration from N to M was required but not found`），而**不会**静默清空用户的播放列表与全部进度。
+
+新增字段/表时的正确流程：
+
+1. 在 `PlayerDatabase` 的 `@Database` 上递增 `version`；
+2. 在同处补充 `Migration(N, M)` 并加入 `Room.databaseBuilder(...).addMigrations(...)`；
+3. 构建后确认 `app/schemas/com.example.player.PlayerDatabase/<M>.json` 已生成**并提交到版本控制** —— 该文件是后续迁移的 diff 基准，缺失会让后续迁移无法正确编写。
+
+> 早期版本使用 `fallbackToDestructiveMigration(dropAllTables = true)`，在升版本忘记写迁移时会静默删除全部用户数据。该兜底已移除，改为构建/运行期显式暴露。
 
 ### 签名（Release）
 
@@ -77,7 +92,7 @@ Release 签名信息按优先级取自：
 
 ### CI
 
-`.github/workflows/build.yml`：push 到 `main` 或打 `v*` tag 时自动构建签名 Release APK；PR 构建在无 Secrets 时回退无签名构建。
+`.github/workflows/build.yml`：push 到 `main` 或打 `v*` tag 时依次执行**单元测试 → lint → 构建签名 Release APK**（前两步失败即中止，回归不会进入产物）；PR 构建在无 Secrets 时回退无签名构建。
 
 ## 安装
 
@@ -95,6 +110,12 @@ app/src/main/java/com/example/player/
 
 app/src/test/java/com/example/player/
 └── PlayerTests.kt                   # 进度合并语义 / 旧数据迁移 / 时长格式化 / 列表高亮越界防护 / 版本比较
+
+app/schemas/com.example.player.PlayerDatabase/
+└── 1.json                           # Room 导出的 schema（须提交，作为后续 Migration 的 diff 基准）
+
+app/src/main/res/values/
+└── strings.xml                      # 全部用户可见文案（含控制栏与手势浮层，均经资源引用）
 ```
 
 ## License

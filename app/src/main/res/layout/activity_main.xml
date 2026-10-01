@@ -67,7 +67,7 @@
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"
-            android:text="播放列表"
+            android:text="@string/playlist_title"
             android:textSize="18sp"
             android:textStyle="bold"
             android:fontFamily="sans-serif-medium"
@@ -164,7 +164,7 @@
             android:layout_gravity="center"
             android:gravity="center"
             android:lineSpacingExtra="6dp"
-            android:text="播放列表还是空的\n点击上方「扫描」导入本地视频和音频"
+            android:text="@string/list_empty_hint"
             android:textColor="@color/text_secondary"
             android:textSize="14sp"
             android:visibility="gone" />

@@ -142,12 +142,16 @@ class FullscreenPipHelper(
     /** 进入 PiP 小窗；失败时恢复 UI，并按需提示。 */
     fun enterPipMode(showError: Boolean = true): Boolean {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
-            if (showError) Toast.makeText(activity, "系统不支持小窗播放", Toast.LENGTH_SHORT).show()
+            if (showError) {
+                Toast.makeText(activity, R.string.toast_pip_unsupported, Toast.LENGTH_SHORT).show()
+            }
             return false
         }
         val vs = controllerProvider()?.videoSize
         if (vs == null || !hasVideo(vs)) {
-            if (showError) Toast.makeText(activity, "当前没有正在播放的视频", Toast.LENGTH_SHORT).show()
+            if (showError) {
+                Toast.makeText(activity, R.string.toast_pip_no_video, Toast.LENGTH_SHORT).show()
+            }
             return false
         }
         if (isFullscreen) {
@@ -169,7 +173,9 @@ class FullscreenPipHelper(
         setChromeVisible(true)
         binding.playerView.useController = true
         applyPipVideoSurface(false)
-        if (showError) Toast.makeText(activity, "无法进入小窗模式", Toast.LENGTH_SHORT).show()
+        if (showError) {
+            Toast.makeText(activity, R.string.toast_pip_failed, Toast.LENGTH_SHORT).show()
+        }
         return false
     }
 
@@ -262,12 +268,12 @@ class GestureController(
                 if (e.x < playerView.width / 2f) {
                     if (ctrl.isCommandAvailable(Player.COMMAND_SEEK_BACK)) {
                         ctrl.seekBack()
-                        showGestureOverlay("快退 15 秒")
+                        showGestureOverlay(activity.getString(R.string.gesture_seek_back))
                     }
                 } else {
                     if (ctrl.isCommandAvailable(Player.COMMAND_SEEK_FORWARD)) {
                         ctrl.seekForward()
-                        showGestureOverlay("快进 15 秒")
+                        showGestureOverlay(activity.getString(R.string.gesture_seek_forward))
                     }
                 }
                 return true
@@ -307,16 +313,26 @@ class GestureController(
                             .toLong().coerceIn(0L, duration)
                         seekTargetPosition = target
                         val deltaSec = (target - seekStartPosition) / 1000
-                        val action = if (deltaSec >= 0) "快进" else "快退"
+                        val actionRes = if (deltaSec >= 0) R.string.gesture_seek_forward_action
+                        else R.string.gesture_seek_back_action
                         showGestureOverlay(
-                            "$action ${abs(deltaSec)} 秒\n" +
-                                "${formatTime(target)} / ${formatTime(duration)}"
+                            activity.getString(
+                                R.string.gesture_seek_text,
+                                activity.getString(actionRes),
+                                abs(deltaSec),
+                                formatTime(target),
+                                formatTime(duration)
+                            )
                         )
                     }
                     GESTURE_BRIGHTNESS -> {
                         val delta = (start.y - e2.y) / playerView.height
                         applyBrightness(brightnessStart + delta)
-                        showGestureOverlay("亮度 ${(currentBrightness() * 100).toInt()}%")
+                        showGestureOverlay(
+                            activity.getString(
+                                R.string.gesture_brightness, (currentBrightness() * 100).toInt()
+                            )
+                        )
                     }
                     GESTURE_VOLUME -> {
                         val maxVolume =
@@ -326,7 +342,7 @@ class GestureController(
                         val target = (volumeStart + delta).coerceIn(0, maxVolume)
                         audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, target, 0)
                         val pct = if (maxVolume > 0) target * 100 / maxVolume else 0
-                        showGestureOverlay("音量 $pct%")
+                        showGestureOverlay(activity.getString(R.string.gesture_volume, pct))
                     }
                 }
                 return true

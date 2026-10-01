@@ -194,7 +194,7 @@ class UpdateManager(private val activity: AppCompatActivity) {
                     enqueueDownload(next)
                     return
                 }
-                Toast.makeText(context, "下载失败，请手动下载安装", Toast.LENGTH_SHORT).show()
+                Toast.makeText(context, R.string.update_download_failed, Toast.LENGTH_SHORT).show()
                 return
             }
             val uri = downloadedInstallUri() ?: return
@@ -267,10 +267,14 @@ class UpdateManager(private val activity: AppCompatActivity) {
                 }
                 when {
                     release == null -> if (manual) {
-                        Toast.makeText(activity, "检查更新失败，请稍后重试", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(activity, R.string.update_check_failed, Toast.LENGTH_SHORT).show()
                     }
                     !UpdateChecker.isNewer(release.version, current) -> if (manual) {
-                        Toast.makeText(activity, "已是最新版本 v$current", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(
+                            activity,
+                            activity.getString(R.string.update_up_to_date, current),
+                            Toast.LENGTH_SHORT
+                        ).show()
                     }
                     else -> showUpdateDialog(release)
                 }
@@ -279,12 +283,12 @@ class UpdateManager(private val activity: AppCompatActivity) {
     }
 
     private fun showUpdateDialog(release: UpdateChecker.Release) {
-        val notes = release.notes.trim().ifEmpty { "优化体验并修复已知问题" }
+        val notes = release.notes.trim().ifEmpty { activity.getString(R.string.update_notes_fallback) }
         AlertDialog.Builder(activity)
-            .setTitle("发现新版本 v${release.version}")
+            .setTitle(activity.getString(R.string.update_dialog_title, release.version))
             .setMessage(notes)
-            .setPositiveButton("立即更新") { _, _ -> downloadApk(release) }
-            .setNegativeButton("取消", null)
+            .setPositiveButton(R.string.update_now) { _, _ -> downloadApk(release) }
+            .setNegativeButton(R.string.cancel, null)
             .show()
     }
 
@@ -300,12 +304,12 @@ class UpdateManager(private val activity: AppCompatActivity) {
         )
         val dir = activity.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
         if (dir == null) {
-            Toast.makeText(activity, "存储不可用，无法下载更新包", Toast.LENGTH_SHORT).show()
+            Toast.makeText(activity, R.string.update_storage_unavailable, Toast.LENGTH_SHORT).show()
             return
         }
         pendingDownloadFile = File(dir, apkFileName(release.version))
         enqueueDownload(pendingDownloadUrls.removeFirst())
-        Toast.makeText(activity, "开始下载，完成后自动弹出安装", Toast.LENGTH_SHORT).show()
+        Toast.makeText(activity, R.string.update_download_started, Toast.LENGTH_SHORT).show()
     }
 
     private fun apkFileName(version: String): String =
@@ -315,8 +319,8 @@ class UpdateManager(private val activity: AppCompatActivity) {
     private fun enqueueDownload(url: String) {
         val file = pendingDownloadFile ?: return
         val request = DownloadManager.Request(url.toUri())
-            .setTitle("影音盒 v$pendingDownloadVersion")
-            .setDescription("正在下载更新包")
+            .setTitle(activity.getString(R.string.update_download_title, pendingDownloadVersion))
+            .setDescription(activity.getString(R.string.update_download_description))
             .setMimeType(APK_MIME)
             .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
         file.delete()
@@ -346,7 +350,7 @@ class UpdateManager(private val activity: AppCompatActivity) {
                 )
             } catch (_: Exception) {
             }
-            Toast.makeText(activity, "请允许本应用安装未知应用，返回后将自动继续", Toast.LENGTH_LONG).show()
+            Toast.makeText(activity, R.string.update_install_permission, Toast.LENGTH_LONG).show()
             return
         }
         val intent = Intent(Intent.ACTION_VIEW).apply {
@@ -357,7 +361,7 @@ class UpdateManager(private val activity: AppCompatActivity) {
         try {
             activity.startActivity(intent)
         } catch (_: Exception) {
-            Toast.makeText(activity, "无法启动安装器，请在下载通知中手动安装", Toast.LENGTH_SHORT).show()
+            Toast.makeText(activity, R.string.update_installer_failed, Toast.LENGTH_SHORT).show()
         }
     }
 }

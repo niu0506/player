@@ -27,8 +27,8 @@ android {
         applicationId = "com.example.player"
         minSdk = 24
         targetSdk = 35
-        versionCode = 34
-        versionName = "1.4.14"
+        versionCode = 35
+        versionName = "1.5.0"
     }
 
     signingConfigs {
@@ -66,6 +66,15 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
+}
+
+/**
+ * Room schema 导出目录（须提交到版本控制）：
+ * 它是编写/校验后续 Migration 的 diff 基准；缺失会让下次改 schema 时无法确认迁移正确性。
+ * 与 @Database(exportSchema = true) 配套，改 schema 后由 KSP 自动写出 <version>.json。
+ */
+ksp {
+    arg("room.schemaLocation", "$projectDir/schemas")
 }
 
 dependencies {

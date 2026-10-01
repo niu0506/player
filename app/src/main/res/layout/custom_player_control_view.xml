@@ -79,7 +79,7 @@
           android:paddingLeft="10dp"
           android:paddingRight="10dp"
           android:gravity="center"
-          android:text="音轨"
+          android:text="@string/track_audio"
           android:textSize="13sp"
           android:textColor="#FFFFFF"
           android:background="?attr/selectableItemBackgroundBorderless"/>
@@ -91,7 +91,7 @@
           android:paddingLeft="10dp"
           android:paddingRight="10dp"
           android:gravity="center"
-          android:text="字幕"
+          android:text="@string/track_subtitle"
           android:textSize="13sp"
           android:textColor="#FFFFFF"
           android:background="?attr/selectableItemBackgroundBorderless"/>
@@ -109,7 +109,7 @@
           android:paddingLeft="10dp"
           android:paddingRight="10dp"
           android:gravity="center"
-          android:text="1x"
+          android:text="@string/speed_default_label"
           android:textSize="13sp"
           android:textColor="#FFFFFF"
           android:textStyle="bold"

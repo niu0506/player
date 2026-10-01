@@ -200,7 +200,7 @@ interface KvDao {
 @Database(
     entities = [PlaylistItemEntity::class, ProgressEntity::class, KvEntity::class],
     version = 1,
-    exportSchema = false,
+    exportSchema = true,
 )
 abstract class PlayerDatabase : RoomDatabase() {
     abstract fun playlistDao(): PlaylistDao
@@ -381,9 +381,10 @@ object PlayerRepository {
 
     /** 一次性加载：建库 → 迁移旧 prefs → 读出三份数据进内存镜像 */
     private suspend fun loadInternal(appCtx: Context) {
+        // 刻意不启用 fallbackToDestructiveMigration：宁可升版本漏写迁移时明确报错，
+        // 也不能静默清空用户的播放列表与全部进度。改 schema 时须递增 version
+        // 并补 Migration、addMigrations(...)，同时提交 app/schemas/ 下新导出的 json。
         val database = Room.databaseBuilder(appCtx, PlayerDatabase::class.java, DB_NAME)
-            // 未来升版本缺迁移时销毁重建，保 App 可打开（不覆盖 DB 文件损坏场景）
-            .fallbackToDestructiveMigration(dropAllTables = true)
             .build()
         db = database
         val prefs = appCtx.getSharedPreferences(LEGACY_PREFS, Context.MODE_PRIVATE)
