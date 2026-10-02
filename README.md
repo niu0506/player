@@ -19,7 +19,8 @@
 
 - 按 **URI** 独立记忆每个文件（音/视频统一）的播放进度，应用重启/切后台后自动恢复断点
 - 进度每 2 秒落盘一次（快照无变化时跳过，零空闲 IO）；seek、暂停、任务移除、内存吃紧时立即落盘
-- 「合并非覆盖」写入语义：0 值不覆盖已有非零进度；播放到末尾或删除条目时进度显式清除，防止残留进度「复活」
+- **末尾容差**：距末尾 5 秒以内（且不超过总时长 10%）的进度视为已看完，不写入断点——周期落盘的采样点本就常落在末尾几秒内，否则单曲循环每轮回绕都会被 seek 回片尾，表现为只重复最后几秒
+- 「合并非覆盖」写入语义：0 值不覆盖已有非零进度；播放到末尾（含末尾容差）或删除条目时进度显式清除，防止残留进度「复活」
 
 ### 交互
 
@@ -32,7 +33,9 @@
 
 ### 更新
 
-- **应用内更新**：检查 GitHub Releases 新版本（GitHub API 直连 + jsDelivr CDN 兜底），确认后经系统 DownloadManager 下载（CDN 反代加速在前、直连兜底，失败自动换源），完成后调起系统安装器
+- **应用内更新**：检查 GitHub Releases 新版本（GitHub API 优先，响应无法解析时自动回退 jsDelivr CDN；`version.json` 即该回退源）
+- **下载与安装**：经系统 DownloadManager 下载，**GitHub 直连优先、CDN 反代（gh-proxy / ghproxy）加速兜底**，失败自动换源；下载完成先校验产物确为可解析的 APK（防反代返回 200 + HTML 错误页或残包），通过后才调起系统安装器
+- **更新提示时机**：更新弹窗只在界面处于前台（resumed）时创建，检查期间切走则由 `onResume` 补弹；且不响应「点外部取消」，避免菜单收起等残留触摸把刚弹出的提示框立刻关掉
 - **权限适配**：Android 8+ 的「安装未知应用」授权流程；应用替换成功后自动清理下载目录中的旧更新包
 
 ### 系统适配
@@ -46,7 +49,7 @@
 - 最低支持 / 目标版本：minSdk 24 / targetSdk 35（compileSdk 36，由 media3 1.11 的传递依赖要求）
 - 播放器：androidx.media3 1.11.0（ExoPlayer + MediaSession + MediaController）
 - 架构：前台服务（`PlayerService`）+ 单 Activity（`MainActivity`），经 MediaController 通信；源码扁平化为单包 5 文件，UI 逻辑拆分为 `GestureController`、`FullscreenPipHelper`、`MediaStoreScanner` 等职责类（见 `PlayerUi.kt` / `PlayerRepository.kt` / `UpdateManager.kt`）
-- 持久化：Room 数据库（播放列表、进度映射、KV 分表存储，统一「合并写」入口；首次启动自动迁移旧 SharedPreferences 数据）；schema 导出至 `app/schemas/` 并纳入版本控制
+- 持久化：Room 数据库（播放列表、进度映射、KV 分表存储，统一「合并写」入口；首次启动自动迁移旧 SharedPreferences 数据）；schema 导出至 `app/schemas/` 并纳入版本控制。加载失败**不是终态**：会按需重试（30 秒冷却），失败期间的写入不再被静默丢弃，界面给出提示
 - 更新下载：系统 DownloadManager 写入**应用外部私有** `getExternalFilesDir(DIRECTORY_DOWNLOADS)`（全版本免存储权限，分区存储下可用）；安装器经 FileProvider content URI 授权直读。注意 `setDestinationUri` 只接受 `file://`，传 `content://`（MediaStore 目标）会抛 `IllegalArgumentException` —— 这正是 v1.4.8 修复的「点立即更新闪退」根因，勿回退为 MediaStore 目标
 - UI：ViewBinding + RecyclerView（DiffUtil 后台差分刷新）
 - 构建：AGP + Kotlin DSL (Gradle)，GitHub Actions CI 自动构建
@@ -81,6 +84,8 @@
 
 > 早期版本使用 `fallbackToDestructiveMigration(dropAllTables = true)`，在升版本忘记写迁移时会静默删除全部用户数据。该兜底已移除，改为构建/运行期显式暴露。
 
+同理，**加载失败不会被当成永久状态**：`PlayerRepository.ensureLoaded` 在失败后会重新发起加载（写入路径按 30 秒冷却重试，避免库永久损坏时被 2 秒一次的进度写反复触发重建），`awaitLoaded` 返回失败结果供界面提示，写入不再被静默丢弃。
+
 ### 签名（Release）
 
 Release 签名信息按优先级取自：
@@ -93,6 +98,13 @@ Release 签名信息按优先级取自：
 ### CI
 
 `.github/workflows/build.yml`：push 到 `main` 或打 `v*` tag 时依次执行**单元测试 → lint → 构建签名 Release APK**（前两步失败即中止，回归不会进入产物）；PR 构建在无 Secrets 时回退无签名构建。
+
+### 发布新版本
+
+1. 递增 `app/build.gradle.kts` 的 `versionCode` 与 `versionName`；
+2. 更新仓库根 `version.json`（`version` / `apkUrl` / `notes`）：它是应用内更新在 GitHub API 不可达时的回退源，`apkUrl` 必须指向本次 tag 的 Release 资产，否则「立即更新」会 404；
+3. 提交并推送 `main`，再推送与 `versionName` 同名的 `v<版本>` tag（CI 的 Release job 只在 `v*` tag 上触发）；
+4. CI 自动构建**签名** Release APK 并创建 GitHub Release，资产名 `player-v<版本>-release.apk`。
 
 ## 安装
 
@@ -109,7 +121,7 @@ app/src/main/java/com/example/player/
 └── UpdateManager.kt                 # 应用内更新检查（GitHub Releases / jsDelivr 兜底）+ 下载与安装流程
 
 app/src/test/java/com/example/player/
-└── PlayerTests.kt                   # 进度合并语义 / 旧数据迁移 / 时长格式化 / 列表高亮越界防护 / 版本比较
+└── PlayerTests.kt                   # 进度合并语义 / 进度末尾裁决 / 旧数据迁移 / 时长格式化 / 列表高亮越界防护 / 版本比较 / 更新下载源顺序
 
 app/schemas/com.example.player.PlayerDatabase/
 └── 1.json                           # Room 导出的 schema（须提交，作为后续 Migration 的 diff 基准）

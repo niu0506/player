@@ -1,5 +1,5 @@
 {
-  "version": "1.5.0",
-  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.5.0/player-v1.5.0-release.apk",
-  "notes": "修复回前台后倍速按钮文案与真实播放速度不一致的问题；数据库升版本漏写迁移时不再静默清空播放列表与进度，改为明确报错以便发现；全部界面文案抽取为资源；CI 增加单元测试与静态检查门禁。"
+  "version": "1.5.1",
+  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.5.1/player-v1.5.1-release.apk",
+  "notes": "修复单曲循环时每轮只重复片尾最后几秒的问题：进度写入新增末尾容差（距末尾 5 秒内视为已看完），单曲回绕不再回跳片尾。更新包下载改为 GitHub 直连优先、CDN 反代加速兜底，并增加产物校验，反代返回 200 加错误页或残包时自动换源。GitHub API 返回非 JSON（代理、强制门户、DNS 劫持）时不再中断 jsDelivr 兜底。数据库加载失败不再成为永久状态，后续写入也不再被静默丢弃：失败会按需重试并提示用户。"
 }

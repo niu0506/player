@@ -38,6 +38,8 @@
     <string name="toast_deleted">已删除</string>
     <string name="toast_permission_granted">权限已授予，请点击扫描</string>
     <string name="toast_scan_failed">扫描失败，请稍后重试</string>
+    <!-- 本地数据库加载失败：列表/进度暂不可用，改动可能无法保存 -->
+    <string name="toast_repository_load_failed">本地数据加载失败，播放列表与进度暂时不可用（将自动重试）</string>
     <string name="toast_no_new_media">没有新文件</string>
     <string name="toast_scan_removed">删除 %1$d 个已消失文件</string>
     <string name="toast_scan_added">添加 %1$d 个文件</string>

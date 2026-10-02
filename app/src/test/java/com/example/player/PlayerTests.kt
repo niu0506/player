@@ -90,6 +90,80 @@ class PlaybackProgressTest {
     }
 }
 
+/**
+ * 进度写入裁决测试：末尾容差内视为「已看完」（回归：单曲循环只重复片尾）。
+ *
+ * 周期落盘的采样点几乎必然落在末尾几秒内；若只把「位置 ≥ 总时长」当播完，
+ * 这个接近末尾的值会被当成断点存下来——REPEAT_MODE_ONE 回绕时位置已归 0
+ * （判 Skip，抹不掉旧值），于是每一轮都被 seek 回片尾。
+ */
+class ProgressDecisionTest {
+
+    private val duration = 180_000L
+
+    @Test
+    fun `position well before end is stored`() {
+        assertEquals(ProgressWriteDecision.Store(60_000L), decideProgressWrite(60_000, duration))
+    }
+
+    @Test
+    fun `position inside tail is treated as finished`() {
+        // 178s / 180s：距末尾 2s，落在 5s 容差内
+        assertEquals(ProgressWriteDecision.Clear, decideProgressWrite(duration - 2_000, duration))
+    }
+
+    @Test
+    fun `exact end and beyond are finished`() {
+        assertEquals(ProgressWriteDecision.Clear, decideProgressWrite(duration, duration))
+        assertEquals(ProgressWriteDecision.Clear, decideProgressWrite(duration + 1, duration))
+    }
+
+    @Test
+    fun `zero position is skipped rather than cleared`() {
+        assertEquals(ProgressWriteDecision.Skip, decideProgressWrite(0, duration))
+    }
+
+    @Test
+    fun `unknown duration keeps legacy semantics`() {
+        assertEquals(ProgressWriteDecision.Skip, decideProgressWrite(0, 0))
+        assertEquals(ProgressWriteDecision.Store(5_000L), decideProgressWrite(5_000, 0))
+        assertEquals(ProgressWriteDecision.Store(5_000L), decideProgressWrite(5_000, -1))
+    }
+
+    @Test
+    fun `tail is capped at ten percent of short media`() {
+        // 10s 媒体：容差取 1s（而非 5s），阈值 9.0s，避免整段被当成「已看完」
+        assertFalse(isProgressFinished(8_900, 10_000))
+        assertTrue(isProgressFinished(9_000, 10_000))
+    }
+}
+
+/** 更新包下载源顺序测试：直连在前、反代兜底 */
+class DownloadSourceOrderTest {
+
+    private val apk =
+        "https://github.com/niu0506/player/releases/download/v1.5.0/player-v1.5.0-release.apk"
+    private val accelerators = listOf("https://gh-proxy.com/", "https://ghproxy.net")
+
+    @Test
+    fun `direct url comes first`() {
+        assertEquals(apk, orderedDownloadUrls(apk, accelerators).first())
+    }
+
+    @Test
+    fun `accelerators follow as fallback with normalized prefix`() {
+        assertEquals(
+            listOf(apk, "https://gh-proxy.com/$apk", "https://ghproxy.net/$apk"),
+            orderedDownloadUrls(apk, accelerators)
+        )
+    }
+
+    @Test
+    fun `without accelerators only the direct url remains`() {
+        assertEquals(listOf(apk), orderedDownloadUrls(apk, emptyList()))
+    }
+}
+
 /** 旧 SharedPreferences 迁移解析测试：null/空/坏 JSON、进度 >0 过滤、列表去重 */
 class LegacyPrefsMigrationTest {
 

@@ -208,7 +208,12 @@ class MainActivity : AppCompatActivity() {
             }
             currentIndex = controller?.currentMediaItemIndex ?: -1
             syncAdapterPlayingState()
-            restoreProgressIfNeeded()
+            // REPEAT（单曲回绕）跳过恢复：此刻位置已归 0，而仓库里仍是末次 tick 落下的
+            // 「接近末尾」值，恢复会把每一轮都 seek 回片尾（表现为只重复最后几秒）。
+            // 正常切项/冷启动才需要断点续播。
+            if (reason != Player.MEDIA_ITEM_TRANSITION_REASON_REPEAT) {
+                restoreProgressIfNeeded()
+            }
         }
 
         override fun onIsPlayingChanged(isPlaying: Boolean) {
@@ -312,13 +317,18 @@ class MainActivity : AppCompatActivity() {
     private fun resolveResumePosition(item: MediaItemData): Long =
         PlayerRepository.getProgress(item.uri.toString()) ?: 0L
 
-    /** 当前项有保存进度（>0）则 seek 到该位置，实现断点续播 */
+    /**
+     * 当前项有保存进度则 seek 到该位置，实现断点续播。
+     * 进度落在末尾容差内视为已看完（不回跳，否则会从末尾续播）；
+     * 时长未知时无从判断，按原样恢复。
+     */
     private fun restoreProgressIfNeeded() {
         val ctrl = controller ?: return
         val index = ctrl.currentMediaItemIndex
         if (index < 0 || index >= playlist.size) return
-        val savedPos = resolveResumePosition(playlist[index])
-        if (savedPos > 0) {
+        val item = playlist[index]
+        val savedPos = resolveResumePosition(item)
+        if (savedPos > 0 && !isProgressFinished(savedPos, item.duration)) {
             ctrl.seekTo(savedPos)
         }
     }
@@ -332,7 +342,11 @@ class MainActivity : AppCompatActivity() {
         if (idx !in playlist.indices) return
         // 不因「下标为 0」提前 return：冷启动重建队列时下标 0 是默认值，须走 seekTo 才恢复断点
         val pos = resolveResumePosition(playlist[idx])
-        if (pos > 0) ctrl.seekTo(idx, pos) else ctrl.seekToDefaultPosition(idx)
+        if (pos > 0 && !isProgressFinished(pos, playlist[idx].duration)) {
+            ctrl.seekTo(idx, pos)
+        } else {
+            ctrl.seekToDefaultPosition(idx)
+        }
         currentIndex = idx
         syncAdapterPlayingState()
     }
@@ -573,7 +587,8 @@ class MainActivity : AppCompatActivity() {
                     PlayerService.flushCurrentPosition()
                     val item = playlist[index]
                     val pos = resolveResumePosition(item)
-                    if (pos > 0 && (item.duration !in 1..pos)) {
+                    // 末尾容差内的进度视为已看完：从默认位置起播，不回跳末尾
+                    if (pos > 0 && !isProgressFinished(pos, item.duration)) {
                         controller?.seekTo(index, pos)
                     } else {
                         controller?.seekToDefaultPosition(index)
@@ -675,18 +690,28 @@ class MainActivity : AppCompatActivity() {
             syncSpeedLabel()
             syncAdapterPlayingState()
             lifecycleScope.launch {
-                // 失败已在仓库内部处理（日志 + 镜像重置为空），不吞 CancellationException
-                PlayerRepository.awaitLoaded(this@MainActivity)
+                // 失败已在仓库内部处理（日志 + 镜像重置为空 + 允许后续重试），不吞 CancellationException
+                val loaded = PlayerRepository.awaitLoaded(this@MainActivity)
                 // MediaController release 后调用方法为静默 no-op（不抛异常），协程在挂起点
                 // 被 onStop 跨越后若继续操作已 release 的 ctrl 会静默失效，甚至与新 onStart
                 // 的协程重复执行自愈/恢复；故每个挂起点恢复后须重新校验有效性
                 if (controllerFuture !== future || controller !== ctrl) return@launch
-                if (!playlistLoaded) {
-                    loadPlaylist()
-                    playlistLoaded = true
-                } else {
+                when {
+                    // 加载失败：明确告知用户（而不是让后续改动被静默丢弃），
+                    // 保持 playlistLoaded=false，下次回前台会重新加载
+                    !loaded -> Toast.makeText(
+                        this@MainActivity,
+                        R.string.toast_repository_load_failed,
+                        Toast.LENGTH_LONG
+                    ).show()
+
+                    !playlistLoaded -> {
+                        loadPlaylist()
+                        playlistLoaded = true
+                    }
+
                     // 回前台：进度权威值已在仓库镜像，无需对账，仅刷新可见行展示
-                    adapter.refreshAllProgress()
+                    else -> adapter.refreshAllProgress()
                 }
                 // 回前台静默对账：等列表加载完后再扫，并等对账完成再走后续自愈/恢复
                 scanLocalMediaSuspend(silent = true)
@@ -729,6 +754,12 @@ class MainActivity : AppCompatActivity() {
         super.onPause()
         // 进度只在 onPause 存：离开前台必先 onPause 再 onStop；弹窗/透明 Activity 只触发 onPause
         saveCurrentProgress()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // 更新检查期间切走再切回：补弹被挂起的「发现新版本」提示（弹窗只在 resumed 时创建）
+        updateManager.resumePendingUpdateDialog()
     }
 
     override fun onUserLeaveHint() {

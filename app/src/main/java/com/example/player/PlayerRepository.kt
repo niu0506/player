@@ -229,6 +229,20 @@ object PlayerRepository {
     private var loadJob: Deferred<Unit>? = null
     private val loadLock = Any()
 
+    /** 应用上下文（[ensureLoaded] 捕获，供写入路径在加载失败后自行重试加载） */
+    @Volatile
+    private var appContext: Context? = null
+
+    /** 最近一次加载发起时刻（单调时钟毫秒），用于失败重试冷却 */
+    @Volatile
+    private var lastLoadAttemptMs = 0L
+
+    /**
+     * 加载失败后的自动重试冷却：失败可能是永久性的（如迁移报错），
+     * 没有冷却会被 2 秒一次的进度写任务反复触发「重建数据库 + 失败」。
+     */
+    private const val LOAD_RETRY_COOLDOWN_MS = 30_000L
+
     /** 内存镜像：不可变快照 + copy-on-write，读方永远见一致状态 */
     @Volatile
     private var playlistState: List<MediaItemData> = emptyList()
@@ -243,28 +257,35 @@ object PlayerRepository {
     @Volatile
     private var loadSucceeded = false
 
-    /** 启动一次性加载（幂等），由 PlayerApp.onCreate 触发 */
+    /**
+     * 启动一次性加载（幂等）。已成功或正在进行时不重复；
+     * **上一次失败则重新发起**——失败若成为终态，[dispatchWrite] 会永远命中失败结果，
+     * 把用户的进度与列表改动静默丢弃（库损坏/瞬时 I/O 报错本可恢复）。
+     */
     fun ensureLoaded(context: Context) {
+        appContext = context.applicationContext
         synchronized(loadLock) {
-            if (loadJob == null) {
-                val appCtx = context.applicationContext
-                loadJob = persistScope.async { loadInternal(appCtx) }
-            }
+            val running = loadJob?.isCompleted == false
+            if (!running && !loadSucceeded) restartLoadLocked()
         }
     }
 
-    /** 等待加载完成；失败时日志并重置镜像为空，绝不向外抛（避免启动闪退） */
-    suspend fun awaitLoaded(context: Context) {
+    /**
+     * 等待加载完成；失败返回 false，绝不向外抛（避免启动闪退）。
+     * 失败时日志并重置镜像为空，但**不把失败当终态**：下一次 [ensureLoaded]/[awaitLoaded]
+     * 会重新尝试加载，调用方可据此提示用户。
+     */
+    suspend fun awaitLoaded(context: Context): Boolean {
         ensureLoaded(context)
-        val failure = loadJob!!.awaitOrNull()
-        if (failure != null) {
-            Log.e(TAG, "数据库加载失败，内存镜像已重置为空", failure)
-            synchronized(stateLock) {
-                playlistState = emptyList()
-                progressState = emptyMap()
-                lastItemState = null
-            }
+        val job = synchronized(loadLock) { loadJob } ?: return false
+        val failure = job.awaitOrNull() ?: return true
+        Log.e(TAG, "数据库加载失败，内存镜像已重置为空（下次调用会重试）", failure)
+        synchronized(stateLock) {
+            playlistState = emptyList()
+            progressState = emptyMap()
+            lastItemState = null
         }
+        return false
     }
 
     // ---- 同步读（加载后调用；返回不可变快照） ----
@@ -346,7 +367,9 @@ object PlayerRepository {
      * 写任务调度：一次性加载成功后，[memPart]（镜像更新，须在 [stateLock] 内执行）
      * 在调用线程同步完成、写方法返回即对读方可见，[dbPart] 按提交顺序进入
      * persistScope 异步落库；加载尚未完成则两段一起排队到加载后执行
-     * （防镜像先写、随后被加载结果覆盖）；加载失败则丢弃该写，防半加载合并。
+     * （防镜像先写、随后被加载结果覆盖）。
+     * 加载失败时**不静默丢弃**：先按冷却策略重试一次加载，成功了照常落盘；
+     * 仍失败才放弃本次写入，并留明确日志（加载失败已由 [awaitLoaded] 返回值告知 UI）。
      * 注：跨越加载完成边界的两次同键写，镜像合并顺序可能与提交顺序相反
      * （仅进程启动瞬间的极窄窗口），DB 侧仍严格按提交序、重启后以 DB 为准，可接受。
      * loadJob 由 PlayerApp 进程启动即经 [ensureLoaded] 保证非空，兜底分支仅作防御。
@@ -362,12 +385,49 @@ object PlayerRepository {
             persistScope.launch { persist(dbPart) }
         } else {
             persistScope.launch {
-                if (job.awaitOrNull() != null) return@launch
+                if (job.awaitOrNull() != null && !reloadAfterFailure()) {
+                    Log.e(TAG, "数据库加载失败且重试未成功，本次写入未落盘")
+                    return@launch
+                }
                 synchronized(stateLock) { memPart() }
                 persist(dbPart)
             }
         }
     }
+
+    /**
+     * 加载失败后的补救：等（或按冷却期重新发起）一次加载。
+     * 冷却期内已有重试在跑时直接等它，避免并发写各自重启加载。
+     * @return true 表示当下镜像可用（调用方可继续落盘）
+     */
+    private suspend fun reloadAfterFailure(): Boolean {
+        val job = synchronized(loadLock) {
+            if (loadSucceeded) return true
+            val running = loadJob?.isCompleted == false
+            if (!running && nowMs() - lastLoadAttemptMs >= LOAD_RETRY_COOLDOWN_MS) {
+                restartLoadLocked()
+            }
+            loadJob
+        } ?: return false
+        return job.awaitOrNull() == null
+    }
+
+    /** 须在 [loadLock] 内：丢弃失败的加载任务与其数据库实例，重新发起一次加载 */
+    private fun restartLoadLocked() {
+        val ctx = appContext ?: return
+        loadJob = null
+        loadSucceeded = false
+        try {
+            db?.close()
+        } catch (_: Exception) {
+        }
+        db = null
+        lastLoadAttemptMs = nowMs()
+        loadJob = persistScope.async { loadInternal(ctx) }
+    }
+
+    /** 单调时钟毫秒（不依赖系统时间，避免时钟回拨让冷却失效） */
+    private fun nowMs(): Long = System.nanoTime() / 1_000_000
 
     /** 单个写任务的 DB 段落：锁 + 事务，写失败只记日志不上抛（内存已更新） */
     private suspend fun persist(block: suspend PlayerDatabase.() -> Unit) {
@@ -438,12 +498,27 @@ internal sealed interface ProgressWriteDecision {
     data object Skip : ProgressWriteDecision
 }
 
+/** 末尾容差上限：距总时长 5 秒以内即视为播完（同时不超过总时长 10%，短媒体不被整段吞掉） */
+internal const val PROGRESS_FINISH_TAIL_MS = 5_000L
+
+/**
+ * 「进度已到末尾」判定（唯一权威实现）：距末尾 [PROGRESS_FINISH_TAIL_MS] 以内视为已看完。
+ * 周期落盘的采样点几乎必然落在末尾几秒内，若只把「位置 ≥ 总时长」当播完，
+ * 这个「接近末尾」的值会被当成断点存下来：重启后从末尾续播，单曲循环时每轮回绕
+ * 都被 seek 回片尾（表现为只重复片尾的几秒）。
+ */
+internal fun isProgressFinished(positionMs: Long, durationMs: Long): Boolean {
+    if (durationMs <= 0) return false
+    val tail = minOf(PROGRESS_FINISH_TAIL_MS, durationMs / 10)
+    return positionMs >= durationMs - tail
+}
+
 /**
  * 进度写入判定纯函数（唯一权威实现，调用方据此裁决不各自漂移）：
- * 播到末尾→Clear；位置<=0→Skip；其余→Store。
+ * 播到末尾（含末尾容差）→Clear；位置<=0→Skip；其余→Store。
  */
 internal fun decideProgressWrite(positionMs: Long, durationMs: Long): ProgressWriteDecision {
-    if (durationMs in 1..positionMs) return ProgressWriteDecision.Clear
+    if (isProgressFinished(positionMs, durationMs)) return ProgressWriteDecision.Clear
     if (positionMs <= 0) return ProgressWriteDecision.Skip
     return ProgressWriteDecision.Store(positionMs)
 }
