@@ -1,8 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- FileProvider 路径声明：更新包下载至应用外部私有 Download 目录（getExternalFilesDir(DIRECTORY_DOWNLOADS)），
-     经此暴露给系统安装器（私有目录全版本免存储权限，分区存储下可用） -->
+
 <paths xmlns:android="http://schemas.android.com/apk/res/android">
-    <!-- 应用外部私有 Download 目录 -->
+    
     <external-files-path
         name="app_download"
         path="Download/" />

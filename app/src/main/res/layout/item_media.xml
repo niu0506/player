@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- 单个播放列表项的布局：主行(序号/播放动画 + 名称 + 时长 + 删除) + 进度行 -->
+
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:id="@+id/item_root"
     android:layout_width="match_parent"
@@ -16,7 +16,6 @@
         android:orientation="horizontal"
         android:gravity="center_vertical">
 
-        <!-- 序号与正在播放动画，两者互斥（播放时显示动画） -->
         <FrameLayout
             android:layout_width="24dp"
             android:layout_height="24dp">
@@ -40,7 +39,6 @@
                 android:contentDescription="@string/playing_indicator" />
         </FrameLayout>
 
-        <!-- 媒体名称（超长时从中间省略） -->
         <TextView
             android:id="@+id/tv_name"
             android:layout_width="0dp"
@@ -60,7 +58,6 @@
             android:textSize="12sp"
             android:textColor="@color/text_secondary" />
 
-        <!-- 删除按钮 -->
         <ImageView
             android:id="@+id/btn_delete"
             android:layout_width="32dp"
@@ -72,7 +69,6 @@
             android:contentDescription="@string/delete" />
     </LinearLayout>
 
-    <!-- 进度行：进度条 + 进度文本（仅在已存有 progress 时由代码显示） -->
     <LinearLayout
         android:id="@+id/progress_row"
         android:layout_width="match_parent"

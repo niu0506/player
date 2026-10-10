@@ -48,7 +48,8 @@
 - 语言：Kotlin
 - 最低支持 / 目标版本：minSdk 24 / targetSdk 35（compileSdk 36，由 media3 1.11 的传递依赖要求）
 - 播放器：androidx.media3 1.11.0（ExoPlayer + MediaSession + MediaController）
-- 架构：前台服务（`PlayerService`）+ 单 Activity（`MainActivity`），经 MediaController 通信；源码扁平化为单包 5 文件，UI 逻辑拆分为 `GestureController`、`FullscreenPipHelper`、`MediaStoreScanner` 等职责类（见 `PlayerUi.kt` / `PlayerRepository.kt` / `UpdateManager.kt`）
+- 架构：前台服务（`PlayerService`）+ 单 Activity（`MainActivity`），经 MediaController 通信；源码扁平化为单包 5 文件，UI 逻辑拆分为 `GestureController`、`FullscreenPipHelper`、`MediaStoreScanner` 等职责类（见 `PlayerUi.kt` / `PlayerRepository.kt` / `UpdateManager.kt`）；依赖版本集中在 `gradle/libs.versions.toml`
+- 控制栏：使用应用自有的尺寸、颜色、样式与图标资源；仅依赖 Media3 文档化的控制视图 ID 和图标属性，避免绑定其私有布局资源
 - 持久化：Room 数据库（播放列表、进度映射、KV 分表存储，统一「合并写」入口；首次启动自动迁移旧 SharedPreferences 数据）；schema 导出至 `app/schemas/` 并纳入版本控制。加载失败**不是终态**：会按需重试（30 秒冷却），失败期间的写入不再被静默丢弃，界面给出提示
 - 更新下载：系统 DownloadManager 写入**应用外部私有** `getExternalFilesDir(DIRECTORY_DOWNLOADS)`（全版本免存储权限，分区存储下可用）；安装器经 FileProvider content URI 授权直读。注意 `setDestinationUri` 只接受 `file://`，传 `content://`（MediaStore 目标）会抛 `IllegalArgumentException` —— 这正是 v1.4.8 修复的「点立即更新闪退」根因，勿回退为 MediaStore 目标
 - UI：ViewBinding + RecyclerView（DiffUtil 后台差分刷新）
@@ -56,7 +57,7 @@
 
 ## 构建
 
-需要 JDK 17+（Gradle 工具链声明为 21，见 `gradle/gradle-daemon-jvm.properties`）与已配置的 Android SDK。
+需要 JDK 21 与已配置的 Android SDK。Gradle daemon 与 GitHub Actions CI 均使用 JDK 21。
 
 ```bash
 # 构建调试版 APK

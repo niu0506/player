@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- 主界面布局：竖屏结构 = 顶部播放器卡片 + 工具栏 + 底部播放列表 -->
+
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
     android:id="@+id/root_layout"
@@ -8,7 +8,6 @@
     android:orientation="vertical"
     android:background="@color/bg_dark">
 
-    <!-- 播放器卡片容器：承载视频画面与手势提示 -->
     <com.google.android.material.card.MaterialCardView
         android:id="@+id/player_card"
         android:layout_width="match_parent"
@@ -23,7 +22,6 @@
         app:cardElevation="0dp"
         app:strokeWidth="0dp">
 
-        <!-- ExoPlayer 播放视图；使用自定义控制栏，3 秒后自动隐藏，TextureView 渲染 -->
         <androidx.media3.ui.PlayerView
             android:id="@+id/player_view"
             android:layout_width="match_parent"
@@ -33,9 +31,21 @@
             app:resize_mode="fit"
             app:surface_type="texture_view"
             app:show_buffering="when_playing"
-            app:controller_layout_id="@layout/custom_player_control_view" />
+            app:controller_layout_id="@layout/custom_player_control_view"
+            app:play_icon="@drawable/player_control_play"
+            app:pause_icon="@drawable/player_control_pause"
+            app:previous_icon="@drawable/player_control_previous"
+            app:next_icon="@drawable/player_control_next"
+            app:rewind_icon="@drawable/player_control_rewind"
+            app:fastforward_icon="@drawable/player_control_fastforward"
+            app:repeat_off_icon="@drawable/player_control_repeat_off"
+            app:repeat_one_icon="@drawable/player_control_repeat_one"
+            app:repeat_all_icon="@drawable/player_control_repeat_all"
+            app:shuffle_off_icon="@drawable/player_control_shuffle_off"
+            app:shuffle_on_icon="@drawable/player_control_shuffle_on"
+            app:fullscreen_enter_icon="@drawable/player_control_fullscreen_enter"
+            app:fullscreen_exit_icon="@drawable/player_control_fullscreen_exit" />
 
-        <!-- 手势反馈浮层：滑动调节亮度/音量/进度、双击快进快退时的提示 -->
         <TextView
             android:id="@+id/gesture_overlay"
             android:layout_width="wrap_content"
@@ -51,7 +61,6 @@
             android:visibility="gone" />
     </com.google.android.material.card.MaterialCardView>
 
-    <!-- 工具栏：标题 + 数量 + 小窗 + 扫描按钮 -->
     <LinearLayout
         android:id="@+id/toolbar_layout"
         android:layout_width="match_parent"
@@ -125,7 +134,6 @@
             android:textColor="@color/text_primary"
             android:textSize="12sp" />
 
-        <!-- 溢出菜单（⋮）：检查更新等更多操作 -->
         <ImageButton
             android:id="@+id/btn_more"
             android:layout_width="32dp"
@@ -138,14 +146,12 @@
             android:contentDescription="@string/check_update" />
     </LinearLayout>
 
-    <!-- 播放列表容器：高度占屏约 3/5；全屏/PiP 时整体隐藏 -->
     <FrameLayout
         android:id="@+id/playlist_container"
         android:layout_width="match_parent"
         android:layout_height="0dp"
         android:layout_weight="1">
 
-        <!-- 播放列表本身 -->
         <androidx.recyclerview.widget.RecyclerView
             android:id="@+id/recycler_playlist"
             android:layout_width="match_parent"
@@ -156,7 +162,6 @@
             android:clipToPadding="false"
             android:overScrollMode="never" />
 
-        <!-- 空列表提示，默认隐藏 -->
         <TextView
             android:id="@+id/tv_empty"
             android:layout_width="wrap_content"

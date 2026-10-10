@@ -1,16 +1,10 @@
 import java.util.Properties
 
 plugins {
-    id("com.android.application")
-    id("com.google.devtools.ksp")
+    alias(libs.plugins.android.application)
+    alias(libs.plugins.ksp)
 }
 
-/**
- * 签名配置来源（二选一，优先级从高到低）：
- * 1. 环境变量：CI(GitHub Actions) 通过 Secrets 注入，本地也可以 export 后覆盖
- * 2. 本地文件 keystore.properties（已加入 .gitignore，不会提交）
- * 两者都没有时 release 构建回退为无签名（输出 *-unsigned.apk）。
- */
 val keystoreProperties = Properties().apply {
     val f = rootProject.file("keystore.properties")
     if (f.exists()) f.inputStream().use { load(it) }
@@ -21,19 +15,19 @@ fun envOrProp(envKey: String, propKey: String): String? =
 
 android {
     namespace = "com.example.player"
-    // media3 1.11 的传递依赖（androidx.core 1.18 等）要求 compileSdk 36+；targetSdk 仍为 35，运行时行为不变
+
     compileSdk = 36
     defaultConfig {
         applicationId = "com.example.player"
         minSdk = 24
         targetSdk = 35
-        versionCode = 36
-        versionName = "1.5.1"
+        versionCode = 37
+        versionName = "1.5.2"
     }
 
     signingConfigs {
         create("release") {
-            // 环境变量优先(CI 注入)，其次本地 keystore.properties
+
             storeFile = System.getenv("KEYSTORE_FILE")?.let { file(it) }
                 ?: keystoreProperties.getProperty("storeFile")?.let { rootProject.file(it) }
             storePassword = envOrProp("KEYSTORE_PASSWORD", "storePassword")
@@ -51,7 +45,7 @@ android {
                 "proguard-rules.pro"
             )
             signingConfig = signingConfigs.getByName("release")
-            // 签名四要素齐备才生效；否则 AGP 回退为无签名产物（构建不失败，便于无密钥环境编译验证）
+
             if (signingConfigs.getByName("release").storeFile == null) {
                 signingConfig = null
             }
@@ -59,7 +53,7 @@ android {
     }
     buildFeatures { viewBinding = true }
     testOptions {
-        // 本地单测中 formatTime 等使用 android.util.LruCache；缺失时返回默认值而非抛异常，便于测试纯逻辑
+
         unitTests.isReturnDefaultValues = true
     }
     compileOptions {
@@ -68,28 +62,23 @@ android {
     }
 }
 
-/**
- * Room schema 导出目录（须提交到版本控制）：
- * 它是编写/校验后续 Migration 的 diff 基准；缺失会让下次改 schema 时无法确认迁移正确性。
- * 与 @Database(exportSchema = true) 配套，改 schema 后由 KSP 自动写出 <version>.json。
- */
 ksp {
     arg("room.schemaLocation", "$projectDir/schemas")
 }
 
 dependencies {
-    implementation("androidx.media3:media3-exoplayer:1.11.0")
-    implementation("androidx.media3:media3-ui:1.11.0")
-    implementation("androidx.media3:media3-session:1.11.0")
-    implementation("androidx.appcompat:appcompat:1.7.0")
-    implementation("androidx.recyclerview:recyclerview:1.4.0")
-    implementation("androidx.activity:activity-ktx:1.13.0")
-    implementation("com.google.android.material:material:1.12.0")
-    testImplementation("junit:junit:4.13.2")
-    // 本地单测中 android.jar 的 org.json 是空 stub（方法全部返回默认值），
-    // Room 迁移解析器与 UpdateChecker 用真实 JSON 序列化，测试需要引入真实现
-    testImplementation("org.json:json:20240303")
-    // Room 持久化：播放列表/播放进度/上次播放项（替代旧 SharedPreferences 存储）
-    implementation("androidx.room:room-runtime:2.8.4")
-    ksp("androidx.room:room-compiler:2.8.4")
+    implementation(libs.media3.exoplayer)
+    implementation(libs.media3.ui)
+    implementation(libs.media3.session)
+    implementation(libs.appcompat)
+    implementation(libs.recyclerview)
+    implementation(libs.activity.ktx)
+    implementation(libs.material)
+    implementation(libs.coroutines.android)
+    testImplementation(libs.junit)
+
+    testImplementation(libs.json)
+
+    implementation(libs.room.runtime)
+    ksp(libs.room.compiler)
 }

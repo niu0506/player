@@ -24,14 +24,17 @@ import androidx.room.Room
 import androidx.room.RoomDatabase
 import androidx.room.Transaction
 import androidx.room.withTransaction
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
-import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -39,27 +42,30 @@ import kotlinx.coroutines.sync.withLock
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.Locale
+import kotlin.time.Duration.Companion.milliseconds
 
-// ==================== 数据模型 ====================
-
-/** 播放列表单个媒体项：仅元信息；进度统一存 uri→positions 映射 */
+/** 一条媒体条目（视频或音频）的运行时数据。 */
 data class MediaItemData(
     val uri: Uri,
     val name: String,
-    /** 总时长（毫秒），扫描时可能未知，播放后回填 */
+    /** 时长(毫秒)，未知时为 0。 */
     val duration: Long = 0L
 )
 
-/** 规整化 Uri 字符串，作为去重/匹配的稳定 key */
+/**
+ * 生成用于去重/索引的规范化 uri 键：
+ * 去掉查询参数与结尾斜杠，并拼接最后一段路径，尽量保证同一文件稳定唯一。
+ */
 fun normalizeUri(uri: Uri): String {
     val base = uri.buildUpon().clearQuery().build().toString().trimEnd('/')
     val lastSeg = uri.lastPathSegment ?: base
     return "$base|$lastSeg"
 }
 
-/** 毫秒格式化时长文本（"12:34"/"1:02:03"），结果按值缓存 */
+/** 时间格式化结果的 LRU 缓存，避免列表滚动时重复计算。 */
 private val timeFormatCache = LruCache<Long, String>(512)
 
+/** 把毫秒格式化为 mm:ss 或 h:mm:ss。 */
 fun formatTime(ms: Long): String {
     timeFormatCache.get(ms)?.let { return it }
     val totalSec = ms / 1000
@@ -72,18 +78,16 @@ fun formatTime(ms: Long): String {
     return result
 }
 
-// ==================== 本地媒体库扫描 ====================
-
-/** MediaStore 查询与权限判定，只负责读，合并/对账由上层编排 */
+/** 通过 MediaStore 扫描设备上的视频与音频。 */
 class MediaStoreScanner(private val context: Context) {
 
-    /** 查询全部视频（按名称升序）；失败返回 null */
+    /** 查询设备视频，失败返回 null。 */
     fun queryVideos(): List<MediaItemData>? = query(MediaStore.Video.Media.EXTERNAL_CONTENT_URI)
 
-    /** 查询全部音频（按名称升序）；失败返回 null */
+    /** 查询设备音频，失败返回 null。 */
     fun queryAudios(): List<MediaItemData>? = query(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI)
 
-    /** 查询 MediaStore；失败返回 null（与「空结果」区分，避免被当作误删） */
+    /** 按内容 uri 执行查询，返回 id/名称/时长列表；异常时返回 null 以区分“无数据”。 */
     private fun query(contentUri: Uri): List<MediaItemData>? {
         val items = mutableListOf<MediaItemData>()
         val projection = arrayOf(
@@ -115,48 +119,55 @@ class MediaStoreScanner(private val context: Context) {
         }
     }
 
-    /** 是否具备全量读取权限（API 34+ 的「仅选中」授权不算），用于删除对账前保护 */
+    /** 是否拥有某种媒体类型的完整读取权限。 */
     fun hasFullMediaAccess(permission: String): Boolean {
-        if (Build.VERSION.SDK_INT < 33) {
-            return ContextCompat.checkSelfPermission(
-                context, android.Manifest.permission.READ_EXTERNAL_STORAGE
-            ) == PackageManager.PERMISSION_GRANTED
-        }
-        return ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED
+        return hasMediaReadAccess(context, permission, includePartial = false)
     }
 }
 
-// ==================== Room 持久化层 ====================
-
 /**
- * 持久化层：Room 数据库 + 内存镜像。
- * 读走内存镜像（主线程同步可见）；一次性加载完成后，写在调用线程锁内同步更新镜像
- * （写方法返回即对读方可见），DB 段按提交顺序异步落库；加载完成前的写整体排队到加载后执行。
+ * 判断是否拥有媒体读取权限。
+ * Android 13 以下使用 READ_EXTERNAL_STORAGE；
+ * Android 13+ 使用传入的分类型权限；Android 14+ 还支持“仅选择部分照片/视频”的部分授权。
  */
+fun hasMediaReadAccess(context: Context, permission: String, includePartial: Boolean): Boolean {
+    if (Build.VERSION.SDK_INT < 33) {
+        return ContextCompat.checkSelfPermission(
+            context, android.Manifest.permission.READ_EXTERNAL_STORAGE
+        ) == PackageManager.PERMISSION_GRANTED
+    }
+    val full = ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED
+    return full || (includePartial && Build.VERSION.SDK_INT >= 34 &&
+        ContextCompat.checkSelfPermission(
+            context, android.Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED
+        ) == PackageManager.PERMISSION_GRANTED)
+}
 
-/** 播放列表条目（sortOrder 维护顺序） */
+/** 播放列表项（Room 实体）。 */
 @Entity(tableName = "playlist")
 data class PlaylistItemEntity(
     @PrimaryKey val uri: String,
     val name: String,
     val duration: Long,
+    /** 列表中的排序序号。 */
     val sortOrder: Int,
 )
 
-/** 播放进度（uri → 位置毫秒），断点续播的唯一数据源 */
+/** 播放进度（Room 实体）：uri -> 位置(毫秒)。 */
 @Entity(tableName = "progress")
 data class ProgressEntity(
     @PrimaryKey val uri: String,
     val positionMs: Long,
 )
 
-/** 轻量键值存储：上次播放项、迁移标记等 */
+/** 通用键值对（Room 实体），用于保存“上次播放项”等状态。 */
 @Entity(tableName = "kv")
 data class KvEntity(
     @PrimaryKey @ColumnInfo(name = "key") val key: String,
     val value: String?,
 )
 
+/** 播放列表数据访问对象。 */
 @Dao
 interface PlaylistDao {
     @Query("SELECT * FROM playlist ORDER BY sortOrder ASC")
@@ -168,7 +179,7 @@ interface PlaylistDao {
     @Query("DELETE FROM playlist")
     suspend fun clear()
 
-    /** 全量替换：clear + insert 原子完成 */
+    /** 事务内整体替换播放列表（先清空再插入）。 */
     @Transaction
     suspend fun replaceAll(items: List<PlaylistItemEntity>) {
         clear()
@@ -176,6 +187,7 @@ interface PlaylistDao {
     }
 }
 
+/** 播放进度数据访问对象。 */
 @Dao
 interface ProgressDao {
     @Query("SELECT * FROM progress")
@@ -188,6 +200,7 @@ interface ProgressDao {
     suspend fun deleteAll(uris: Set<String>)
 }
 
+/** 键值对数据访问对象。 */
 @Dao
 interface KvDao {
     @Query("SELECT value FROM kv WHERE `key` = :key")
@@ -197,6 +210,7 @@ interface KvDao {
     suspend fun put(entry: KvEntity)
 }
 
+/** 应用 Room 数据库，包含播放列表、进度与键值对三张表。 */
 @Database(
     entities = [PlaylistItemEntity::class, ProgressEntity::class, KvEntity::class],
     version = 1,
@@ -208,60 +222,70 @@ abstract class PlayerDatabase : RoomDatabase() {
     abstract fun kvDao(): KvDao
 }
 
-// ---------- 仓库 ----------
-
+/**
+ * 播放数据仓库（单例）。
+ *
+ * 采用“内存镜像 + 异步落盘”的模式：读操作直接读内存镜像（[playlistState] /
+ * [progressState] / [lastItemState]），写操作先更新内存镜像，再在单线程作用域内
+ * 串行写数据库；数据库加载失败时会重置内存镜像并在冷却后自动重试。
+ */
 object PlayerRepository {
     private const val TAG = "PlayerRepository"
     private const val DB_NAME = "player.db"
-    /** 旧版 SharedPreferences 文件名（仅一次性迁移用） */
+
+    // 旧版使用 SharedPreferences 存储，这里定义用于一次性迁移到 Room 的键名
     private const val LEGACY_PREFS = "player"
     private const val KEY_LAST_ITEM = "lastItem"
     private const val KEY_MIGRATED = "migratedFromPrefs"
 
-    /** 单线程 dispatcher + 公正互斥锁，保证写序 = 调用序 */
-    @OptIn(ExperimentalCoroutinesApi::class)
+    /** 串行落盘作用域：限制并发为 1，保证写库顺序。 */
     private val persistScope =
         CoroutineScope(SupervisorJob() + Dispatchers.IO.limitedParallelism(1))
+
+    /** 保护数据库事务的互斥锁。 */
     private val writeMutex = Mutex()
+
+    /** 写盘失败通知通道，供界面层监听并提示。 */
+    private val writeFailureChannel = Channel<WriteFailure>(Channel.BUFFERED)
+    val writeFailures: Flow<WriteFailure> = writeFailureChannel.receiveAsFlow()
+
+    /** 保护内存镜像状态的锁。 */
     private val stateLock = Any()
 
     private var db: PlayerDatabase? = null
     private var loadJob: Deferred<Unit>? = null
     private val loadLock = Any()
 
-    /** 应用上下文（[ensureLoaded] 捕获，供写入路径在加载失败后自行重试加载） */
+    /** 应用上下文（Application），用于数据库与 SharedPreferences。 */
     @Volatile
     private var appContext: Context? = null
 
-    /** 最近一次加载发起时刻（单调时钟毫秒），用于失败重试冷却 */
     @Volatile
     private var lastLoadAttemptMs = 0L
 
-    /**
-     * 加载失败后的自动重试冷却：失败可能是永久性的（如迁移报错），
-     * 没有冷却会被 2 秒一次的进度写任务反复触发「重建数据库 + 失败」。
-     */
+    /** 加载失败后的重试冷却时间。 */
     private const val LOAD_RETRY_COOLDOWN_MS = 30_000L
 
-    /** 内存镜像：不可变快照 + copy-on-write，读方永远见一致状态 */
+    /** 播放列表内存镜像。 */
     @Volatile
     private var playlistState: List<MediaItemData> = emptyList()
 
+    /** 播放进度内存镜像：uri -> 位置(毫秒)。 */
     @Volatile
     private var progressState: Map<String, Long> = emptyMap()
 
+    /** “上次播放项”内存镜像。 */
     @Volatile
     private var lastItemState: String? = null
 
-    /** 一次性加载是否已成功完成；完成后写方法在调用线程同步更新镜像 */
+    /** 写盘失败信息。 */
+    data class WriteFailure(val message: String)
+
+    /** 数据库是否已成功加载。 */
     @Volatile
     private var loadSucceeded = false
 
-    /**
-     * 启动一次性加载（幂等）。已成功或正在进行时不重复；
-     * **上一次失败则重新发起**——失败若成为终态，[dispatchWrite] 会永远命中失败结果，
-     * 把用户的进度与列表改动静默丢弃（库损坏/瞬时 I/O 报错本可恢复）。
-     */
+    /** 确保数据库已开始加载（幂等）：尚未成功且无进行中的加载时，触发一次加载。 */
     fun ensureLoaded(context: Context) {
         appContext = context.applicationContext
         synchronized(loadLock) {
@@ -271,9 +295,8 @@ object PlayerRepository {
     }
 
     /**
-     * 等待加载完成；失败返回 false，绝不向外抛（避免启动闪退）。
-     * 失败时日志并重置镜像为空，但**不把失败当终态**：下一次 [ensureLoaded]/[awaitLoaded]
-     * 会重新尝试加载，调用方可据此提示用户。
+     * 等待数据库加载完成。
+     * 返回是否加载成功；失败时会清空内存镜像，便于下次调用重试。
      */
     suspend fun awaitLoaded(context: Context): Boolean {
         ensureLoaded(context)
@@ -288,47 +311,66 @@ object PlayerRepository {
         return false
     }
 
-    // ---- 同步读（加载后调用；返回不可变快照） ----
-
+    /** 读取播放列表内存镜像。 */
     fun getPlaylist(): List<MediaItemData> = playlistState
 
+    /** 读取某 uri 的进度，无记录返回 null。 */
     fun getProgress(uri: String): Long? = progressState[uri]
 
+    /** 读取上次播放项 uri。 */
     fun getLastItem(): String? = lastItemState
 
-    // ---- 写：加载完成后内存同步更新（调用线程），DB 按调用顺序异步落库 ----
-
-    /** 批量更新进度：先剔除 [removes]，再合并 [writes]（仅 >0，0 不覆盖） */
-    fun applyProgressUpdates(writes: Map<String, Long>, removes: Set<String> = emptySet()) {
-        if (writes.isEmpty() && removes.isEmpty()) return
+    /**
+     * 应用一批进度更新：先合并进内存镜像，再异步落盘。
+     * @param writes 需要写入的 uri -> 位置
+     * @param removes 需要删除的 uri 集合
+     * @param onPersisted 落盘完成回调，参数表示是否成功
+     */
+    fun applyProgressUpdates(
+        writes: Map<String, Long>,
+        removes: Set<String> = emptySet(),
+        onPersisted: (Boolean) -> Unit = {}
+    ) {
+        if (writes.isEmpty() && removes.isEmpty()) {
+            onPersisted(true)
+            return
+        }
         val writesSnapshot = writes.toMap()
         val removesSnapshot = removes.toSet()
-        var delta: List<ProgressEntity> = emptyList()
         dispatchWrite(
-            memPart = { delta = mergeProgressLocked(writesSnapshot, removesSnapshot) },
+            // 内存部分：合并进度
+            memPart = { mergeProgressLocked(writesSnapshot, removesSnapshot) },
+            // 数据库部分：先删除再写入
             dbPart = {
                 if (removesSnapshot.isNotEmpty()) progressDao().deleteAll(removesSnapshot)
-                if (delta.isNotEmpty()) progressDao().upsertAll(delta)
+
+                // 仅写入正数进度（0 视为无进度）
+                val rows = writesSnapshot.filterValues { it > 0 }
+                    .map { ProgressEntity(it.key, it.value) }
+                if (rows.isNotEmpty()) progressDao().upsertAll(rows)
+            },
+            onComplete = onPersisted
+        )
+    }
+
+    /** 保存整个播放列表：更新内存镜像并异步落盘。 */
+    fun savePlaylist(items: List<MediaItemData>) {
+        val itemsSnapshot = items.toList()
+        dispatchWrite(
+            memPart = {
+                playlistState = itemsSnapshot
+            },
+            dbPart = {
+                // 按顺序生成带 sortOrder 的实体并整体替换
+                val entities = itemsSnapshot.mapIndexed { i, it ->
+                    PlaylistItemEntity(it.uri.toString(), it.name, it.duration, i)
+                }
+                playlistDao().replaceAll(entities)
             }
         )
     }
 
-    /** 全量替换播放列表；进度统一经 [applyProgressUpdates] 写入，不再借列表落盘搭车 */
-    fun savePlaylist(items: List<MediaItemData>) {
-        val itemsSnapshot = items.toList()
-        var entities: List<PlaylistItemEntity> = emptyList()
-        dispatchWrite(
-            memPart = {
-                playlistState = itemsSnapshot
-                entities = itemsSnapshot.mapIndexed { i, it ->
-                    PlaylistItemEntity(it.uri.toString(), it.name, it.duration, i)
-                }
-            },
-            dbPart = { playlistDao().replaceAll(entities) }
-        )
-    }
-
-    /** 记录上次播放项 uri（供冷启动恢复定位） */
+    /** 记录“上次播放项”。 */
     fun setLastItem(uri: String) {
         dispatchWrite(
             memPart = { lastItemState = uri },
@@ -336,24 +378,21 @@ object PlayerRepository {
         )
     }
 
-    /** 等待一次性加载与所有已提交写任务落盘（Service 销毁等同步路径用） */
+    /** 等待所有挂起的写任务完成（用于退出前保证落盘）。 */
     suspend fun flush() {
         loadJob?.awaitOrNull()
         persistScope.coroutineContext[Job]!!.children.toList().joinAll()
     }
 
-    // ---- 内部实现 ----
-
-    /** 进度写公共段落（须在 [stateLock] 内）：更新内存并返回需落库的 >0 增量 */
+    /** 在持锁状态下把更新合并进进度内存镜像。 */
     private fun mergeProgressLocked(
         writes: Map<String, Long>,
         removes: Set<String>
-    ): List<ProgressEntity> {
+    ) {
         progressState = mergeProgressMap(progressState, writes, removes)
-        return writes.filterValues { it > 0 }.map { ProgressEntity(it.key, it.value) }
     }
 
-    /** 等待加载协程：成功返回 null，失败返回异常（取消仍上抛）；不做降级 */
+    /** 等待 Deferred，成功返回 null，失败返回异常（不吞掉取消）。 */
     private suspend fun Deferred<Unit>.awaitOrNull(): Exception? = try {
         await()
         null
@@ -364,42 +403,38 @@ object PlayerRepository {
     }
 
     /**
-     * 写任务调度：一次性加载成功后，[memPart]（镜像更新，须在 [stateLock] 内执行）
-     * 在调用线程同步完成、写方法返回即对读方可见，[dbPart] 按提交顺序进入
-     * persistScope 异步落库；加载尚未完成则两段一起排队到加载后执行
-     * （防镜像先写、随后被加载结果覆盖）。
-     * 加载失败时**不静默丢弃**：先按冷却策略重试一次加载，成功了照常落盘；
-     * 仍失败才放弃本次写入，并留明确日志（加载失败已由 [awaitLoaded] 返回值告知 UI）。
-     * 注：跨越加载完成边界的两次同键写，镜像合并顺序可能与提交顺序相反
-     * （仅进程启动瞬间的极窄窗口），DB 侧仍严格按提交序、重启后以 DB 为准，可接受。
-     * loadJob 由 PlayerApp 进程启动即经 [ensureLoaded] 保证非空，兜底分支仅作防御。
+     * 统一的写入调度：若数据库已就绪则直接更新内存并异步落盘；
+     * 否则等待加载完成（必要时重试）后再执行。
      */
-    private fun dispatchWrite(memPart: () -> Unit, dbPart: suspend PlayerDatabase.() -> Unit) {
+    private fun dispatchWrite(
+        memPart: () -> Unit,
+        dbPart: suspend PlayerDatabase.() -> Unit,
+        onComplete: (Boolean) -> Unit = {}
+    ) {
         val job: Deferred<Unit>? = synchronized(loadLock) { loadJob }
         if (job == null) {
             Log.w(TAG, "仓库尚未初始化，丢弃一次写任务")
+            onComplete(false)
             return
         }
         if (loadSucceeded) {
             synchronized(stateLock) { memPart() }
-            persistScope.launch { persist(dbPart) }
+            persistScope.launch { onComplete(persist(dbPart)) }
         } else {
             persistScope.launch {
+                // 首次加载失败时尝试重试，仍失败则放弃本次写入
                 if (job.awaitOrNull() != null && !reloadAfterFailure()) {
                     Log.e(TAG, "数据库加载失败且重试未成功，本次写入未落盘")
+                    onComplete(false)
                     return@launch
                 }
                 synchronized(stateLock) { memPart() }
-                persist(dbPart)
+                onComplete(persist(dbPart))
             }
         }
     }
 
-    /**
-     * 加载失败后的补救：等（或按冷却期重新发起）一次加载。
-     * 冷却期内已有重试在跑时直接等它，避免并发写各自重启加载。
-     * @return true 表示当下镜像可用（调用方可继续落盘）
-     */
+    /** 加载失败后按冷却策略重试，返回最终是否成功。 */
     private suspend fun reloadAfterFailure(): Boolean {
         val job = synchronized(loadLock) {
             if (loadSucceeded) return true
@@ -412,7 +447,7 @@ object PlayerRepository {
         return job.awaitOrNull() == null
     }
 
-    /** 须在 [loadLock] 内：丢弃失败的加载任务与其数据库实例，重新发起一次加载 */
+    /** 重启加载流程（需持有 loadLock）：关闭旧库、重置状态并重新异步加载。 */
     private fun restartLoadLocked() {
         val ctx = appContext ?: return
         loadJob = null
@@ -426,28 +461,40 @@ object PlayerRepository {
         loadJob = persistScope.async { loadInternal(ctx) }
     }
 
-    /** 单调时钟毫秒（不依赖系统时间，避免时钟回拨让冷却失效） */
+    /** 基于纳秒时钟的毫秒时间戳，单调递增，适合做间隔判断。 */
     private fun nowMs(): Long = System.nanoTime() / 1_000_000
 
-    /** 单个写任务的 DB 段落：锁 + 事务，写失败只记日志不上抛（内存已更新） */
-    private suspend fun persist(block: suspend PlayerDatabase.() -> Unit) {
-        val database = db ?: return
-        try {
-            writeMutex.withLock { database.withTransaction { database.block() } }
-        } catch (e: Exception) {
-            Log.e(TAG, "数据库写入失败，本次变更未落盘", e)
+    /** 在事务中执行一次写库，失败时最多重试 3 次；全部失败则上报通知。 */
+    private suspend fun persist(block: suspend PlayerDatabase.() -> Unit): Boolean {
+        repeat(3) { attempt ->
+            val database = db
+            try {
+                if (database == null) error("数据库尚未初始化")
+                writeMutex.withLock { database.withTransaction { database.block() } }
+                return true
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (attempt < 2) {
+                    delay(200.milliseconds)
+                } else {
+                    Log.e(TAG, "数据库写入三次失败，本次变更未落盘", e)
+                    writeFailureChannel.trySend(WriteFailure(e.message ?: "database write failed"))
+                    return false
+                }
+            }
         }
+        return false
     }
 
-    /** 一次性加载：建库 → 迁移旧 prefs → 读出三份数据进内存镜像 */
+    /** 实际加载：打开数据库，（首次）执行旧数据迁移，再把数据读入内存镜像。 */
     private suspend fun loadInternal(appCtx: Context) {
-        // 刻意不启用 fallbackToDestructiveMigration：宁可升版本漏写迁移时明确报错，
-        // 也不能静默清空用户的播放列表与全部进度。改 schema 时须递增 version
-        // 并补 Migration、addMigrations(...)，同时提交 app/schemas/ 下新导出的 json。
+
         val database = Room.databaseBuilder(appCtx, PlayerDatabase::class.java, DB_NAME)
             .build()
         db = database
         val prefs = appCtx.getSharedPreferences(LEGACY_PREFS, Context.MODE_PRIVATE)
+        // 首次启动：从旧版 SharedPreferences 迁移；否则清理可能残留的旧数据
         if (database.kvDao().get(KEY_MIGRATED) == null) {
             migrateFromPrefs(database, prefs)
         } else if (prefs.contains("playlist") || prefs.contains("progress")
@@ -460,12 +507,11 @@ object PlayerRepository {
         }
         progressState = database.progressDao().getAll().associate { it.uri to it.positionMs }
         lastItemState = database.kvDao().get(KEY_LAST_ITEM)
-        // 置于最后：三份镜像赋值对 loadSucceeded 的读方 happens-before，
-        // 此后的写方法走调用线程同步更新镜像的快路径
+
         loadSucceeded = true
     }
 
-    /** 旧 prefs 一次性迁移：单事务写 Room + 打标记，提交成功后才清旧文件（中途被杀下次重试） */
+    /** 把旧版 SharedPreferences 中的播放列表/进度/上次播放项迁移到数据库，并清理旧数据。 */
     private suspend fun migrateFromPrefs(database: PlayerDatabase, prefs: SharedPreferences) {
         val items = parseLegacyPlaylistJson(prefs.getString("playlist", null))
         val progress = parseLegacyProgressJson(prefs.getString("progress", null))
@@ -484,50 +530,37 @@ object PlayerRepository {
     }
 }
 
-// ==================== 纯函数与旧数据迁移解析 ====================
-
-/** 单个文件进度落缓存判定结果：清除 / 写入 / 跳过 */
+/** 播放进度写入决策：清空 / 写入指定位置 / 跳过。 */
 internal sealed interface ProgressWriteDecision {
-    /** 播到末尾视为看完：清除该 uri 的进度 */
+
+    /** 视为播放完成，应从进度中移除。 */
     data object Clear : ProgressWriteDecision
 
-    /** 正常播放中：写入 [positionMs] */
+    /** 记录该位置。 */
     data class Store(val positionMs: Long) : ProgressWriteDecision
 
-    /** 无效位置：不动作 */
+    /** 无需处理。 */
     data object Skip : ProgressWriteDecision
 }
 
-/** 末尾容差上限：距总时长 5 秒以内即视为播完（同时不超过总时长 10%，短媒体不被整段吞掉） */
+/** 判定“已播完”的尾部容差：不超过 5 秒，且不超过总时长的 1/10。 */
 internal const val PROGRESS_FINISH_TAIL_MS = 5_000L
 
-/**
- * 「进度已到末尾」判定（唯一权威实现）：距末尾 [PROGRESS_FINISH_TAIL_MS] 以内视为已看完。
- * 周期落盘的采样点几乎必然落在末尾几秒内，若只把「位置 ≥ 总时长」当播完，
- * 这个「接近末尾」的值会被当成断点存下来：重启后从末尾续播，单曲循环时每轮回绕
- * 都被 seek 回片尾（表现为只重复片尾的几秒）。
- */
+/** 判断是否已播放到接近结尾（视为看完/听完）。 */
 internal fun isProgressFinished(positionMs: Long, durationMs: Long): Boolean {
     if (durationMs <= 0) return false
     val tail = minOf(PROGRESS_FINISH_TAIL_MS, durationMs / 10)
     return positionMs >= durationMs - tail
 }
 
-/**
- * 进度写入判定纯函数（唯一权威实现，调用方据此裁决不各自漂移）：
- * 播到末尾（含末尾容差）→Clear；位置<=0→Skip；其余→Store。
- */
+/** 依据当前位置与时长决定进度写入策略。 */
 internal fun decideProgressWrite(positionMs: Long, durationMs: Long): ProgressWriteDecision {
     if (isProgressFinished(positionMs, durationMs)) return ProgressWriteDecision.Clear
     if (positionMs <= 0) return ProgressWriteDecision.Skip
     return ProgressWriteDecision.Store(positionMs)
 }
 
-/**
- * 进度裁决应用纯函数：把 [decideProgressWrite] 的结果分发到 [store]/[clear]，
- * Skip 不动作。调用方传入各自存储介质的操作（Service 的 progressCache/removedUris、
- * Activity 的仓库直写等），保证各处裁决应用行为完全一致。
- */
+/** 按决策执行对应的进度操作（写入或清除）。 */
 internal fun applyProgressDecision(
     decision: ProgressWriteDecision,
     uri: String,
@@ -541,9 +574,7 @@ internal fun applyProgressDecision(
     }
 }
 
-/**
- * 进度合并纯函数（唯一权威实现）：先剔除 [removes]，再合并 [writes]（仅 >0）。
- */
+/** 合并进度映射：先移除指定 uri，再写入正数进度。 */
 internal fun mergeProgressMap(
     disk: Map<String, Long>,
     writes: Map<String, Long>,
@@ -557,7 +588,7 @@ internal fun mergeProgressMap(
     return merged
 }
 
-/** 解析旧 "progress" JSON，仅保留 >0 的值 */
+/** 解析旧版进度 JSON（uri -> 位置），解析失败返回空映射。 */
 internal fun parseLegacyProgressJson(json: String?): Map<String, Long> {
     if (json.isNullOrEmpty()) return emptyMap()
     return try {
@@ -573,14 +604,14 @@ internal fun parseLegacyProgressJson(json: String?): Map<String, Long> {
     }
 }
 
-/** 旧 "playlist" JSON 条目的纯字符串载体（不依赖 Uri，便于 JVM 单测） */
+/** 旧版播放列表项（迁移用）。 */
 internal data class LegacyPlaylistItem(
     val uri: String,
     val name: String,
     val duration: Long,
 )
 
-/** 解析旧 "playlist" JSON 数组（按 uri 去重）；Uri 转换留给运行时处理 */
+/** 解析旧版播放列表 JSON（数组），去重并解析失败时返回空列表。 */
 internal fun parseLegacyPlaylistJson(json: String?): List<LegacyPlaylistItem> {
     if (json.isNullOrEmpty()) return emptyList()
     return try {
@@ -590,6 +621,7 @@ internal fun parseLegacyPlaylistJson(json: String?): List<LegacyPlaylistItem> {
             for (i in 0 until arr.length()) {
                 val obj = arr.getJSONObject(i)
                 val uri = obj.getString("uri")
+                // 跳过重复项
                 if (uri in seen) continue
                 seen.add(uri)
                 add(LegacyPlaylistItem(uri, obj.getString("name"), obj.optLong("duration", 0L)))

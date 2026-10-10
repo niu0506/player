@@ -1,5 +1,5 @@
 {
-  "version": "1.5.1",
-  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.5.1/player-v1.5.1-release.apk",
-  "notes": "修复单曲循环时每轮只重复片尾最后几秒的问题：进度写入新增末尾容差（距末尾 5 秒内视为已看完），单曲回绕不再回跳片尾。更新包下载改为 GitHub 直连优先、CDN 反代加速兜底，并增加产物校验，反代返回 200 加错误页或残包时自动换源。GitHub API 返回非 JSON（代理、强制门户、DNS 劫持）时不再中断 jsDelivr 兜底。数据库加载失败不再成为永久状态，后续写入也不再被静默丢弃：失败会按需重试并提示用户。"
+  "version": "1.5.2",
+  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.5.2/player-v1.5.2-release.apk",
+  "notes": "播放控制栏改用应用自有资源：尺寸、颜色、样式与图标全部自持，仅依赖 Media3 稳定公开的控制视图 ID 与图标属性，不再绑定其私有布局与 ExoStyledControls 样式；快退/快进改为自绘按钮。新增「已是最后一项」的无法读取/播放出错提示，以及本地数据保存失败提示。依赖版本集中到 gradle/libs.versions.toml，构建工具链升级到 JDK 21。补充完善源码中文注释。"
 }

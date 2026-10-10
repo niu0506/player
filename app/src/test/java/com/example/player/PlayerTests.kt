@@ -8,7 +8,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 
-/** formatTime 时长格式化测试 */
+/** 测试 [formatTime] 的时间格式化规则。 */
 class FormatTimeTest {
 
     @Test
@@ -37,7 +37,7 @@ class FormatTimeTest {
     }
 }
 
-/** mergeProgressMap「合并非覆盖 + 0 值不覆盖 + removes 优先剔除」语义测试 */
+/** 测试 [mergeProgressMap] 的进度合并语义（正数覆盖、0 不覆盖、删除优先等）。 */
 class PlaybackProgressTest {
 
     @Test
@@ -64,7 +64,7 @@ class PlaybackProgressTest {
 
     @Test
     fun `removed then written same uri ends up written`() {
-        // 契约是「先剔除 removes，再合并 writes(>0)」：同名条目写入方胜出
+
         val result = mergeProgressMap(
             emptyMap(),
             mapOf("a" to 1000L),
@@ -90,15 +90,10 @@ class PlaybackProgressTest {
     }
 }
 
-/**
- * 进度写入裁决测试：末尾容差内视为「已看完」（回归：单曲循环只重复片尾）。
- *
- * 周期落盘的采样点几乎必然落在末尾几秒内；若只把「位置 ≥ 总时长」当播完，
- * 这个接近末尾的值会被当成断点存下来——REPEAT_MODE_ONE 回绕时位置已归 0
- * （判 Skip，抹不掉旧值），于是每一轮都被 seek 回片尾。
- */
+/** 测试进度写入决策 [decideProgressWrite] 与“已播完”判定 [isProgressFinished]。 */
 class ProgressDecisionTest {
 
+    /** 测试用总时长：180 秒。 */
     private val duration = 180_000L
 
     @Test
@@ -108,7 +103,7 @@ class ProgressDecisionTest {
 
     @Test
     fun `position inside tail is treated as finished`() {
-        // 178s / 180s：距末尾 2s，落在 5s 容差内
+
         assertEquals(ProgressWriteDecision.Clear, decideProgressWrite(duration - 2_000, duration))
     }
 
@@ -132,13 +127,13 @@ class ProgressDecisionTest {
 
     @Test
     fun `tail is capped at ten percent of short media`() {
-        // 10s 媒体：容差取 1s（而非 5s），阈值 9.0s，避免整段被当成「已看完」
+
         assertFalse(isProgressFinished(8_900, 10_000))
         assertTrue(isProgressFinished(9_000, 10_000))
     }
 }
 
-/** 更新包下载源顺序测试：直连在前、反代兜底 */
+/** 测试 [orderedDownloadUrls] 的下载地址排序（直连优先、镜像兜底）。 */
 class DownloadSourceOrderTest {
 
     private val apk =
@@ -164,10 +159,8 @@ class DownloadSourceOrderTest {
     }
 }
 
-/** 旧 SharedPreferences 迁移解析测试：null/空/坏 JSON、进度 >0 过滤、列表去重 */
+/** 测试旧版 SharedPreferences 数据（播放列表/进度 JSON）的迁移解析。 */
 class LegacyPrefsMigrationTest {
-
-    // ---- parseLegacyProgressJson ----
 
     @Test
     fun `null progress json returns empty map`() {
@@ -195,8 +188,6 @@ class LegacyPrefsMigrationTest {
         val json = """{"a":1000,"b":250000}"""
         assertEquals(mapOf("a" to 1000L, "b" to 250000L), parseLegacyProgressJson(json))
     }
-
-    // ---- parseLegacyPlaylistJson ----
 
     @Test
     fun `null playlist json returns empty list`() {
@@ -236,18 +227,13 @@ class LegacyPrefsMigrationTest {
 }
 
 /**
- * MediaListAdapter.setCurrentPlaying 边界检查测试。
- *
- * uri 是稳定身份：items 经异步 diff 后才回写，下标存在错位窗口，高亮按 uri 定位；
- * 不在 items 中的 uri 只记录状态不通知，待 items 追上后高亮不丢失。
- *
- * 纯 JVM 限制：MediaItemData 依赖 android.net.Uri，stub jar 无法构造真实实例，
- * 用同包占位实现 [FakeUri]（仅 toString 参与）；AdapterDataObservable 来自
- * mockable android.jar（空 stub），需反射注入观察者列表让 notifyItemChanged 回调可被记录。
+ * 测试 [MediaListAdapter.setCurrentPlaying] 的刷新行为：
+ * 仅对命中/变更的行发出通知，且能正确记录状态。
+ * 由于用例在本地 JVM 运行，通过反射直接访问 Adapter 的私有字段。
  */
 class MediaListAdapterCurrentPlayingTest {
 
-    /** 记录 notifyItemChanged 产生回调的列表项位置 */
+    /** 记录被通知刷新的位置，便于断言。 */
     private class RecordingObserver : RecyclerView.AdapterDataObserver() {
         val changedPositions = mutableListOf<Int>()
         override fun onItemRangeChanged(positionStart: Int, itemCount: Int, payload: Any?) {
@@ -267,6 +253,7 @@ class MediaListAdapterCurrentPlayingTest {
         attachObserver(adapter, observer)
     }
 
+    /** 通过反射把观察者挂到 Adapter 内部的 mObservable.mObservers 上。 */
     @Suppress("UNCHECKED_CAST")
     private fun attachObserver(adapter: MediaListAdapter, observer: RecordingObserver) {
         val observableField = RecyclerView.Adapter::class.java.getDeclaredField("mObservable")
@@ -274,7 +261,6 @@ class MediaListAdapterCurrentPlayingTest {
         val observable = observableField.get(adapter)
             ?: throw IllegalStateException("未取到 Adapter.mObservable")
 
-        // mObservers 声明在父类（android.database.Observable stub），沿类层级向上找
         var cls: Class<*>? = observable.javaClass
         var observersField: java.lang.reflect.Field? = null
         while (cls != null && observersField == null) {
@@ -289,6 +275,7 @@ class MediaListAdapterCurrentPlayingTest {
         (observersField.get(observable) as ArrayList<Any>).add(observer)
     }
 
+    /** 通过反射读取 Adapter 的私有 items 列表。 */
     @Suppress("UNCHECKED_CAST")
     private fun items(): MutableList<Any> {
         val field = MediaListAdapter::class.java.getDeclaredField("items")
@@ -296,6 +283,7 @@ class MediaListAdapterCurrentPlayingTest {
         return field.get(adapter) as MutableList<Any>
     }
 
+    /** 通过反射读取 Adapter 的私有 currentPlayingUri。 */
     private fun currentPlayingUri(): String? {
         val field = MediaListAdapter::class.java.getDeclaredField("currentPlayingUri")
         field.isAccessible = true
@@ -321,15 +309,14 @@ class MediaListAdapterCurrentPlayingTest {
         repeat(3) { items().add(item("u$it")) }
         adapter.setCurrentPlaying("u1")
         assertEquals(listOf(1), observer.changedPositions)
-        // 切换到新位置：旧位置 1 与新位置 2 都在界内，均应刷新
+
         adapter.setCurrentPlaying("u2", true)
         assertEquals(listOf(1, 1, 2), observer.changedPositions)
     }
 
     @Test
     fun `state is recorded even when uri is not in items yet`() {
-        // items 未含该 uri 时仅记录状态不通知：等 items 追上后，下一次状态变化会把
-        // 旧高亮（追上前的 u5）与新位置一并刷新，高亮不丢失
+
         adapter.setCurrentPlaying("u5", true)
         assertEquals("u5", currentPlayingUri())
         assertTrue(observer.changedPositions.isEmpty())
@@ -348,13 +335,12 @@ class MediaListAdapterCurrentPlayingTest {
         items().clear()
         observer.changedPositions.clear()
 
-        // 空列表时旧 u1 与新 u0 均找不到，不应产生任何回调
         adapter.setCurrentPlaying("u0")
         assertTrue(observer.changedPositions.isEmpty())
     }
 }
 
-/** UpdateChecker.isNewer 语义化版本比较测试 */
+/** 测试 [UpdateChecker.isNewer] 的版本号比较逻辑。 */
 class UpdateCheckerTest {
 
     @Test

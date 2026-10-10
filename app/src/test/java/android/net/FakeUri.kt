@@ -3,9 +3,8 @@ package android.net
 import android.os.Parcel
 
 /**
- * 测试专用 Uri 占位：本地单测的 stub android.jar 无法构造真实 Uri 实例，
- * 而 Uri 的构造器是包私有、无法在应用包内继承，故放在同包下。
- * 仅 toString() 参与被测逻辑（身份比较），其余成员返回默认值。
+ * 单元测试用的极简 [Uri] 实现：仅实现测试所需的 toString/equals/hashCode，
+ * 其余方法返回默认值或抛异常，从而避免依赖 Android 运行时。
  */
 class FakeUri(private val s: String) : Uri() {
     override fun toString(): String = s
