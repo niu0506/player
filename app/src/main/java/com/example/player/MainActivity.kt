@@ -296,6 +296,31 @@ class MainActivity : AppCompatActivity() {
         return true
     }
 
+    /**
+     * 队列与播放列表不一致时重建队列，并尽量保持当前播放项与位置。
+     *
+     * 重排后下标必然变化，因此当前项一律按 **uri** 反查，不按旧下标恢复；
+     * 反查不到（该项已不在列表中）时保持默认起始位置，与重建前行为一致。
+     */
+    private fun rebuildQueueIfNeeded(ctrl: MediaController) {
+        if (playlist.isEmpty() || queueMatchesPlaylist(ctrl)) return
+
+        val curUri = ctrl.currentMediaItem?.localConfiguration?.uri?.toString()
+        val curPos = ctrl.currentPosition
+        val curIdx = curUri?.let { u -> playlist.indexOfFirst { it.uri.toString() == u } } ?: -1
+
+        // 重建前先把当前位置落盘，避免清空队列时丢失进度
+        PlayerService.flushCurrentPosition()
+
+        ctrl.clearMediaItems()
+        for (item in playlist) {
+            ctrl.addMediaItem(buildMediaItem(item))
+        }
+        if (curIdx >= 0) {
+            ctrl.seekTo(curIdx, curPos)
+        }
+    }
+
     /** 解析某项的续播位置（来自仓库进度，默认 0）。 */
     private fun resolveResumePosition(item: MediaItemData): Long =
         PlayerRepository.getProgress(item.uri.toString()) ?: 0L
@@ -455,8 +480,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 合并扫描结果：删除已不存在的媒体，并（非静默时）追加时长合格的新媒体。
-     * @param silent 静默模式下只做删除清理，不新增、不提示
+     * 合并扫描结果：删除已不存在的媒体，（非静默时）追加时长合格的新媒体，
+     * 并按「文件夹分组 + 组内集数自然序」整理整个播放列表。
+     * @param silent 静默模式下只做删除清理与整理，不新增、不提示
      */
     private fun reconcileScanResult(
         scannedVideos: List<MediaItemData>?,
@@ -470,6 +496,7 @@ class MainActivity : AppCompatActivity() {
             }
             return
         }
+        // 先删除已消失的项：此时队列与列表仍同序，按下标删除才安全
         val removedCount = pruneDeletedMedia(scannedVideos, scannedAudios)
         val newItems = if (silent) emptyList() else {
             // 合并扫描结果，过滤掉时长过短(<5s)与已存在的项
@@ -481,31 +508,52 @@ class MainActivity : AppCompatActivity() {
                 it.duration >= 5000 && normalizeUri(it.uri) !in existingKeys
             }
         }
+
+        // 新项先追加再统一重排，避免出现「已插入但队列未同步」的下标错位窗口
+        val before = playlist.toList()
+        playlist.addAll(newItems)
+        val appended = playlist.toList()
+        val ordered = sortPlaylist(backfillFolderKeys(appended, buildFolderMap(scannedVideos, scannedAudios)))
+        val orderReorganized = ordered != appended
+
         // 无变化则不处理
-        if (newItems.isEmpty() && removedCount == 0) {
+        if (ordered == before && removedCount == 0) {
             if (!silent) {
                 Toast.makeText(this, R.string.toast_no_new_media, Toast.LENGTH_SHORT).show()
             }
             return
         }
-        playlist.addAll(newItems)
-        for (item in newItems) {
-            controller?.addMediaItem(buildMediaItem(item))
-        }
+        playlist.clear()
+        playlist.addAll(ordered)
         refreshPlaylist()
         savePlaylist()
+        // 与上面的重排处于同一主线程执行块（中间无挂起点），
+        // 保证队列下标与列表下标不会出现短暂不一致
+        controller?.let { rebuildQueueIfNeeded(it) }
         if (!silent) {
-            // 组装“删除 x 项 / 新增 y 项”的提示
+            // 组装“删除 x 项 / 新增 y 项 / 已按文件夹整理”的提示
             val parts = mutableListOf<String>()
             if (removedCount > 0) parts.add(getString(R.string.toast_scan_removed, removedCount))
             if (newItems.isNotEmpty()) parts.add(getString(R.string.toast_scan_added, newItems.size))
-            val message = if (parts.size == 2) {
-                getString(R.string.toast_scan_join, parts[0], parts[1])
-            } else {
-                parts.first()
-            }
-            Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
+            if (orderReorganized) parts.add(getString(R.string.toast_scan_reordered))
+            Toast.makeText(
+                this,
+                parts.reduce { acc, part -> getString(R.string.toast_scan_join, acc, part) },
+                Toast.LENGTH_SHORT
+            ).show()
         }
+    }
+
+    /** 用本次扫描结果构造「规范化 uri 键 -> 文件夹分组键」映射，跳过无分组信息的项。 */
+    private fun buildFolderMap(
+        scannedVideos: List<MediaItemData>?,
+        scannedAudios: List<MediaItemData>?
+    ): Map<String, String> {
+        val map = mutableMapOf<String, String>()
+        for ((uri, _, _, folderKey) in scannedVideos.orEmpty() + scannedAudios.orEmpty()) {
+            if (folderKey.isNotEmpty()) map[normalizeUri(uri)] = folderKey
+        }
+        return map
     }
 
     /** 删除播放列表中已不存在的媒体项，返回删除数量。 */
@@ -711,20 +759,8 @@ class MainActivity : AppCompatActivity() {
 
                 if (!isCurrentController(future, ctrl)) return@launch
 
-                // 若播放器队列与列表不一致，则重建队列并尽量保持当前播放项与位置
-                if (playlist.isNotEmpty() && !queueMatchesPlaylist(ctrl)) {
-                    val cur = ctrl.currentMediaItem
-                    val curUri = cur?.localConfiguration?.uri?.toString()
-                    val curPos = ctrl.currentPosition
-                    ctrl.clearMediaItems()
-                    for (item in playlist) {
-                        ctrl.addMediaItem(buildMediaItem(item))
-                    }
-                    val curIdx = curUri?.let { u -> playlist.indexOfFirst { it.uri.toString() == u } }
-                    if (curIdx != null && curIdx >= 0) {
-                        ctrl.seekTo(curIdx, curPos)
-                    }
-                }
+                // 若播放器队列与列表不一致（例如刚刚按文件夹重排过），则重建队列
+                rebuildQueueIfNeeded(ctrl)
                 restoreLastPlayed()
                 refreshPlaylist()
             }

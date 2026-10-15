@@ -9,6 +9,7 @@
 ### 播放
 
 - **本地媒体库扫描**：基于 MediaStore 扫描设备上的视频与音频，自动构建播放列表；自动监听媒体库变化（防抖合并增量扫描），回前台时对账清理已被外部删除的文件
+- **按文件夹分组连播**：记录每个文件所属目录（API 29+ 取 `RELATIVE_PATH`，更低版本由绝对路径取父目录），列表按「文件夹 + 组内集数自然序」排序——`第2集` 排在 `第10集` 之前，同一部剧的分集连续相邻，自动连播不会在几部剧之间来回跳；已存列表在首次扫描时按扫描结果回填目录并重排（进度按 URI 记录，重排不影响续播）。**建议每部剧放在独立文件夹**：同一文件夹里混放多部剧时无法区分；读不到目录的条目统一排在列表末尾
 - **播放控制**：播放/暂停、进度拖动、快退/快进 15s、随机播放、循环模式（顺序/单曲/列表）
 - **音轨/字幕选择**：多音轨视频可切换音轨，内嵌字幕可切换
 - **变速播放**：0.5x ~ 3.0x 共 7 档倍速；倍速由 Service 侧播放器持有，controller 重连（回前台）后按钮文案会重新同步，不会与真实速度脱节
@@ -83,6 +84,11 @@
 2. 在同处补充 `Migration(N, M)` 并加入 `Room.databaseBuilder(...).addMigrations(...)`；
 3. 构建后确认 `app/schemas/com.example.player.PlayerDatabase/<M>.json` 已生成**并提交到版本控制** —— 该文件是后续迁移的 diff 基准，缺失会让后续迁移无法正确编写。
 
+> 示例（v1 → v2，播放列表新增文件夹分组键）：实体字段写 `@ColumnInfo(defaultValue = "''")`，
+> 迁移执行 `ALTER TABLE playlist ADD COLUMN folder TEXT NOT NULL DEFAULT ''`。
+> 注意两者必须同时存在且字面量一致（`defaultValue = "''"` 要自带引号），否则迁移后 Room 的
+> `TableInfo` 校验会报 `Migration didn't properly handle`。
+
 > 早期版本使用 `fallbackToDestructiveMigration(dropAllTables = true)`，在升版本忘记写迁移时会静默删除全部用户数据。该兜底已移除，改为构建/运行期显式暴露。
 
 同理，**加载失败不会被当成永久状态**：`PlayerRepository.ensureLoaded` 在失败后会重新发起加载（写入路径按 30 秒冷却重试，避免库永久损坏时被 2 秒一次的进度写反复触发重建），`awaitLoaded` 返回失败结果供界面提示，写入不再被静默丢弃。
@@ -122,10 +128,11 @@ app/src/main/java/com/example/player/
 └── UpdateManager.kt                 # 应用内更新检查（GitHub Releases / jsDelivr 兜底）+ 下载与安装流程
 
 app/src/test/java/com/example/player/
-└── PlayerTests.kt                   # 进度合并语义 / 进度末尾裁决 / 旧数据迁移 / 时长格式化 / 列表高亮越界防护 / 版本比较 / 更新下载源顺序
+└── PlayerTests.kt                   # 进度合并语义 / 进度末尾裁决 / 旧数据迁移 / 时长格式化 / 列表高亮越界防护 / 版本比较 / 更新下载源顺序 / 文件夹分组键与集数自然序
 
 app/schemas/com.example.player.PlayerDatabase/
-└── 1.json                           # Room 导出的 schema（须提交，作为后续 Migration 的 diff 基准）
+├── 1.json                           # Room 导出的 schema（须提交，作为后续 Migration 的 diff 基准）
+└── 2.json                           # v2：playlist 新增 folder 列
 
 app/src/main/res/values/
 └── strings.xml                      # 全部用户可见文案（含控制栏与手势浮层，均经资源引用）

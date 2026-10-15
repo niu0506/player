@@ -3,8 +3,10 @@ package com.example.player
 import android.content.Context
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
+import android.database.Cursor
 import android.net.Uri
 import android.os.Build
+import android.os.Environment
 import android.provider.BaseColumns
 import android.provider.MediaStore
 import android.util.Log
@@ -23,7 +25,9 @@ import androidx.room.Query
 import androidx.room.Room
 import androidx.room.RoomDatabase
 import androidx.room.Transaction
+import androidx.room.migration.Migration
 import androidx.room.withTransaction
+import androidx.sqlite.db.SupportSQLiteDatabase
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
@@ -49,17 +53,157 @@ data class MediaItemData(
     val uri: Uri,
     val name: String,
     /** 时长(毫秒)，未知时为 0。 */
-    val duration: Long = 0L
+    val duration: Long = 0L,
+    /**
+     * 所属文件夹分组键（相对外部存储的目录，如 `Movies/剧A`）；无法识别时为 ""。
+     * 用于把同一部剧的分集排在一起，保证连播不跨剧。
+     */
+    val folderKey: String = "",
 )
 
 /**
- * 生成用于去重/索引的规范化 uri 键：
- * 去掉查询参数与结尾斜杠，并拼接最后一段路径，尽量保证同一文件稳定唯一。
+ * 归一化 uri 作为去重键：去掉查询参数并裁掉结尾斜杠，再拼上末段路径。
+ * 该键仅在内存中用于比较（不落盘），因此实现调整不影响已保存的数据。
  */
 fun normalizeUri(uri: Uri): String {
-    val base = uri.buildUpon().clearQuery().build().toString().trimEnd('/')
+    val base = uri.toString().substringBefore('?').trimEnd('/')
     val lastSeg = uri.lastPathSegment ?: base
     return "$base|$lastSeg"
+}
+
+/**
+ * 把 MediaStore 的 `RELATIVE_PATH`（如 `Movies/剧A/`）归一化为分组键。
+ * 去掉首尾空白与结尾斜杠；值为空时返回 ""（视为无法分组）。
+ */
+internal fun folderKeyFromRelativePath(relativePath: String?): String =
+    relativePath?.trim()?.trim('/')?.trim().orEmpty()
+
+/**
+ * 低版本（API < 29）没有 `RELATIVE_PATH`，用文件绝对路径的父目录作为分组键，
+ * 并剥掉主外部存储根前缀，使其与 [folderKeyFromRelativePath] 的结果形态一致。
+ * 文件直接位于存储根目录时返回 ""；非主存储卷（如 SD 卡）保留绝对父目录。
+ */
+internal fun folderKeyFromAbsolutePath(absolutePath: String?, storageRoot: String?): String {
+    val path = absolutePath?.trim().orEmpty()
+    if (path.isEmpty()) return ""
+    val parent = path.substringBeforeLast('/', "")
+    if (parent.isEmpty() || parent == "/") return ""
+    val root = storageRoot?.trim()?.trimEnd('/').orEmpty()
+    if (root.isNotEmpty() && (parent == root || parent.startsWith("$root/"))) {
+        return parent.removePrefix(root).trim('/')
+    }
+    return parent.trimEnd('/')
+}
+
+/** 取分组键的末段作为展示用文件夹名（如 `Movies/剧A` -> `剧A`）；空键返回 ""。 */
+internal fun folderDisplayName(folderKey: String): String = folderKey.substringAfterLast('/')
+
+/** 数字段超过该位数时改用长度 + 字典序比较，避免转 Long 溢出。 */
+private const val NATURAL_MAX_DIGITS = 18
+
+/**
+ * 比较两个数字段（仅由数字字符组成）：
+ * 忽略前导 0 按数值比较；数值相同则位数少者在前；超长数字段按长度再按字典序。
+ * 仅当两段完全相等时返回 0。
+ */
+private fun compareDigitSegments(a: String, b: String): Int {
+    val x = a.trimStart('0').ifEmpty { "0" }
+    val y = b.trimStart('0').ifEmpty { "0" }
+    if (x.length > NATURAL_MAX_DIGITS || y.length > NATURAL_MAX_DIGITS) {
+        val byLength = x.length.compareTo(y.length)
+        return if (byLength != 0) byLength else x.compareTo(y)
+    }
+    val vx = x.toLong()
+    val vy = y.toLong()
+    if (vx != vy) return if (vx < vy) -1 else 1
+    // 数值相同（如 "2" 与 "02"）：按位数打破平局，保证结果不依赖输入顺序
+    val byLength = x.length.compareTo(y.length)
+    return if (byLength != 0) byLength else x.compareTo(y)
+}
+
+/**
+ * 比较两个非数字段：先忽略大小写比较，完全相同时再用区分大小写的比较打破平局。
+ * 仅当两段完全相等时返回 0。
+ */
+private fun compareTextSegments(a: String, b: String): Int {
+    val byIgnoreCase = a.compareTo(b, ignoreCase = true)
+    if (byIgnoreCase != 0) return if (byIgnoreCase < 0) -1 else 1
+    val byCase = a.compareTo(b)
+    return if (byCase < 0) -1 else if (byCase > 0) 1 else 0
+}
+
+/**
+ * 自然序比较：把字符串切成「连续数字段 / 连续非数字段」交替比较，数字段按数值大小。
+ * 因此 `第2集` 排在 `第10集` 之前，`E02` 排在 `E10` 之前。
+ *
+ * 数字段排在非数字段之前，段数与长度不足则短串在前，最后按原文兜底 ——
+ * 这样保证是**全序**（自反、反对称、传递），排序结果不依赖输入顺序，
+ * 避免每次扫描都误判“顺序变了”而反复重建播放队列。
+ */
+internal fun naturalCompare(a: String, b: String): Int {
+    var i = 0
+    var j = 0
+    while (i < a.length && j < b.length) {
+        val aIsDigit = a[i].isDigit()
+        val bIsDigit = b[j].isDigit()
+        if (aIsDigit != bIsDigit) return if (aIsDigit) -1 else 1
+
+        val startA = i
+        val startB = j
+        val cmp = if (aIsDigit) {
+            while (i < a.length && a[i].isDigit()) i++
+            while (j < b.length && b[j].isDigit()) j++
+            compareDigitSegments(a.substring(startA, i), b.substring(startB, j))
+        } else {
+            while (i < a.length && !a[i].isDigit()) i++
+            while (j < b.length && !b[j].isDigit()) j++
+            compareTextSegments(a.substring(startA, i), b.substring(startB, j))
+        }
+        if (cmp != 0) return cmp
+    }
+    if (a.length != b.length) return a.length.compareTo(b.length)
+    return a.compareTo(b)
+}
+
+/**
+ * 播放列表项比较：先按文件夹分组键（**无法分组的空键统一排在最后**），
+ * 再按文件名自然序，最后按 uri 兜底（同名不同 uri 时顺序也确定）。
+ */
+internal fun comparePlaylistItems(a: MediaItemData, b: MediaItemData): Int {
+    val aUngrouped = a.folderKey.isEmpty()
+    val bUngrouped = b.folderKey.isEmpty()
+    if (aUngrouped != bUngrouped) return if (aUngrouped) 1 else -1
+    if (!aUngrouped) {
+        val byFolder = a.folderKey.compareTo(b.folderKey)
+        if (byFolder != 0) return byFolder
+    }
+    val byName = naturalCompare(a.name, b.name)
+    if (byName != 0) return byName
+    return a.uri.toString().compareTo(b.uri.toString())
+}
+
+/** 按「文件夹分组 + 组内自然序」重排播放列表（稳定排序，幂等）。 */
+internal fun sortPlaylist(items: List<MediaItemData>): List<MediaItemData> =
+    items.sortedWith(Comparator { a, b -> comparePlaylistItems(a, b) })
+
+/**
+ * 用扫描结果（uri 键 -> 文件夹键）回填播放列表中缺失的分组键：
+ * 只填空值、不覆盖已有非空值，映射缺失则保持为空；无变化时原样返回。
+ */
+internal fun backfillFolderKeys(
+    items: List<MediaItemData>,
+    uriToFolder: Map<String, String>
+): List<MediaItemData> {
+    if (uriToFolder.isEmpty()) return items
+    var changed = false
+    val result = items.map { item ->
+        if (item.folderKey.isNotEmpty()) return@map item
+        val folder = uriToFolder[normalizeUri(item.uri)].orEmpty()
+        if (folder.isEmpty()) return@map item
+        changed = true
+        item.copy(folderKey = folder)
+    }
+    return if (changed) result else items
 }
 
 /** 时间格式化结果的 LRU 缓存，避免列表滚动时重复计算。 */
@@ -87,13 +231,38 @@ class MediaStoreScanner(private val context: Context) {
     /** 查询设备音频，失败返回 null。 */
     fun queryAudios(): List<MediaItemData>? = query(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI)
 
-    /** 按内容 uri 执行查询，返回 id/名称/时长列表；异常时返回 null 以区分“无数据”。 */
+    /**
+     * 用于读取所属文件夹的 MediaStore 列名：
+     * API 29+ 为 `RELATIVE_PATH`（相对外部存储的目录）；更低版本回退到 `DATA`（绝对路径）。
+     * 只会查询本机存在的列，避免把“列不存在”变成整次查询失败。
+     */
+    @Suppress("DEPRECATION")
+    private val folderColumn: String =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            MediaStore.MediaColumns.RELATIVE_PATH
+        } else {
+            MediaStore.MediaColumns.DATA
+        }
+
+    /** 低版本剥绝对路径前缀时用的主外部存储根目录（API 29+ 用不到）。 */
+    @Suppress("DEPRECATION")
+    private val storageRoot: String? =
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            Environment.getExternalStorageDirectory()?.absolutePath
+        } else {
+            null
+        }
+
+    /**
+     * 按内容 uri 执行查询，返回 id/名称/时长/所属文件夹列表；异常时返回 null 以区分“无数据”。
+     */
     private fun query(contentUri: Uri): List<MediaItemData>? {
         val items = mutableListOf<MediaItemData>()
         val projection = arrayOf(
             BaseColumns._ID,
             MediaStore.MediaColumns.DISPLAY_NAME,
-            MediaStore.MediaColumns.DURATION
+            MediaStore.MediaColumns.DURATION,
+            folderColumn
         )
         return try {
             val cursor = context.contentResolver.query(
@@ -104,12 +273,19 @@ class MediaStoreScanner(private val context: Context) {
                 val idIdx = it.getColumnIndexOrThrow(BaseColumns._ID)
                 val nameIdx = it.getColumnIndexOrThrow(MediaStore.MediaColumns.DISPLAY_NAME)
                 val durIdx = it.getColumnIndexOrThrow(MediaStore.MediaColumns.DURATION)
+                // 文件夹列可能缺失：用 getColumnIndex 判 -1 并逐项降级，不能 OrThrow
+                val folderIdx = it.getColumnIndex(folderColumn)
                 while (it.moveToNext()) {
                     val id = it.getLong(idIdx)
                     val name = it.getString(nameIdx)
                     val duration = it.getLong(durIdx)
                     items.add(
-                        MediaItemData(Uri.withAppendedPath(contentUri, id.toString()), name, duration)
+                        MediaItemData(
+                            Uri.withAppendedPath(contentUri, id.toString()),
+                            name,
+                            duration,
+                            folderKeyOf(it, folderIdx)
+                        )
                     )
                 }
             }
@@ -117,6 +293,22 @@ class MediaStoreScanner(private val context: Context) {
         } catch (_: Exception) {
             null
         }
+    }
+
+    /**
+     * 读取某一行的文件夹分组键；列不存在或取值失败时返回 ""，
+     * 保证路径不可读只影响该项的排序位置，不会丢掉整批扫描结果。
+     */
+    private fun folderKeyOf(cursor: Cursor, folderIdx: Int): String {
+        if (folderIdx < 0) return ""
+        return runCatching {
+            val raw = cursor.getString(folderIdx) ?: return@runCatching ""
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                folderKeyFromRelativePath(raw)
+            } else {
+                folderKeyFromAbsolutePath(raw, storageRoot)
+            }
+        }.getOrDefault("")
     }
 
     /** 是否拥有某种媒体类型的完整读取权限。 */
@@ -151,6 +343,8 @@ data class PlaylistItemEntity(
     val duration: Long,
     /** 列表中的排序序号。 */
     val sortOrder: Int,
+    /** 所属文件夹分组键；旧数据与无法识别的项为空串。 */
+    @ColumnInfo(defaultValue = "''") val folder: String = "",
 )
 
 /** 播放进度（Room 实体）：uri -> 位置(毫秒)。 */
@@ -213,13 +407,23 @@ interface KvDao {
 /** 应用 Room 数据库，包含播放列表、进度与键值对三张表。 */
 @Database(
     entities = [PlaylistItemEntity::class, ProgressEntity::class, KvEntity::class],
-    version = 1,
+    version = 2,
     exportSchema = true,
 )
 abstract class PlayerDatabase : RoomDatabase() {
     abstract fun playlistDao(): PlaylistDao
     abstract fun progressDao(): ProgressDao
     abstract fun kvDao(): KvDao
+}
+
+/**
+ * v1 -> v2：播放列表项新增「文件夹分组键」列。
+ * 旧数据统一填默认空串（随后由扫描结果回填），不删除任何用户数据。
+ */
+private val MIGRATION_1_2 = object : Migration(1, 2) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE playlist ADD COLUMN folder TEXT NOT NULL DEFAULT ''")
+    }
 }
 
 /**
@@ -363,7 +567,7 @@ object PlayerRepository {
             dbPart = {
                 // 按顺序生成带 sortOrder 的实体并整体替换
                 val entities = itemsSnapshot.mapIndexed { i, it ->
-                    PlaylistItemEntity(it.uri.toString(), it.name, it.duration, i)
+                    PlaylistItemEntity(it.uri.toString(), it.name, it.duration, i, it.folderKey)
                 }
                 playlistDao().replaceAll(entities)
             }
@@ -491,6 +695,7 @@ object PlayerRepository {
     private suspend fun loadInternal(appCtx: Context) {
 
         val database = Room.databaseBuilder(appCtx, PlayerDatabase::class.java, DB_NAME)
+            .addMigrations(MIGRATION_1_2)
             .build()
         db = database
         val prefs = appCtx.getSharedPreferences(LEGACY_PREFS, Context.MODE_PRIVATE)
@@ -503,7 +708,7 @@ object PlayerRepository {
             prefs.edit { clear() }
         }
         playlistState = database.playlistDao().getAll().map {
-            MediaItemData(it.uri.toUri(), it.name, it.duration)
+            MediaItemData(it.uri.toUri(), it.name, it.duration, it.folder)
         }
         progressState = database.progressDao().getAll().associate { it.uri to it.positionMs }
         lastItemState = database.kvDao().get(KEY_LAST_ITEM)

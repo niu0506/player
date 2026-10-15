@@ -380,3 +380,268 @@ class UpdateCheckerTest {
         assertFalse(UpdateChecker.isNewer("1.x", "1.9"))
     }
 }
+
+/** 测试文件夹分组键的派生规则 [folderKeyFromRelativePath] / [folderKeyFromAbsolutePath] / [folderDisplayName]。 */
+class FolderKeyTest {
+
+    private val root = "/storage/emulated/0"
+
+    @Test
+    fun `relative path trims slashes and blanks`() {
+        assertEquals("Movies/剧A", folderKeyFromRelativePath("Movies/剧A/"))
+        assertEquals("Movies/剧A", folderKeyFromRelativePath(" Movies/剧A/ "))
+        assertEquals("Movies/剧A/Season 1", folderKeyFromRelativePath("Movies/剧A/Season 1/"))
+    }
+
+    @Test
+    fun `blank relative path means ungrouped`() {
+        assertEquals("", folderKeyFromRelativePath(null))
+        assertEquals("", folderKeyFromRelativePath(""))
+        assertEquals("", folderKeyFromRelativePath("   "))
+        assertEquals("", folderKeyFromRelativePath("/"))
+    }
+
+    @Test
+    fun `absolute path parent is relative to storage root`() {
+        assertEquals("Movies/剧A", folderKeyFromAbsolutePath("$root/Movies/剧A/第01集.mp4", root))
+        assertEquals("Movies", folderKeyFromAbsolutePath("$root/Movies/第01集.mp4", root))
+    }
+
+    @Test
+    fun `file directly in storage root is ungrouped`() {
+        assertEquals("", folderKeyFromAbsolutePath("$root/散装.mp4", root))
+    }
+
+    @Test
+    fun `another volume keeps the absolute parent`() {
+        assertEquals(
+            "/storage/1234-5678/Movies/剧A",
+            folderKeyFromAbsolutePath("/storage/1234-5678/Movies/剧A/第01集.mp4", root)
+        )
+    }
+
+    @Test
+    fun `unknown storage root keeps the absolute parent`() {
+        assertEquals(
+            "$root/Movies/剧A",
+            folderKeyFromAbsolutePath("$root/Movies/剧A/第01集.mp4", null)
+        )
+    }
+
+    @Test
+    fun `null or unusable absolute path is ungrouped`() {
+        assertEquals("", folderKeyFromAbsolutePath(null, root))
+        assertEquals("", folderKeyFromAbsolutePath("", root))
+        assertEquals("", folderKeyFromAbsolutePath("第01集.mp4", root))
+    }
+
+    @Test
+    fun `display name is the last segment`() {
+        assertEquals("剧A", folderDisplayName("Movies/剧A"))
+        assertEquals("剧A", folderDisplayName("剧A"))
+        assertEquals("", folderDisplayName(""))
+    }
+}
+
+/** 测试 [naturalCompare] 的数字感知排序与全序性质。 */
+class NaturalOrderTest {
+
+    private val comparator = Comparator<String> { a, b -> naturalCompare(a, b) }
+
+    private fun sign(x: Int): Int = if (x > 0) 1 else if (x < 0) -1 else 0
+
+    @Test
+    fun `episode numbers compare by value not by text`() {
+        assertTrue(naturalCompare("第2集", "第10集") < 0)
+        assertTrue(naturalCompare("第10集", "第100集") < 0)
+        assertTrue(naturalCompare("E02", "E10") < 0)
+    }
+
+    @Test
+    fun `episodes are ordered naturally`() {
+        val names = listOf("第10集", "第2集", "第11集", "第1集", "第9集")
+        assertEquals(
+            listOf("第1集", "第2集", "第9集", "第10集", "第11集"),
+            names.sortedWith(comparator)
+        )
+    }
+
+    @Test
+    fun `leading zeros are resolved deterministically`() {
+        // 数值相同（"1" 与 "01"）时靠长度兜底：位数少者在前
+        assertTrue(naturalCompare("1", "01") < 0)
+        assertEquals(
+            sign(naturalCompare("01", "1")),
+            -sign(naturalCompare("1", "01"))
+        )
+    }
+
+    @Test
+    fun `shorter name with the same prefix comes first`() {
+        assertTrue(naturalCompare("第2集", "第2集B") < 0)
+        assertTrue(naturalCompare("第2集", "第2集 完") < 0)
+        assertEquals(
+            sign(naturalCompare("第2集B", "第2集 完")),
+            -sign(naturalCompare("第2集 完", "第2集B"))
+        )
+    }
+
+    @Test
+    fun `case differences are broken deterministically`() {
+        assertTrue(naturalCompare("e02", "E02") != 0)
+        assertEquals(sign(naturalCompare("e02", "E02")), -sign(naturalCompare("E02", "e02")))
+        assertTrue(naturalCompare("ep01", "EP01") != 0)
+    }
+
+    @Test
+    fun `mixed languages stay deterministic`() {
+        assertEquals(
+            sign(naturalCompare("第1集", "EP01")),
+            -sign(naturalCompare("EP01", "第1集"))
+        )
+    }
+
+    @Test
+    fun `names without digits do not crash and stay deterministic`() {
+        assertTrue(naturalCompare("番外.mp4", "第1集.mp4") != 0)
+        assertEquals(
+            sign(naturalCompare("番外.mp4", "第1集.mp4")),
+            -sign(naturalCompare("第1集.mp4", "番外.mp4"))
+        )
+    }
+
+    @Test
+    fun `very long digit runs compare without overflow`() {
+        val huge = "第999999999999999999999集"
+        assertTrue(naturalCompare("第2集", huge) < 0)
+        assertTrue(naturalCompare(huge, "第2集") > 0)
+    }
+
+    @Test
+    fun `natural compare is a total order`() {
+        val names = listOf(
+            "第1集", "第2集", "第10集", "第11集", "第2集 完",
+            "E02", "E10", "ep01", "番外.mp4", "01", "1"
+        )
+        for (a in names) {
+            assertEquals(0, naturalCompare(a, a))
+            for (b in names) {
+                assertEquals(sign(naturalCompare(a, b)), -sign(naturalCompare(b, a)))
+            }
+        }
+        // 结果与输入排列无关，并且幂等 —— 否则每次扫描都会误判“顺序变了”
+        val sorted = names.sortedWith(comparator)
+        assertEquals(sorted, names.reversed().sortedWith(comparator))
+        assertEquals(sorted, sorted.sortedWith(comparator))
+    }
+}
+
+/** 测试播放列表的「文件夹分组 + 组内自然序」重排 [sortPlaylist] / [comparePlaylistItems]。 */
+class PlaylistSortTest {
+
+    private fun item(name: String, folder: String = "") =
+        MediaItemData(FakeUri("content://video/$folder/$name"), name, 0L, folder)
+
+    @Test
+    fun `episodes of one folder stay together and naturally ordered`() {
+        val items = listOf(
+            item("第10集.mp4", "Movies/剧B"),
+            item("第2集.mp4", "Movies/剧A"),
+            item("第1集.mp4", "Movies/剧B"),
+            item("第10集.mp4", "Movies/剧A"),
+            item("第1集.mp4", "Movies/剧A")
+        )
+        assertEquals(
+            listOf(
+                "Movies/剧A" to "第1集.mp4",
+                "Movies/剧A" to "第2集.mp4",
+                "Movies/剧A" to "第10集.mp4",
+                "Movies/剧B" to "第1集.mp4",
+                "Movies/剧B" to "第10集.mp4"
+            ),
+            sortPlaylist(items).map { it.folderKey to it.name }
+        )
+    }
+
+    @Test
+    fun `ungrouped items are placed last`() {
+        val items = listOf(
+            item("散2.mp4"),
+            item("第1集.mp4", "Movies/剧A"),
+            item("散1.mp4"),
+            item("第2集.mp4", "Movies/剧A")
+        )
+        val sorted = sortPlaylist(items)
+        assertEquals("Movies/剧A", sorted[0].folderKey)
+        assertEquals("Movies/剧A", sorted[1].folderKey)
+        assertTrue(sorted.drop(2).all { it.folderKey.isEmpty() })
+    }
+
+    @Test
+    fun `sorting is independent of input order and idempotent`() {
+        val items = listOf(
+            item("第3集.mp4", "Movies/剧A"),
+            item("第1集.mp4", "Movies/剧A"),
+            item("第10集.mp4", "Movies/剧B"),
+            item("第2集.mp4", "Movies/剧B")
+        )
+        val sorted = sortPlaylist(items)
+        assertEquals(sorted, sortPlaylist(items.reversed()))
+        assertEquals(sorted, sortPlaylist(sorted))
+    }
+
+    @Test
+    fun `same name in one folder falls back to uri`() {
+        val a = MediaItemData(FakeUri("content://video/1"), "同名.mp4", 0L, "Movies/剧A")
+        val b = MediaItemData(FakeUri("content://video/2"), "同名.mp4", 0L, "Movies/剧A")
+        assertTrue(comparePlaylistItems(a, b) < 0)
+        assertEquals(0, comparePlaylistItems(a, a))
+    }
+}
+
+/** 测试用扫描结果回填文件夹键 [backfillFolderKeys]。 */
+class FolderBackfillTest {
+
+    private fun item(uri: String, name: String, folder: String = "") =
+        MediaItemData(FakeUri(uri), name, 0L, folder)
+
+    private fun key(uri: String): String = normalizeUri(FakeUri(uri))
+
+    @Test
+    fun `missing folder keys are filled from the scan result`() {
+        val items = listOf(item("content://video/1", "第1集.mp4"), item("content://video/2", "第2集.mp4"))
+        val map = mapOf(key("content://video/1") to "Movies/剧A", key("content://video/2") to "Movies/剧A")
+        assertEquals(listOf("Movies/剧A", "Movies/剧A"), backfillFolderKeys(items, map).map { it.folderKey })
+    }
+
+    @Test
+    fun `existing folder keys are not overwritten`() {
+        val items = listOf(item("content://video/1", "第1集.mp4", "Movies/旧目录"))
+        val map = mapOf(key("content://video/1") to "Movies/新目录")
+        assertEquals(listOf("Movies/旧目录"), backfillFolderKeys(items, map).map { it.folderKey })
+    }
+
+    @Test
+    fun `items without a scan mapping stay ungrouped`() {
+        val items = listOf(item("content://video/9", "第9集.mp4"))
+        val map = mapOf(key("content://video/1") to "Movies/剧A")
+        assertEquals(listOf(""), backfillFolderKeys(items, map).map { it.folderKey })
+    }
+
+    @Test
+    fun `empty mapping returns the original list`() {
+        val items = listOf(item("content://video/1", "第1集.mp4"))
+        assertTrue(backfillFolderKeys(items, emptyMap()) === items)
+    }
+
+    @Test
+    fun `uri set and size are preserved`() {
+        val items = listOf(item("content://video/1", "第1集.mp4"), item("content://video/2", "第2集.mp4"))
+        val result = backfillFolderKeys(items, mapOf(key("content://video/1") to "Movies/剧A"))
+        assertEquals(items.size, result.size)
+        assertEquals(
+            items.map { it.uri.toString() }.toSet(),
+            result.map { it.uri.toString() }.toSet()
+        )
+    }
+}

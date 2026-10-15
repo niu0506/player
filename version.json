@@ -1,5 +1,5 @@
 {
-  "version": "1.5.2",
-  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.5.2/player-v1.5.2-release.apk",
-  "notes": "播放控制栏改用应用自有资源：尺寸、颜色、样式与图标全部自持，仅依赖 Media3 稳定公开的控制视图 ID 与图标属性，不再绑定其私有布局与 ExoStyledControls 样式；快退/快进改为自绘按钮。新增「已是最后一项」的无法读取/播放出错提示，以及本地数据保存失败提示。依赖版本集中到 gradle/libs.versions.toml，构建工具链升级到 JDK 21。补充完善源码中文注释。"
+  "version": "1.5.3",
+  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.5.3/player-v1.5.3-release.apk",
+  "notes": "播放列表新增按文件夹分组排序：扫描时记录每个文件所属目录，列表按「文件夹 + 组内集数自然序」排列，同一部剧的分集连续相邻，自动连播不再在几部剧之间来回跳（第2集现在排在第10集之前）。已存列表在首次扫描时自动回填目录并重排，进度按 URI 记录不受影响；数据库升级到 v2（playlist 表新增 folder 列）。建议每部剧放在独立文件夹。"
 }
