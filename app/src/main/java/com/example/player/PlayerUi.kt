@@ -39,6 +39,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlin.math.abs
@@ -443,12 +444,14 @@ class MediaListAdapter(
     private val getProgress: (String) -> Long = { 0L }
 ) : RecyclerView.Adapter<MediaListAdapter.VH>() {
 
+    private val progressPayload = Any()
+
     private val items = mutableListOf<MediaItemData>()
 
     /** 当前正在播放的 uri。 */
     private var currentPlayingUri: String? = null
     private var isPlaying = false
-    private val diffScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    private var diffScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
     private var diffJob: Job? = null
 
     /** 提交新列表：在后台计算差异后回到主线程分发更新。 */
@@ -498,12 +501,12 @@ class MediaListAdapter(
 
     /** 刷新指定行的进度显示。 */
     fun refreshProgress(index: Int) {
-        if (index in items.indices) notifyItemChanged(index)
+        if (index in items.indices) notifyItemChanged(index, progressPayload)
     }
 
     /** 刷新全部行的进度显示。 */
     fun refreshAllProgress() {
-        if (itemCount > 0) notifyItemRangeChanged(0, itemCount)
+        if (itemCount > 0) notifyItemRangeChanged(0, itemCount, progressPayload)
     }
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): VH {
@@ -528,6 +531,21 @@ class MediaListAdapter(
             context.getColor(if (isActive) R.color.accent else R.color.text_primary)
         )
 
+        bindProgress(holder, item)
+    }
+
+    override fun onBindViewHolder(holder: VH, position: Int, payloads: MutableList<Any>) {
+        if (payloads.isNotEmpty() && payloads.all { it === progressPayload }) {
+            bindProgress(holder, items[position])
+        } else {
+            super.onBindViewHolder(holder, position, payloads)
+        }
+    }
+
+    /** 仅更新进度相关视图，供 progress payload 使用。 */
+    private fun bindProgress(holder: VH, item: MediaItemData) {
+        val context = holder.itemView.context
+        val isActive = item.uri.toString() == currentPlayingUri && isPlaying
         // 展示观看进度条与进度文本
         val progress = getProgress(item.uri.toString())
         if (progress > 0 && item.duration > 0) {
@@ -553,6 +571,14 @@ class MediaListAdapter(
     }
 
     override fun getItemCount() = items.size
+
+    override fun onAttachedToRecyclerView(recyclerView: RecyclerView) {
+        super.onAttachedToRecyclerView(recyclerView)
+        // 曾被 detach 取消过的作用域在此重建，保证后续 submitList 的差异计算仍能执行
+        if (!diffScope.isActive) {
+            diffScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+        }
+    }
 
     override fun onDetachedFromRecyclerView(recyclerView: RecyclerView) {
         super.onDetachedFromRecyclerView(recyclerView)

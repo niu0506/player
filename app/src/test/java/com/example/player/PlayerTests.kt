@@ -340,6 +340,128 @@ class MediaListAdapterCurrentPlayingTest {
     }
 }
 
+/** 测试缺失记录的持久化编解码 [parseMissingJson] / [encodeMissingJson]。 */
+class MissingRecordsTest {
+
+    @Test
+    fun `null or empty json returns empty map`() {
+        assertEquals(emptyMap<String, MissingInfo>(), parseMissingJson(null))
+        assertEquals(emptyMap<String, MissingInfo>(), parseMissingJson(""))
+    }
+
+    @Test
+    fun `garbage json returns empty map`() {
+        assertEquals(emptyMap<String, MissingInfo>(), parseMissingJson("{not valid json"))
+    }
+
+    @Test
+    fun `encode then parse round trips`() {
+        val state = mapOf(
+            "content://video/1" to MissingInfo(1_700_000_000_000L, 3),
+            "content://audio/2" to MissingInfo(1_700_000_001_000L, 0)
+        )
+        assertEquals(state, parseMissingJson(encodeMissingJson(state)))
+    }
+
+    @Test
+    fun `empty map round trips to empty string map`() {
+        assertEquals(emptyMap<String, MissingInfo>(), parseMissingJson(encodeMissingJson(emptyMap())))
+    }
+
+    @Test
+    fun `entries with non positive first missing time are dropped`() {
+        val json = """{"a":{"first":0,"count":5},"b":{"first":-1,"count":2},"c":{"first":123,"count":1}}"""
+        assertEquals(mapOf("c" to MissingInfo(123L, 1)), parseMissingJson(json))
+    }
+
+    @Test
+    fun `entry with missing time but no count defaults count to zero`() {
+        assertEquals(mapOf("a" to MissingInfo(100L, 0)), parseMissingJson("""{"a":{"first":100}}"""))
+    }
+
+    @Test
+    fun `non object values are skipped`() {
+        val json = """{"a":123,"b":"x"}"""
+        assertEquals(emptyMap<String, MissingInfo>(), parseMissingJson(json))
+    }
+}
+
+/** 测试更新包完整性相关的纯函数 [parseSha256Digest] / [toHex]。 */
+class UpdateIntegrityTest {
+
+    private val hex64 = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+
+    @Test
+    fun `null blank and garbage digests return null`() {
+        assertEquals(null, parseSha256Digest(null))
+        assertEquals(null, parseSha256Digest(""))
+        assertEquals(null, parseSha256Digest("   "))
+        assertEquals(null, parseSha256Digest("sha256:"))
+        assertEquals(null, parseSha256Digest("not-a-hash"))
+    }
+
+    @Test
+    fun `wrong length or non hex digests are rejected`() {
+        assertEquals(null, parseSha256Digest("abcdef"))
+        assertEquals(null, parseSha256Digest("z".repeat(64)))
+        assertEquals(null, parseSha256Digest(hex64.dropLast(1)))
+    }
+
+    @Test
+    fun `bare hex and sha256 prefixed hex are both accepted`() {
+        assertEquals(hex64, parseSha256Digest(hex64))
+        assertEquals(hex64, parseSha256Digest("sha256:$hex64"))
+        assertEquals(hex64, parseSha256Digest("  sha256:$hex64  "))
+    }
+
+    @Test
+    fun `uppercase digest is normalized to lowercase`() {
+        assertEquals(hex64, parseSha256Digest(hex64.uppercase()))
+        assertEquals(hex64, parseSha256Digest("SHA256:${hex64.uppercase()}"))
+    }
+
+    @Test
+    fun `toHex encodes bytes as lowercase two digit pairs`() {
+        assertEquals("", toHex(ByteArray(0)))
+        assertEquals("616263", toHex(byteArrayOf(0x61, 0x62, 0x63)))
+        assertEquals("00ff10", toHex(byteArrayOf(0x00, 0xff.toByte(), 0x10)))
+    }
+
+    @Test
+    fun `toHex matches SHA-256 of known input`() {
+        val digest = java.security.MessageDigest.getInstance("SHA-256").digest("abc".toByteArray())
+        assertEquals(hex64, toHex(digest))
+    }
+}
+
+/** 测试更新包完整性判定 [verifyApkChecksum]（fail-closed 语义）。 */
+class ApkChecksumVerdictTest {
+
+    private val hex64 = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+
+    @Test
+    fun `missing expected checksum is rejected`() {
+        assertEquals(ApkChecksumVerdict.MISSING, verifyApkChecksum(null, hex64))
+        assertEquals(ApkChecksumVerdict.MISSING, verifyApkChecksum("", hex64))
+    }
+
+    @Test
+    fun `matching checksum is accepted`() {
+        assertEquals(ApkChecksumVerdict.OK, verifyApkChecksum(hex64, hex64))
+    }
+
+    @Test
+    fun `checksum comparison ignores case`() {
+        assertEquals(ApkChecksumVerdict.OK, verifyApkChecksum(hex64.uppercase(), hex64))
+        assertEquals(ApkChecksumVerdict.OK, verifyApkChecksum(hex64, hex64.uppercase()))
+    }
+
+    @Test
+    fun `mismatched checksum is flagged`() {
+        assertEquals(ApkChecksumVerdict.MISMATCH, verifyApkChecksum(hex64.dropLast(1) + "0", hex64))
+    }
+}
+
 /** 测试 [UpdateChecker.isNewer] 的版本号比较逻辑。 */
 class UpdateCheckerTest {
 

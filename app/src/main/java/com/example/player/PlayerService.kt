@@ -3,6 +3,7 @@ package com.example.player
 import android.content.Intent
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import androidx.annotation.OptIn
 import androidx.media3.common.AudioAttributes
@@ -15,12 +16,6 @@ import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withTimeoutOrNull
-import kotlin.time.Duration.Companion.milliseconds
 
 /**
  * 播放服务：基于 Media3 的 [MediaSessionService]。
@@ -38,8 +33,11 @@ class PlayerService : MediaSessionService() {
     /** 主线程 Handler，用于定时任务和把回调切回主线程执行。 */
     private val mainHandler = Handler(Looper.getMainLooper())
 
-    /** 服务级协程作用域，用于销毁时做收尾工作（如 flush 落盘）。 */
-    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    /** 服务是否已销毁：销毁后不再重挂进度轮询、不再执行错误托底。 */
+    private var destroyed = false
+
+    /** 连续播放错误计数：整队失败时停止自动跳转，避免无限重试。 */
+    private var consecutiveErrorCount = 0
 
     /** 播放进度内存缓存：uri -> 位置(毫秒)，作为落盘前的缓冲区。 */
     private val progressCache = mutableMapOf<String, Long>()
@@ -73,8 +71,14 @@ class PlayerService : MediaSessionService() {
         }
 
         override fun onIsPlayingChanged(isPlaying: Boolean) {
-            // 暂停（含缓冲暂停）时立即落盘，避免进度丢失
-            if (!isPlaying) persistProgress()
+            // 暂停（含缓冲暂停）时立即落盘，避免进度丢失；恢复播放时按需启动轮询
+            if (!isPlaying) {
+                persistProgress()
+            } else {
+                // 播放成功：重置连续错误计数
+                consecutiveErrorCount = 0
+                scheduleProgressTicker()
+            }
         }
 
         override fun onPlaybackStateChanged(playbackState: Int) {
@@ -107,25 +111,32 @@ class PlayerService : MediaSessionService() {
             val player = mediaSession?.player ?: return
             val errorUri = player.currentMediaItem?.localConfiguration?.uri?.toString() ?: return
 
-            // 前台可能已处理该错误（会调用 notifyErrorHandled），此处先清除标记
-            foregroundHandledErrorUris.remove(errorUri)
+            // 连续错误计数：整队失败时停止自动跳转，避免无限 seek
+            consecutiveErrorCount++
+
+            // Controller 与播放器监听回调可能以不同顺序到达；若前台已确认同一错误，
+            // 不再安排后台托底。确认记录有时效，避免同 URI 的后续错误误消费旧标记。
+            if (consumeForegroundErrorAck(errorUri)) return
 
             // 延迟 500ms 做后台托底：若前台未处理且仍停留在出错项，则自动跳到下一项或暂停
             mainHandler.postDelayed({
-                if (foregroundHandledErrorUris.remove(errorUri)) return@postDelayed
+                if (destroyed) return@postDelayed
+                if (consumeForegroundErrorAck(errorUri)) return@postDelayed
                 val p = mediaSession?.player ?: return@postDelayed
                 val stillOnError =
                     errorUri == p.currentMediaItem?.localConfiguration?.uri?.toString()
                 if (stillOnError && p.playbackState == Player.STATE_IDLE) {
-                    if (p.hasNextMediaItem()) {
+                    val exhausted =
+                        p.mediaItemCount in 1..consecutiveErrorCount
+                    if (p.hasNextMediaItem() && !exhausted) {
                         Log.i(TAG, "后台托底：自动跳到下一项")
                         p.seekToNextMediaItem()
 
                         p.prepare()
                         p.play()
                     } else {
-
-                        p.prepare()
+                        // 无下一项或整队连续出错：只暂停。不再 prepare()，否则会对同一个坏文件
+                        // 反复重新加载、再次报错，与 onPlayerError 形成无限循环
                         p.pause()
                     }
                 }
@@ -133,15 +144,35 @@ class PlayerService : MediaSessionService() {
         }
     }
 
-    /** 进度轮询任务：每 2 秒在播放中或有待删除项时落盘一次进度。 */
-    private val progressTicker = object : Runnable {
-        override fun run() {
-            if (mediaSession?.player?.isPlaying == true || removedUris.isNotEmpty()) {
-                persistProgress()
-            }
+    /** 是否已有待执行的进度轮询任务，避免重复挂起。 */
+    private var tickerScheduled = false
 
-            mainHandler.postDelayed(this, 2000)
+    /**
+     * 进度轮询任务：仅在播放中或有待落盘删除项时落盘并续期；
+     * 无任务时不再续期，避免长时间后台常驻时每 2 秒空转唤醒主线程。
+     */
+    private val progressTicker = Runnable {
+        tickerScheduled = false
+        if (mediaSession?.player?.isPlaying == true || removedUris.isNotEmpty()) {
+            persistProgress()
+            scheduleProgressTicker()
         }
+    }
+
+    /** 按需挂起进度轮询（幂等）。 */
+    private fun scheduleProgressTicker() {
+        // 服务已销毁（或已无媒体会话）后不再挂起，避免销毁后每 2 秒空转、泄漏 Service
+        if (destroyed || mediaSession == null) return
+        if (tickerScheduled) return
+        tickerScheduled = true
+        mainHandler.postDelayed(progressTicker, 2000)
+    }
+
+    /** 取消待执行的进度轮询。 */
+    private fun cancelProgressTicker() {
+        if (!tickerScheduled) return
+        tickerScheduled = false
+        mainHandler.removeCallbacks(progressTicker)
     }
 
     @OptIn(UnstableApi::class)
@@ -164,9 +195,6 @@ class PlayerService : MediaSessionService() {
             .build()
         player.addListener(playerEventListener)
         mediaSession = MediaSession.Builder(this, player).build()
-
-        // 启动进度轮询
-        mainHandler.post(progressTicker)
     }
 
     /** 向控制器返回当前会话。 */
@@ -234,9 +262,11 @@ class PlayerService : MediaSessionService() {
                     removedUris.removeAll(removals)
                     lastPersistedSnapshot = progress
                 } else {
-                    // 落盘失败：把删除项重新放回待处理集合，等待下次重试
+                    // 落盘失败：把删除项重新放回待处理集合，并重新触发轮询以便重试
                     removedUris.addAll(removals)
                     lastPersistedSnapshot = emptyMap()
+                    // 服务销毁后不再触碰轮询等外部状态（scheduleProgressTicker 内部也会拦截）
+                    if (!destroyed) scheduleProgressTicker()
                 }
             }
         }
@@ -250,7 +280,8 @@ class PlayerService : MediaSessionService() {
     }
 
     override fun onDestroy() {
-        mainHandler.removeCallbacks(progressTicker)
+        destroyed = true
+        cancelProgressTicker()
         persistProgress()
         // 释放播放器与会话
         mediaSession?.run {
@@ -260,26 +291,31 @@ class PlayerService : MediaSessionService() {
         mediaSession = null
         instance = null
 
-        // 给最后的落盘任务留一点时间（最多 300ms）
-        serviceScope.launch {
-            withTimeoutOrNull(300.milliseconds) { PlayerRepository.flush() }
-        }
+        // 不再额外等待落盘：进度写任务已经提交到 PlayerRepository 自己的 persistScope
+        // （与服务生命周期无关），而服务级作用域从不取消，等待既等不到也不改变结果。
         super.onDestroy()
     }
 
     companion object {
         private const val TAG = "PlayerService"
+        private const val FOREGROUND_ERROR_ACK_TTL_MS = 500L
 
         /** 当前服务实例（单例），供前台/静态方法调用。 */
         @Volatile
         private var instance: PlayerService? = null
 
         /** 已由前台处理过错误的 uri，用于避免后台托底重复处理。 */
-        private val foregroundHandledErrorUris = mutableSetOf<String>()
+        private val foregroundHandledErrorUris = mutableMapOf<String, Long>()
 
         /** 标记某个 uri 的错误已由前台处理。 */
         fun notifyErrorHandled(uri: String) {
-            foregroundHandledErrorUris.add(uri)
+            foregroundHandledErrorUris[uri] = SystemClock.elapsedRealtime()
+        }
+
+        /** 消费尚未过期的前台确认，兼容 Service 与 Controller 回调先后顺序不同的情况。 */
+        private fun consumeForegroundErrorAck(uri: String): Boolean {
+            val acknowledgedAt = foregroundHandledErrorUris.remove(uri) ?: return false
+            return SystemClock.elapsedRealtime() - acknowledgedAt <= FOREGROUND_ERROR_ACK_TTL_MS
         }
 
         /** 从进度中删除指定 uri（如文件被删除时）。 */
@@ -287,6 +323,7 @@ class PlayerService : MediaSessionService() {
             val svc = instance ?: return
             svc.progressCache.remove(uri)
             svc.removedUris.add(uri)
+            svc.scheduleProgressTicker()
         }
 
         /** 立即把当前播放位置落盘（如退出界面时）。 */

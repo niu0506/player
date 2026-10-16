@@ -36,6 +36,7 @@
 
 - **应用内更新**：检查 GitHub Releases 新版本（GitHub API 优先，响应无法解析时自动回退 jsDelivr CDN；`version.json` 即该回退源）
 - **下载与安装**：经系统 DownloadManager 下载，**GitHub 直连优先、CDN 反代（gh-proxy / ghproxy）加速兜底**，失败自动换源；下载完成先校验产物确为可解析的 APK（防反代返回 200 + HTML 错误页或残包），通过后才调起系统安装器
+- **更新包完整性（fail-closed）**：必须校验 SHA-256 才允许安装——校验和取自 `version.json` 的 `sha256`、GitHub Release 资产的 `digest` 或打包元数据；**拿不到校验和时拒绝安装并提示手动下载**（包名/版本号可被第三方反代伪造，不足以作为信任依据）。校验和不匹配视为残包/篡改，自动尝试下一镜像
 - **更新提示时机**：更新弹窗只在界面处于前台（resumed）时创建，检查期间切走则由 `onResume` 补弹；且不响应「点外部取消」，避免菜单收起等残留触摸把刚弹出的提示框立刻关掉
 - **权限适配**：Android 8+ 的「安装未知应用」授权流程；应用替换成功后自动清理下载目录中的旧更新包
 
@@ -111,7 +112,8 @@ Release 签名信息按优先级取自：
 1. 递增 `app/build.gradle.kts` 的 `versionCode` 与 `versionName`；
 2. 更新仓库根 `version.json`（`version` / `apkUrl` / `notes`）：它是应用内更新在 GitHub API 不可达时的回退源，`apkUrl` 必须指向本次 tag 的 Release 资产，否则「立即更新」会 404；
 3. 提交并推送 `main`，再推送与 `versionName` 同名的 `v<版本>` tag（CI 的 Release job 只在 `v*` tag 上触发）；
-4. CI 自动构建**签名** Release APK 并创建 GitHub Release，资产名 `player-v<版本>-release.apk`。
+4. CI 自动构建**签名** Release APK 并创建 GitHub Release，资产名 `player-v<版本>-release.apk`，同时生成同名 `.sha256` 并在 Release 正文附上 `SHA-256`；
+5. **回填 `version.json` 的 `sha256`**：从第 4 步的 Release 正文 / `.sha256` 资产（或 `gh api repos/<owner>/<repo>/releases/latest` 的资产 `digest`）取得本次 APK 的 SHA-256，写入 `version.json` 后提交推送。缺此字段时应用会按 fail-closed **拒绝**自动安装（防止第三方反代返回被篡改的包），仅能手动安装。
 
 ## 安装
 

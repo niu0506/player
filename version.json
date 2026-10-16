@@ -1,5 +1,5 @@
 {
-  "version": "1.5.3",
-  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.5.3/player-v1.5.3-release.apk",
-  "notes": "播放列表新增按文件夹分组排序：扫描时记录每个文件所属目录，列表按「文件夹 + 组内集数自然序」排列，同一部剧的分集连续相邻，自动连播不再在几部剧之间来回跳（第2集现在排在第10集之前）。已存列表在首次扫描时自动回填目录并重排，进度按 URI 记录不受影响；数据库升级到 v2（playlist 表新增 folder 列）。建议每部剧放在独立文件夹。"
+  "version": "1.5.4",
+  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.5.4/player-v1.5.4-release.apk",
+  "notes": "改进播放错误处理，避免损坏文件导致连续重试；媒体缺失经过多次扫描和宽限期后才清理，降低临时存储不可用时误删列表的风险。修复缺失记录在权限不完整扫描时被重置、播放器队列按下标删除错位的问题。应用内更新增加 APK 包名、版本和可用 SHA-256 校验，并可在安装权限设置后恢复待安装流程。"
 }

@@ -32,14 +32,12 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.receiveAsFlow
-import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -437,6 +435,15 @@ object PlayerRepository {
     private const val TAG = "PlayerRepository"
     private const val DB_NAME = "player.db"
 
+    /** 缺失记录在 kv 表中的键名。 */
+    private const val KEY_MISSING_URIS = "missingUris"
+
+    /**
+     * 缺失条目真正删除前的宽限期：首次缺失需超过该时长、且至少经历过两次缺失才清理，
+     * 用于抵御存储卷暂时不可用/媒体库重建导致的瞬时漏扫。
+     */
+    internal const val MISSING_DELETE_GRACE_MS = 24 * 60 * 60 * 1000L
+
     // 旧版使用 SharedPreferences 存储，这里定义用于一次性迁移到 Room 的键名
     private const val LEGACY_PREFS = "player"
     private const val KEY_LAST_ITEM = "lastItem"
@@ -449,8 +456,8 @@ object PlayerRepository {
     /** 保护数据库事务的互斥锁。 */
     private val writeMutex = Mutex()
 
-    /** 写盘失败通知通道，供界面层监听并提示。 */
-    private val writeFailureChannel = Channel<WriteFailure>(Channel.BUFFERED)
+    /** 写盘失败通知通道，供界面层监听并提示。CONFLATED：只保留最新一条，避免失败时积压刷屏。 */
+    private val writeFailureChannel = Channel<WriteFailure>(Channel.CONFLATED)
     val writeFailures: Flow<WriteFailure> = writeFailureChannel.receiveAsFlow()
 
     /** 保护内存镜像状态的锁。 */
@@ -482,6 +489,10 @@ object PlayerRepository {
     @Volatile
     private var lastItemState: String? = null
 
+    /** 缺失记录内存镜像：uri -> (首次缺失时间, 已观察到的缺失次数)。 */
+    @Volatile
+    private var missingState: Map<String, MissingInfo> = emptyMap()
+
     /** 写盘失败信息。 */
     data class WriteFailure(val message: String)
 
@@ -511,12 +522,16 @@ object PlayerRepository {
             playlistState = emptyList()
             progressState = emptyMap()
             lastItemState = null
+            missingState = emptyMap()
         }
         return false
     }
 
     /** 读取播放列表内存镜像。 */
     fun getPlaylist(): List<MediaItemData> = playlistState
+
+    /** 数据库是否已成功加载（未加载成功时不应把内存镜像落盘，以免覆盖库中已有数据）。 */
+    fun isLoaded(): Boolean = loadSucceeded
 
     /** 读取某 uri 的进度，无记录返回 null。 */
     fun getProgress(uri: String): Long? = progressState[uri]
@@ -582,11 +597,62 @@ object PlayerRepository {
         )
     }
 
-    /** 等待所有挂起的写任务完成（用于退出前保证落盘）。 */
-    suspend fun flush() {
-        loadJob?.awaitOrNull()
-        persistScope.coroutineContext[Job]!!.children.toList().joinAll()
+    /** 读取某 uri 的缺失记录，无记录返回 null。 */
+    internal fun getMissingInfo(uri: String): MissingInfo? = missingState[uri]
+
+    /**
+     * 记录一次“错误路径”发现的缺失（例如播放时 FILE_NOT_FOUND）。
+     * 只保证存在一条记录以固定“首次缺失时间”，不累加缺失次数，因此不会单独触发删除；
+     * 真正删除仍需经历扫描并满足“缺失次数 + 宽限期”条件。
+     */
+    fun recordMissing(uri: String) {
+        if (missingState.containsKey(uri)) return
+        val newState = missingState + (uri to MissingInfo(nowWallClockMs(), 0))
+        missingState = newState
+        persistMissing(newState)
     }
+
+    /**
+     * 合并一轮扫描的缺失判定。仍缺失的累加次数；本轮已观察到但不缺失、或已从列表删除的记录清除；
+     * 未参与本轮判定的 URI 保留原记录，避免权限不足或查询失败时重置宽限期。
+     */
+    fun updateMissingRecords(
+        missingUris: Collection<String>,
+        observedUris: Collection<String>,
+        removedUris: Collection<String> = emptySet(),
+    ) {
+        if (missingUris.isEmpty() && observedUris.isEmpty() && removedUris.isEmpty() && missingState.isEmpty()) return
+        val now = nowWallClockMs()
+        val missingSet = missingUris.toSet()
+        val removedSet = removedUris.toSet()
+        val newState = HashMap(missingState)
+        for (uri in removedSet) newState.remove(uri)
+        for (uri in observedUris) {
+            if (uri !in missingSet) newState.remove(uri)
+        }
+        for (uri in missingUris) {
+            if (uri in removedSet) continue
+            val prev = missingState[uri]
+            newState[uri] = if (prev == null) {
+                MissingInfo(now, 1)
+            } else {
+                MissingInfo(prev.firstMissingMs, prev.missCount + 1)
+            }
+        }
+        missingState = newState
+        persistMissing(newState)
+    }
+
+    /** 异步持久化缺失记录（复用统一写调度）。 */
+    private fun persistMissing(state: Map<String, MissingInfo>) {
+        dispatchWrite(
+            memPart = {},
+            dbPart = { kvDao().put(KvEntity(KEY_MISSING_URIS, encodeMissingJson(state))) }
+        )
+    }
+
+    /** 墙钟毫秒时间戳，用于“距首次缺失多久”的判定（不受设备休眠影响）。 */
+    private fun nowWallClockMs(): Long = System.currentTimeMillis()
 
     /** 在持锁状态下把更新合并进进度内存镜像。 */
     private fun mergeProgressLocked(
@@ -712,6 +778,7 @@ object PlayerRepository {
         }
         progressState = database.progressDao().getAll().associate { it.uri to it.positionMs }
         lastItemState = database.kvDao().get(KEY_LAST_ITEM)
+        missingState = parseMissingJson(database.kvDao().get(KEY_MISSING_URIS))
 
         loadSucceeded = true
     }
@@ -791,6 +858,48 @@ internal fun mergeProgressMap(
         if (v > 0) merged[k] = v
     }
     return merged
+}
+
+/**
+ * 缺失记录：首次缺失时间（墙钟毫秒）与已观察到的缺失次数。
+ * 错误路径只负责创建记录（次数不加），扫描缺失才累加次数，
+ * 因此“至少两次缺失”严格对应“至少两次不同的扫描”。
+ */
+internal data class MissingInfo(
+    val firstMissingMs: Long,
+    val missCount: Int,
+)
+
+/** 解析持久化的缺失记录 JSON，解析失败返回空映射。 */
+internal fun parseMissingJson(json: String?): Map<String, MissingInfo> {
+    if (json.isNullOrEmpty()) return emptyMap()
+    return try {
+        val obj = JSONObject(json)
+        buildMap {
+            for (key in obj.keys()) {
+                val value = obj.optJSONObject(key) ?: continue
+                val first = value.optLong("first", 0L)
+                val count = value.optInt("count", 0)
+                if (first > 0L) put(key, MissingInfo(first, count))
+            }
+        }
+    } catch (_: Exception) {
+        emptyMap()
+    }
+}
+
+/** 把缺失记录编码为 JSON。 */
+internal fun encodeMissingJson(map: Map<String, MissingInfo>): String {
+    val obj = JSONObject()
+    for ((uri, info) in map) {
+        obj.put(
+            uri,
+            JSONObject()
+                .put("first", info.firstMissingMs)
+                .put("count", info.missCount)
+        )
+    }
+    return obj.toString()
 }
 
 /** 解析旧版进度 JSON（uri -> 位置），解析失败返回空映射。 */

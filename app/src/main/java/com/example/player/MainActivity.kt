@@ -9,6 +9,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.provider.MediaStore
 import android.view.View
 import android.widget.PopupMenu
@@ -72,6 +73,12 @@ class MainActivity : AppCompatActivity() {
     /** 是否已从仓库加载过播放列表（用于 onStart 中的分支判断）。 */
     private var playlistLoaded = false
 
+    /**
+     * 连续播放错误计数：播放成功或用户主动切歌时清零，
+     * 达到队列长度时停止自动跳转，避免整队坏文件时无限重试。
+     */
+    private var consecutiveErrorCount = 0
+
     private val scanner = MediaStoreScanner(this)
     private lateinit var updateManager: UpdateManager
     private lateinit var gestures: GestureController
@@ -79,6 +86,9 @@ class MainActivity : AppCompatActivity() {
 
     private companion object {
         const val MENU_ID_CHECK_UPDATE = 100
+
+        /** 写盘失败提示的最小间隔，避免连续失败时反复弹出 Toast。 */
+        const val WRITE_FAILURE_TOAST_MIN_INTERVAL_MS = 15_000L
     }
 
     /** 通知权限请求结果回调（当前无需额外处理）。 */
@@ -98,19 +108,26 @@ class MainActivity : AppCompatActivity() {
     /** 从播放列表与播放器队列中移除指定下标（不处理持久化与提示）。 */
     private fun removeItemAt(index: Int) {
         if (index !in playlist.indices) return
+        // 按下标同步删除前先保证索引含义一致。启动恢复/重排期间，服务队列可能仍是旧顺序。
+        controller?.let(::rebuildQueueIfNeeded)
         clearProgress(playlist[index].uri)
         playlist.removeAt(index)
         controller?.removeMediaItem(index)
     }
 
-    /** 从播放列表删除一项：移除、同步状态、刷新并持久化，最后提示。 */
-    private fun removeItemFromPlaylist(index: Int) {
+    /**
+     * 从播放列表删除一项：移除、同步状态、刷新并持久化，最后提示。
+     * @param showToast 是否弹出“已删除”提示；错误流程中已另行提示时传 false 以免重复弹窗。
+     */
+    private fun removeItemFromPlaylist(index: Int, showToast: Boolean = true) {
         if (index !in playlist.indices) return
         removeItemAt(index)
         syncAdapterPlayingState()
         refreshPlaylist()
         savePlaylist()
-        Toast.makeText(this, R.string.toast_deleted, Toast.LENGTH_SHORT).show()
+        if (showToast) {
+            Toast.makeText(this, R.string.toast_deleted, Toast.LENGTH_SHORT).show()
+        }
     }
 
     /** 把当前播放列表提交给适配器（触发差异刷新）。 */
@@ -139,10 +156,15 @@ class MainActivity : AppCompatActivity() {
         if (index !in playlist.indices || playlist[index].duration == duration) return
         playlist[index] = playlist[index].copy(duration = duration)
         submitPlaylist()
+        // 用解码得到的精确时长覆盖扫描结果并落盘，避免下次启动回退到旧时长
+        savePlaylist()
     }
 
     /** 持久化当前播放列表。 */
     private fun savePlaylist() {
+        // 仓库尚未成功加载（如数据库打开失败）时禁止落盘，
+        // 避免用不完整的列表覆盖库中本已完好的数据
+        if (!PlayerRepository.isLoaded()) return
         PlayerRepository.savePlaylist(playlist.toList())
     }
 
@@ -185,6 +207,9 @@ class MainActivity : AppCompatActivity() {
                 // 暂停时立即落盘，并刷新当前项进度显示
                 PlayerService.flushCurrentPosition()
                 adapter.refreshProgress(controller?.currentMediaItemIndex ?: -1)
+            } else {
+                // 播放成功：重置连续错误计数
+                consecutiveErrorCount = 0
             }
         }
 
@@ -204,6 +229,8 @@ class MainActivity : AppCompatActivity() {
 
             // 定位出错项
             val errorUri = ctrl.currentMediaItem?.localConfiguration?.uri?.toString()
+            // 尽早确认前台接管错误，避免服务的延迟托底先于异步 Controller 命令执行。
+            errorUri?.let { PlayerService.notifyErrorHandled(it) }
             val index = errorUri?.let { uri ->
                 playlist.indexOfFirst { it.uri.toString() == uri }
             } ?: -1
@@ -212,46 +239,44 @@ class MainActivity : AppCompatActivity() {
             // 文件不存在属于可自动跳过的错误
             val isFileGone = error.errorCode == PlaybackException.ERROR_CODE_IO_FILE_NOT_FOUND
 
-            val hasNext = ctrl.hasNextMediaItem()
+            // 连续错误计数：整队都失败时停止自动跳转，避免 REPEAT_MODE_ALL 下无限 seek
+            consecutiveErrorCount++
+            val exhausted =
+                ctrl.mediaItemCount in 1..consecutiveErrorCount
+            val hasNext = !exhausted && ctrl.hasNextMediaItem()
+
             if (hasNext) {
-                // 有下一项：自动跳到下一项继续播放
+                // 有下一项且未达到整队上限：自动跳到下一项继续播放
                 ctrl.seekToNextMediaItem()
                 ctrl.prepare()
                 ctrl.play()
             } else {
-                // 无下一项：准备并暂停
-                ctrl.prepare()
+                // 无下一项或整队连续出错：只暂停。不再 prepare()，否则会对同一个坏文件
+                // 反复重新加载、再次报错，与 onPlayerError 形成无限循环
                 ctrl.pause()
             }
 
-            // 通知服务该错误已由前台处理，避免触发后台托底逻辑
-            errorUri?.let { PlayerService.notifyErrorHandled(it) }
-
-            if (isFileGone && index in playlist.indices) {
-                // 文件丢失：提示并从列表移除
-                Toast.makeText(
-                    this@MainActivity,
-                    getString(
-                        if (hasNext) R.string.toast_file_unreadable
-                        else R.string.toast_file_unreadable_last,
-                        name
-                    ),
-                    Toast.LENGTH_SHORT
-                ).show()
-
-                removeItemFromPlaylist(index)
-            } else {
-                // 其他播放错误：仅提示
-                Toast.makeText(
-                    this@MainActivity,
-                    getString(
-                        if (hasNext) R.string.toast_playback_error
-                        else R.string.toast_playback_error_last,
-                        name
-                    ),
-                    Toast.LENGTH_SHORT
-                ).show()
+            if (isFileGone && errorUri != null) {
+                // 文件丢失：只记录一次缺失（条目与进度都保留），真正删除交给扫描流程按
+                // “多次缺失 + 超过宽限期”判定，避免存储卷瞬时不可用时误删
+                PlayerRepository.recordMissing(errorUri)
             }
+
+            // 整队失败只提示一次；否则按是否有下一项给出对应提示（不再删除任何条目）
+            val message = when {
+                exhausted -> getString(R.string.toast_playback_error_all_failed)
+                isFileGone -> getString(
+                    if (hasNext) R.string.toast_file_unreadable
+                    else R.string.toast_file_unreadable_last,
+                    name
+                )
+                else -> getString(
+                    if (hasNext) R.string.toast_playback_error
+                    else R.string.toast_playback_error_last,
+                    name
+                )
+            }
+            Toast.makeText(this@MainActivity, message, Toast.LENGTH_SHORT).show()
         }
 
         override fun onPlaybackSuppressionReasonChanged(playbackSuppressionReason: Int) {
@@ -312,12 +337,13 @@ class MainActivity : AppCompatActivity() {
         // 重建前先把当前位置落盘，避免清空队列时丢失进度
         PlayerService.flushCurrentPosition()
 
-        ctrl.clearMediaItems()
-        for (item in playlist) {
-            ctrl.addMediaItem(buildMediaItem(item))
-        }
+        // 原子替换整个队列：避免 clearMediaItems 让播放器短暂进入 STATE_ENDED
+        // 而被 PlayerService 暂停播放，也避免逐项 addMediaItem 产生一串中间切换
+        val items = playlist.map(::buildMediaItem)
         if (curIdx >= 0) {
-            ctrl.seekTo(curIdx, curPos)
+            ctrl.setMediaItems(items, curIdx, curPos)
+        } else {
+            ctrl.setMediaItems(items)
         }
     }
 
@@ -449,7 +475,9 @@ class MainActivity : AppCompatActivity() {
     }
     private val scanHandler = Handler(Looper.getMainLooper())
     private val debouncedScanRunnable = Runnable {
-        if (hasStoragePermission()) scanLocalMedia()
+        // 媒体库变化是被动事件（系统或其他应用写文件均可触发），因此只做静默清理与重排：
+        // 不新增条目、不弹任何 Toast，避免反复骚扰用户；新增条目仍由用户手动点“扫描”触发。
+        if (hasStoragePermission()) scanLocalMedia(silent = true)
     }
 
     /** 触发扫描本地媒体（异步）。 */
@@ -561,17 +589,29 @@ class MainActivity : AppCompatActivity() {
         scannedVideos: List<MediaItemData>?,
         scannedAudios: List<MediaItemData>?
     ): Int {
-        // 只有在拥有对应类型完整权限时，才能确定“扫描不到即已删除”
-        val videoKeys = if (scannedVideos != null && scanner.hasFullMediaAccess(android.Manifest.permission.READ_MEDIA_VIDEO)) {
+        // null 表示查询失败或权限不足；成功返回空列表则表示该类型当前没有可见媒体。
+        // 缺失记录需要重复扫描并经过宽限期，避免一次空结果就误删。
+        val videoKeys = if (scannedVideos != null &&
+            scanner.hasFullMediaAccess(android.Manifest.permission.READ_MEDIA_VIDEO)
+        ) {
             scannedVideos.map { normalizeUri(it.uri) }.toSet()
         } else null
-        val audioKeys = if (scannedAudios != null && scanner.hasFullMediaAccess(android.Manifest.permission.READ_MEDIA_AUDIO)) {
+        val audioKeys = if (scannedAudios != null &&
+            scanner.hasFullMediaAccess(android.Manifest.permission.READ_MEDIA_AUDIO)
+        ) {
             scannedAudios.map { normalizeUri(it.uri) }.toSet()
         } else null
         val videoPrefix = MediaStore.Video.Media.EXTERNAL_CONTENT_URI.toString()
         val audioPrefix = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI.toString()
         var removed = 0
 
+        // 本次扫描中确认缺失的项（原始 uri）。删除判定改为读取持久化的缺失记录：
+        // 只有“此前至少缺失过一次”且“距首次缺失超过宽限期”才真正删除，
+        // 从而抵御存储卷暂时不可用/媒体库重建导致的瞬时漏扫，且跨启动有效。
+        val missingNow = mutableSetOf<String>()
+        val observedNow = mutableSetOf<String>()
+        val removedNow = mutableSetOf<String>()
+        val now = System.currentTimeMillis()
         // 倒序遍历，便于安全删除
         for (i in playlist.indices.reversed()) {
             val item = playlist[i]
@@ -582,11 +622,24 @@ class MainActivity : AppCompatActivity() {
                 uriStr.startsWith(audioPrefix) -> audioKeys
                 else -> null
             }
-            if (keys != null && normalizeUri(item.uri) !in keys) {
+            if (keys == null) continue
+            observedNow.add(uriStr)
+            val key = normalizeUri(item.uri)
+            if (key in keys) continue
+            // 本次扫描确认缺失：记入缺失集合
+            missingNow.add(uriStr)
+            val prev = PlayerRepository.getMissingInfo(uriStr)
+            val missingBefore = prev != null && prev.missCount >= 1
+            val oldEnough = prev != null &&
+                now - prev.firstMissingMs >= PlayerRepository.MISSING_DELETE_GRACE_MS
+            if (missingBefore && oldEnough) {
                 removeItemAt(i)
+                removedNow.add(uriStr)
                 removed++
             }
         }
+        // 本轮确认缺失的累加次数；重新发现或已从播放列表移除的清除；未检查的类型保留原记录。
+        PlayerRepository.updateMissingRecords(missingNow, observedNow, removedNow)
         if (removed > 0) {
             syncAdapterPlayingState()
         }
@@ -597,9 +650,13 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
-        // 监听仓库写盘失败并提示
+        // 监听仓库写盘失败并提示（带节流，避免连续失败时刷屏）
         lifecycleScope.launch {
+            var lastShownMs = 0L
             PlayerRepository.writeFailures.collect {
+                val now = SystemClock.elapsedRealtime()
+                if (now - lastShownMs < WRITE_FAILURE_TOAST_MIN_INTERVAL_MS) return@collect
+                lastShownMs = now
                 Toast.makeText(
                     this@MainActivity,
                     R.string.toast_repository_write_failed,
@@ -617,6 +674,9 @@ class MainActivity : AppCompatActivity() {
             onClick = { uri ->
                 val index = playlist.indexOfFirst { it.uri.toString() == uri }
                 if (index >= 0) {
+
+                    // 用户主动切歌：重置连续错误计数
+                    consecutiveErrorCount = 0
 
                     // 切歌前先把当前播放位置落盘
                     PlayerService.flushCurrentPosition()
@@ -771,6 +831,9 @@ class MainActivity : AppCompatActivity() {
         updateManager.unregisterReceivers()
         contentResolver.unregisterContentObserver(mediaChangeObserver)
         scanHandler.removeCallbacks(debouncedScanRunnable)
+        // 停止后不再需要后台扫描：取消进行中的扫描任务，避免其在停止后弹 Toast
+        scanJob?.cancel()
+        scanJob = null
         fullscreenPip.onStopped()
         gestures.cancelPendingHide()
         // 断开控制器连接并释放资源
