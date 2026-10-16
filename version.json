@@ -1,5 +1,5 @@
 {
-  "version": "1.5.4",
-  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.5.4/player-v1.5.4-release.apk",
-  "notes": "改进播放错误处理，避免损坏文件导致连续重试；媒体缺失经过多次扫描和宽限期后才清理，降低临时存储不可用时误删列表的风险。修复缺失记录在权限不完整扫描时被重置、播放器队列按下标删除错位的问题。应用内更新增加 APK 包名、版本和可用 SHA-256 校验，并可在安装权限设置后恢复待安装流程。"
+  "version": "1.5.5",
+  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.5.5/player-v1.5.5-release.apk",
+  "notes": "修复并发重试加载成功后内存播放列表被误清空的竞态问题。修复服务未运行时删除播放进度不生效的问题。数据库迁移脚本改为可测试定义，媒体库变化监听改用非废弃接口。"
 }
