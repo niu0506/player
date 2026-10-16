@@ -412,15 +412,18 @@ abstract class PlayerDatabase : RoomDatabase() {
     abstract fun playlistDao(): PlaylistDao
     abstract fun progressDao(): ProgressDao
     abstract fun kvDao(): KvDao
-}
 
-/**
- * v1 -> v2：播放列表项新增「文件夹分组键」列。
- * 旧数据统一填默认空串（随后由扫描结果回填），不删除任何用户数据。
- */
-private val MIGRATION_1_2 = object : Migration(1, 2) {
-    override fun migrate(db: SupportSQLiteDatabase) {
-        db.execSQL("ALTER TABLE playlist ADD COLUMN folder TEXT NOT NULL DEFAULT ''")
+    companion object {
+        /**
+         * v1 -> v2：播放列表项新增「文件夹分组键」列。
+         * 旧数据统一填默认空串（随后由扫描结果回填），不删除任何用户数据。
+         * 定义在 companion（internal）便于迁移单测直接引用。
+         */
+        internal val MIGRATION_1_2 = object : Migration(1, 2) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE playlist ADD COLUMN folder TEXT NOT NULL DEFAULT ''")
+            }
+        }
     }
 }
 
@@ -511,20 +514,29 @@ object PlayerRepository {
 
     /**
      * 等待数据库加载完成。
-     * 返回是否加载成功；失败时会清空内存镜像，便于下次调用重试。
+     * 返回是否加载成功；所等待的加载失败且期间无并发重试成功时，清空内存镜像，
+     * 便于下次调用重试（若并发方已重试成功，则保留其新装载的数据并按成功返回）。
      */
     suspend fun awaitLoaded(context: Context): Boolean {
         ensureLoaded(context)
         val job = synchronized(loadLock) { loadJob } ?: return false
         val failure = job.awaitOrNull() ?: return true
-        Log.e(TAG, "数据库加载失败，内存镜像已重置为空（下次调用会重试）", failure)
-        synchronized(stateLock) {
-            playlistState = emptyList()
-            progressState = emptyMap()
-            lastItemState = null
-            missingState = emptyMap()
+        Log.e(TAG, "数据库加载失败", failure)
+        synchronized(loadLock) {
+            // 仅当失败的 job 仍是当前加载任务时才清空镜像：若并发写入方已通过
+            // reloadAfterFailure 重试成功（镜像已重新装载），迟到的清空会把好数据抹掉
+            // （loadSucceeded 已为 true 后不会再重载，镜像将保持为空直到进程重启）
+            if (loadJob === job && !loadSucceeded) {
+                synchronized(stateLock) {
+                    playlistState = emptyList()
+                    progressState = emptyMap()
+                    lastItemState = null
+                    missingState = emptyMap()
+                }
+            }
         }
-        return false
+        // 按当前实际加载状态返回：并发重试可能已成功，此时不应误报失败
+        return loadSucceeded
     }
 
     /** 读取播放列表内存镜像。 */
@@ -761,7 +773,7 @@ object PlayerRepository {
     private suspend fun loadInternal(appCtx: Context) {
 
         val database = Room.databaseBuilder(appCtx, PlayerDatabase::class.java, DB_NAME)
-            .addMigrations(MIGRATION_1_2)
+            .addMigrations(PlayerDatabase.MIGRATION_1_2)
             .build()
         db = database
         val prefs = appCtx.getSharedPreferences(LEGACY_PREFS, Context.MODE_PRIVATE)

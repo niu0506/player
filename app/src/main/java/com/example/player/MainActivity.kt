@@ -466,9 +466,7 @@ class MainActivity : AppCompatActivity() {
 
     /** 媒体库内容变化监听：去抖 800ms 后触发重新扫描。 */
     private val mediaChangeObserver = object : ContentObserver(Handler(Looper.getMainLooper())) {
-        @Deprecated("Deprecated in Java")
-        override fun onChange(selfChange: Boolean, uri: Uri?) {
-
+        override fun onChange(selfChange: Boolean) {
             scanHandler.removeCallbacks(debouncedScanRunnable)
             scanHandler.postDelayed(debouncedScanRunnable, 800)
         }
