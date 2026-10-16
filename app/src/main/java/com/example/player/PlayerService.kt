@@ -318,9 +318,15 @@ class PlayerService : MediaSessionService() {
             return SystemClock.elapsedRealtime() - acknowledgedAt <= FOREGROUND_ERROR_ACK_TTL_MS
         }
 
-        /** 从进度中删除指定 uri（如文件被删除时）。 */
+        /** 从进度中删除指定 uri（如文件被删除时）。服务未运行时直接走仓库级删除兜底。 */
         fun dropProgress(uri: String) {
-            val svc = instance ?: return
+            val svc = instance
+            if (svc == null) {
+                // 服务未运行：没有内存缓存可清理，直接删除仓库中的进度，
+                // 保证该函数单独调用（不配合仓库级删除）时语义也完整
+                PlayerRepository.applyProgressUpdates(emptyMap(), setOf(uri))
+                return
+            }
             svc.progressCache.remove(uri)
             svc.removedUris.add(uri)
             svc.scheduleProgressTicker()
