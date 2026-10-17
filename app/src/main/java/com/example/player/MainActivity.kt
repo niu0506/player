@@ -29,6 +29,7 @@ import androidx.annotation.StringRes
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.core.net.toUri
 import androidx.lifecycle.lifecycleScope
 import androidx.media3.common.C
 import androidx.media3.common.PlaybackException
@@ -163,14 +164,14 @@ class MainActivity : AppCompatActivity() {
         savePlaylistNow()
     }
 
+    /** 现有条目的统一身份键集合：与扫描去重、目录回填同口径（[normalizeUri]）。 */
     private fun existingUriKeys(): Set<String> = playlist.map { normalizeUri(it.uri) }.toSet()
 
-    /** 按播放器侧的原始 uri 定位列表条目（与仓库的进度键保持一致）。 */
-    private fun indexOfUri(uri: String): Int =
-        playlist.indexOfFirst { it.uri.toString() == uri }
-
-    private fun findItemByUri(uri: String): MediaItemData? =
-        playlist.firstOrNull { it.uri.toString() == uri }
+    /** 按统一的身份键（[normalizeUri]）定位列表条目；找不到返回 -1。 */
+    private fun indexOfUri(uri: String): Int {
+        val key = normalizeUri(uri.toUri())
+        return playlist.indexOfFirst { normalizeUri(it.uri) == key }
+    }
 
     /** 从仓库把已存列表载入当前列表（仅在首次加载、列表为空时调用）。 */
     private fun loadPlaylist() {
@@ -575,7 +576,7 @@ class MainActivity : AppCompatActivity() {
                 if (isFileGone && event.uri != null) {
                     PlayerRepository.recordMissing(event.uri)
                 }
-                val name = event.uri?.let(::findItemByUri)?.name ?: "未知文件"
+                val name = event.uri?.let { playlist.getOrNull(indexOfUri(it)) }?.name ?: "未知文件"
                 val message = when {
                     event.exhausted -> getString(R.string.toast_playback_error_all_failed)
                     isFileGone -> getString(
@@ -609,7 +610,7 @@ class MainActivity : AppCompatActivity() {
                 }
             },
             onDelete = { uri ->
-                val item = findItemByUri(uri) ?: return@MediaListAdapter
+                val item = playlist.getOrNull(indexOfUri(uri)) ?: return@MediaListAdapter
                 AlertDialog.Builder(this)
                     .setTitle(R.string.delete_dialog_title)
                     .setMessage(getString(R.string.delete_dialog_message, item.name))

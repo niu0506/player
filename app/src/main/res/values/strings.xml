@@ -94,7 +94,6 @@
     <string name="update_download_ready">更新包已下载完成，请在系统「下载」目录中手动安装</string>
 
     <!-- 播放器控制栏无障碍描述 -->
-    <string name="player_control_action">播放器操作</string>
     <string name="player_control_shuffle">随机播放</string>
     <string name="player_control_repeat">循环模式</string>
     <string name="player_control_fullscreen">全屏</string>
