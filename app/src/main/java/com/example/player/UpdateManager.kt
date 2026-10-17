@@ -14,6 +14,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
@@ -318,8 +319,16 @@ class UpdateManager(private val activity: AppCompatActivity) {
                 if (activity.isFinishing || activity.isDestroyed) return@withContext
 
                 val current = try {
-                    activity.packageManager.getPackageInfo(activity.packageName, 0).versionName
-                        ?.takeIf { it.isNotBlank() }
+                    val info = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        activity.packageManager.getPackageInfo(
+                            activity.packageName,
+                            PackageManager.PackageInfoFlags.of(0)
+                        )
+                    } else {
+                        @Suppress("DEPRECATION")
+                        activity.packageManager.getPackageInfo(activity.packageName, 0)
+                    }
+                    info.versionName?.takeIf { it.isNotBlank() }
                 } catch (_: Exception) {
                     null
                 }

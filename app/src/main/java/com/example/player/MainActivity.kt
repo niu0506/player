@@ -25,7 +25,6 @@ import android.widget.TextView
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.OptIn
-import androidx.annotation.RequiresApi
 import androidx.annotation.StringRes
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
@@ -223,9 +222,11 @@ class MainActivity : AppCompatActivity() {
             syncSpeedLabel()
         }
 
-        @RequiresApi(Build.VERSION_CODES.O)
         override fun onVideoSizeChanged(videoSize: VideoSize) {
-            if (fullscreenPip.isInPipMode) fullscreenPip.updatePipAspectRatio(videoSize)
+            // 回调在全部版本都会触发；PiP 比例仅在 API 26+ 生效，故此处显式判版本而非标注 @RequiresApi
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && fullscreenPip.isInPipMode) {
+                fullscreenPip.updatePipAspectRatio(videoSize)
+            }
         }
     }
 
