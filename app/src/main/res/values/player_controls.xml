@@ -66,6 +66,11 @@
         <item name="android:src">@drawable/player_control_overflow_hide</item>
         <item name="android:contentDescription">@string/player_control_less</item>
     </style>
+    <!-- 仅全屏时显示，位于左上角，随控制栏一起显隐 -->
+    <style name="PlayerControls.Button.Back" parent="PlayerControls.Button.Bottom">
+        <item name="android:src">@drawable/ic_back</item>
+        <item name="android:contentDescription">@string/player_control_back</item>
+    </style>
     <style name="PlayerControls.Button.Center" parent="PlayerControls.Button">
         <item name="android:layout_width">@dimen/player_control_icon_size</item>
         <item name="android:layout_height">@dimen/player_control_icon_size</item>

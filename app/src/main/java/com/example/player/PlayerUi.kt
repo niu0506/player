@@ -101,10 +101,17 @@ class FullscreenPipHelper(
         binding.playlistContainer.visibility = visibility
     }
 
+    /** 左上角返回键仅全屏时可见（本身在控制栏内，随控制栏一起显隐）。 */
+    private fun setFullscreenBackVisible(visible: Boolean) {
+        binding.playerView.findViewById<View>(R.id.btn_fullscreen_back)?.visibility =
+            if (visible) View.VISIBLE else View.GONE
+    }
+
     /** 根据当前（普通 / 全屏 / PiP）状态统一套用界面样式。 */
     private fun applyVisualState(pipPreparing: Boolean = false) {
         val pipLike = isInPipMode || pipPreparing
         setChromeVisible(!pipLike && !isFullscreen)
+        setFullscreenBackVisible(isFullscreen && !pipLike)
         binding.playerView.useController = !pipLike
         when {
             // PiP（或进入前的过渡态）：按真实比例缩放铺满小窗

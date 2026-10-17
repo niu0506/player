@@ -103,6 +103,7 @@
     <string name="player_control_shuffle">随机播放</string>
     <string name="player_control_repeat">循环模式</string>
     <string name="player_control_fullscreen">全屏</string>
+    <string name="player_control_back">退出全屏返回</string>
     <string name="player_control_more">更多控制</string>
     <string name="player_control_less">收起控制</string>
     <string name="player_control_previous">上一项</string>

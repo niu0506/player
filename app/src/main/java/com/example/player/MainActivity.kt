@@ -322,6 +322,10 @@ class MainActivity : AppCompatActivity() {
         binding.playerView.findViewById<View>(R.id.btn_subtitle)?.setOnClickListener {
             showTrackSelection(C.TRACK_TYPE_TEXT, R.string.track_select_subtitle_title)
         }
+        // 全屏左上角返回键：退出全屏
+        binding.playerView.findViewById<View>(R.id.btn_fullscreen_back)?.setOnClickListener {
+            fullscreenPip.setFullscreen(false)
+        }
     }
 
     /** 把倍速按钮文案与播放器真实速度对齐（重连 / 外部改速后调用）。 */
