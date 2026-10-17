@@ -116,7 +116,7 @@ class FullscreenPipHelper(
         when {
             // PiP（或进入前的过渡态）：按真实比例缩放铺满小窗
             pipLike -> applyEdgeToEdgeSurface(AspectRatioFrameLayout.RESIZE_MODE_ZOOM)
-            // 全屏：等比放大铺满，无黑边
+            // 全屏：按真实比例完整显示（不裁剪画面，可能留黑边）
             isFullscreen -> applyEdgeToEdgeSurface(AspectRatioFrameLayout.RESIZE_MODE_FIT)
             else -> applyNormalVideoSurfaceStyle()
         }
