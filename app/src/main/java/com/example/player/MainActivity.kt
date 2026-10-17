@@ -673,7 +673,7 @@ class MainActivity : AppCompatActivity() {
     override fun onStart() {
         super.onStart()
         updateManager.registerReceivers()
-        updateManager.resumePendingInstall()
+        updateManager.resumePendingDownload()
         // 监听视频 / 音频媒体库变化
         contentResolver.registerContentObserver(
             MediaStore.Video.Media.EXTERNAL_CONTENT_URI, true, mediaChangeObserver
@@ -756,9 +756,8 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
-        // 回到前台补弹检查期间被推迟的更新提示与安装确认
+        // 回到前台补弹检查期间被推迟的更新提示
         updateManager.resumePendingUpdateDialog()
-        updateManager.resumePendingInstallPrompt()
     }
 
     override fun onUserLeaveHint() {

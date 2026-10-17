@@ -35,10 +35,11 @@
 ### 更新
 
 - **应用内更新**：经 GitHub Releases API 检查新版本
-- **下载与安装**：经系统 DownloadManager 从 GitHub Release 资产直连下载；下载完成先校验产物确为可解析的 APK（防残包 / 错误页），通过后弹确认框，用户确认才调起系统安装器
-- **更新包完整性（fail-closed）**：必须校验 SHA-256 才允许安装——校验和取自 GitHub Release 资产的 `digest`；**拿不到校验和时拒绝安装并提示手动下载**（包名/版本号可被伪造，不足以作为信任依据）。校验和不匹配视为残包/篡改，直接判定下载失败
+- **下载**：经系统 DownloadManager 从 GitHub Release 资产直连下载到系统公共「下载」目录（DownloadManager 以系统身份写入，应用无需存储权限）
+- **不代调安装器**：本应用**不**调起系统安装器；校验通过后提示用户到系统「下载」目录手动安装（或点系统下载完成通知自行安装）
+- **更新包完整性（fail-closed）**：必须校验 SHA-256 才判定下载通过——校验和取自 GitHub Release 资产的 `digest`；**拿不到校验和时判定下载失败并提示手动下载**（包名/版本号可被伪造，不足以作为信任依据）。校验和不匹配视为残包/篡改，直接判定下载失败
 - **更新提示时机**：更新弹窗只在界面处于前台（resumed）时创建，检查期间切走则由 `onResume` 补弹；且不响应「点外部取消」，避免菜单收起等残留触摸把刚弹出的提示框立刻关掉
-- **权限适配**：Android 8+ 的「安装未知应用」授权流程；应用替换成功后自动清理下载目录中的旧更新包
+- **收尾**：应用替换成功后自动清理「下载」目录中的旧更新包（`MY_PACKAGE_REPLACED` 广播）
 
 ### 系统适配
 
@@ -53,7 +54,7 @@
 - 架构：前台服务（`PlayerService`）+ 单 Activity（`MainActivity`），经 MediaController 通信；源码扁平化为单包 5 文件，UI 逻辑拆分为 `GestureController`、`FullscreenPipHelper`、`MediaStoreScanner` 等职责类（见 `PlayerUi.kt` / `PlayerRepository.kt` / `UpdateManager.kt`）；依赖版本集中在 `gradle/libs.versions.toml`
 - 控制栏：使用应用自有的尺寸、颜色、样式与图标资源；仅依赖 Media3 文档化的控制视图 ID 和图标属性，避免绑定其私有布局资源
 - 持久化：Room 数据库（播放列表、进度映射、KV 分表存储，统一「合并写」入口）；schema 导出至 `app/schemas/` 并纳入版本控制。加载失败**不是终态**：会按需重试（30 秒冷却），失败期间的写入不再被静默丢弃，界面给出提示
-- 更新下载：系统 DownloadManager 写入**应用外部私有** `getExternalFilesDir(DIRECTORY_DOWNLOADS)`（全版本免存储权限，分区存储下可用）；安装器经 FileProvider content URI 授权直读。注意 `setDestinationUri` 只接受 `file://`，传 `content://`（MediaStore 目标）会抛 `IllegalArgumentException` —— 这正是 v1.4.8 修复的「点立即更新闪退」根因，勿回退为 MediaStore 目标
+- 更新下载：系统 DownloadManager 经 `setDestinationInExternalPublicDir` 写入系统公共「下载」目录（DownloadManager 以系统身份写入，应用无需存储权限；文件对用户/文件管理器可见，便于手动安装）。校验时经 `getUriForDownloadedFile` 的 content uri 读取，并复制到缓存临时文件以解析 APK 元数据。注意：`setDestinationUri` 只接受 `file://`，传 `content://`（MediaStore 目标）会抛 `IllegalArgumentException` —— 这正是 v1.4.8 修复的「点立即更新闪退」根因，勿回退为 content:// 目标
 - UI：ViewBinding + RecyclerView（DiffUtil 后台差分刷新）
 - 构建：AGP + Kotlin DSL (Gradle)，GitHub Actions CI 自动构建
 
@@ -113,11 +114,11 @@ Release 签名信息按优先级取自：
 2. 更新仓库根 `version.json` 的 `notes`（供 CI 生成 Release 说明；版本号以 `build.gradle.kts` 为唯一来源）；
 3. 提交并推送 `main`，再推送与 `versionName` 同名的 `v<版本>` tag（CI 的 Release job 只在 `v*` tag 上触发）；
 4. CI 自动构建**签名** Release APK 并创建 GitHub Release，资产名 `player-v<版本>-release.apk`，同时生成同名 `.sha256` 并在 Release 正文附上 `SHA-256`；
-5. 应用内更新的 SHA-256 直接取自 GitHub Release 资产的 `digest`（GitHub 对上传资产自动计算）。若该字段缺失，应用会按 fail-closed **拒绝**安装，仅能手动安装。
+5. 应用内更新的 SHA-256 直接取自 GitHub Release 资产的 `digest`（GitHub 对上传资产自动计算）。若该字段缺失，应用会按 fail-closed **判定下载失败**，仅能手动下载安装。
 
 ## 安装
 
-将构建出的 `app-debug.apk` 传输到设备后直接安装；或使用 Android Studio 运行到设备/模拟器。首次使用需授予媒体访问权限；应用内更新安装还需在系统设置中授予本应用「安装未知应用」权限。
+将构建出的 `app-debug.apk` 传输到设备后直接安装；或使用 Android Studio 运行到设备/模拟器。首次使用需授予媒体访问权限。应用内更新只负责下载并校验更新包，安装由用户在系统「下载」目录手动完成。
 
 ## 目录结构
 
@@ -127,7 +128,7 @@ app/src/main/java/com/example/player/
 ├── PlayerRepository.kt              # 数据模型 + 媒体库扫描 + Room 数据库与统一合并写入口
 ├── PlayerService.kt                 # 前台服务、后台播放、进度持久化
 ├── PlayerUi.kt                      # 手势控制、全屏与画中画切换、播放列表适配器（DiffUtil 后台差分）
-└── UpdateManager.kt                 # 应用内更新检查（GitHub Releases）+ 下载、校验与安装流程
+└── UpdateManager.kt                 # 应用内更新检查（GitHub Releases）+ 下载与校验（不代调安装器）
 
 app/src/test/java/com/example/player/
 └── PlayerTests.kt                   # 进度合并语义 / 进度末尾裁决 / 时长格式化 / 列表高亮越界防护 / 版本比较 / 安装包完整性校验 / 文件夹分组键与集数自然序
