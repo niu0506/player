@@ -25,6 +25,7 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.annotation.OptIn
 import androidx.annotation.RequiresApi
+import androidx.annotation.StringRes
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
@@ -51,6 +52,21 @@ import kotlinx.coroutines.withContext
 import kotlin.math.abs
 import kotlin.math.max
 import androidx.core.content.edit
+
+/** 统一的短提示入口。 */
+internal fun Context.toast(@StringRes resId: Int, vararg args: Any?) {
+    Toast.makeText(this, getString(resId, *args), Toast.LENGTH_SHORT).show()
+}
+
+/** 统一的长提示入口。 */
+internal fun Context.toastLong(@StringRes resId: Int, vararg args: Any?) {
+    Toast.makeText(this, getString(resId, *args), Toast.LENGTH_LONG).show()
+}
+
+/** 已拼好的文案直接提示。 */
+internal fun Context.toastMessage(message: CharSequence) {
+    Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
+}
 
 /**
  * 全屏与画中画（PiP）辅助类：统一管理视频表面样式、系统栏显隐与方向。
@@ -86,23 +102,17 @@ class FullscreenPipHelper(
     }
 
     /** 根据当前（普通 / 全屏 / PiP）状态统一套用界面样式。 */
-    private fun applyVisualState() {
-        setChromeVisible(!isInPipMode && !isFullscreen)
-        binding.playerView.useController = !isInPipMode
+    private fun applyVisualState(pipPreparing: Boolean = false) {
+        val pipLike = isInPipMode || pipPreparing
+        setChromeVisible(!pipLike && !isFullscreen)
+        binding.playerView.useController = !pipLike
         when {
-            // PiP：按真实比例缩放铺满小窗
-            isInPipMode -> applyEdgeToEdgeSurface(AspectRatioFrameLayout.RESIZE_MODE_ZOOM)
+            // PiP（或进入前的过渡态）：按真实比例缩放铺满小窗
+            pipLike -> applyEdgeToEdgeSurface(AspectRatioFrameLayout.RESIZE_MODE_ZOOM)
             // 全屏：等比放大铺满，无黑边
             isFullscreen -> applyEdgeToEdgeSurface(AspectRatioFrameLayout.RESIZE_MODE_FIT)
             else -> applyNormalVideoSurfaceStyle()
         }
-    }
-
-    /** 进入 PiP 前的过渡状态：隐藏界面元素、关闭控制栏。 */
-    private fun applyPipPreparingState() {
-        setChromeVisible(false)
-        binding.playerView.useController = false
-        applyEdgeToEdgeSurface(AspectRatioFrameLayout.RESIZE_MODE_ZOOM)
     }
 
     /** 边到边视频表面：去除卡片圆角与边距。 */
@@ -163,48 +173,38 @@ class FullscreenPipHelper(
      */
     fun enterPipMode(showError: Boolean = true): Boolean {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
-            if (showError) {
-                Toast.makeText(activity, R.string.toast_pip_unsupported, Toast.LENGTH_SHORT).show()
-            }
+            if (showError) activity.toast(R.string.toast_pip_unsupported)
             return false
         }
         val vs = controllerProvider()?.videoSize
         if (vs == null || !hasVideo(vs)) {
-            if (showError) {
-                Toast.makeText(activity, R.string.toast_pip_no_video, Toast.LENGTH_SHORT).show()
-            }
+            if (showError) activity.toast(R.string.toast_pip_no_video)
             return false
         }
         val wasFullscreen = isFullscreen
-        if (wasFullscreen) {
-            isFullscreen = false
-            activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
-        }
-        applyPipPreparingState()
+        if (wasFullscreen) setFullscreen(false)
+        applyVisualState(pipPreparing = true)
         try {
-
-            val ratio = try {
-                Rational(vs.width, vs.height)
-            } catch (_: Exception) {
-                Rational(16, 9)
-            }
+            val ratio = aspectRatioOf(vs) ?: Rational(16, 9)
             if (activity.enterPictureInPictureMode(buildPipParams(ratio))) return true
         } catch (_: Exception) {
         }
         // 进入失败：回滚全屏状态与界面样式
-        if (wasFullscreen) {
-            isFullscreen = true
-            activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-        }
-        applyVisualState()
-        if (showError) {
-            Toast.makeText(activity, R.string.toast_pip_failed, Toast.LENGTH_SHORT).show()
-        }
+        if (wasFullscreen) setFullscreen(true) else applyVisualState()
+        if (showError) activity.toast(R.string.toast_pip_failed)
         return false
     }
 
     private fun hasVideo(videoSize: VideoSize): Boolean =
         videoSize.width > 0 && videoSize.height > 0
+
+    /** 视频尺寸转系统比例；非法尺寸返回 null。 */
+    private fun aspectRatioOf(videoSize: VideoSize): Rational? =
+        try {
+            Rational(videoSize.width, videoSize.height)
+        } catch (_: Exception) {
+            null
+        }
 
     /** 构造 PiP 参数；API 31+ 开启无缝缩放。 */
     @RequiresApi(Build.VERSION_CODES.O)
@@ -219,13 +219,8 @@ class FullscreenPipHelper(
     /** 视频尺寸变化时更新 PiP 小窗比例（仅 PiP 中生效）。 */
     @RequiresApi(Build.VERSION_CODES.O)
     fun updatePipAspectRatio(videoSize: VideoSize) {
-        if (videoSize.width <= 0 || videoSize.height <= 0) return
-        if (!isInPipMode) return
-        val ratio = try {
-            Rational(videoSize.width, videoSize.height)
-        } catch (_: Exception) {
-            return
-        }
+        if (!isInPipMode || !hasVideo(videoSize)) return
+        val ratio = aspectRatioOf(videoSize) ?: return
         try {
             activity.setPictureInPictureParams(buildPipParams(ratio))
         } catch (_: Exception) {
@@ -462,14 +457,11 @@ class GestureController(
 class MediaListAdapter(
     private val onClick: (String) -> Unit,
     private val onDelete: (String) -> Unit,
-    private val getProgress: (String) -> Long = { 0L }
+    private val getProgress: (String) -> Long
 ) : RecyclerView.Adapter<MediaListAdapter.VH>() {
 
     /** 局部刷新 payload：仅更新进度，不重绑整个条目。 */
     private val progressPayload = Any()
-
-    /** 局部刷新 payload：仅更新时长。 */
-    private val durationPayload = Any()
 
     private val items = mutableListOf<MediaItemData>()
 
@@ -521,13 +513,6 @@ class MediaListAdapter(
         for (index in affected) notifyItemChanged(index)
     }
 
-    /** 更新某条目的时长（局部刷新）。 */
-    fun updateItem(index: Int, item: MediaItemData) {
-        if (index !in items.indices) return
-        items[index] = item
-        notifyItemChanged(index, durationPayload)
-    }
-
     /** 刷新单条进度显示。 */
     fun refreshProgress(index: Int) {
         if (index in items.indices) notifyItemChanged(index, progressPayload)
@@ -551,7 +536,7 @@ class MediaListAdapter(
         holder.binding.tvIndex.text =
             context.getString(R.string.list_item_index, position + 1)
         holder.binding.tvName.text = item.name
-        holder.binding.tvDuration.text = if (item.duration > 0) formatTime(item.duration) else ""
+        bindDuration(holder, item)
         val isActive = item.uri.toString() == currentPlayingUri && isPlaying
         // 播放中隐藏序号、显示均衡器图标并高亮名称
         holder.binding.imgPlaying.visibility = if (isActive) View.VISIBLE else View.GONE
@@ -563,13 +548,11 @@ class MediaListAdapter(
         bindProgress(holder, item)
     }
 
-    /** 带 payload 的绑定：仅处理进度 / 时长局部刷新，其余走默认重绑。 */
+    /** 带 payload 的绑定：仅进度局部刷新走快路径，其余（含时长变化）走默认重绑。 */
     override fun onBindViewHolder(holder: VH, position: Int, payloads: MutableList<Any>) {
         when {
             payloads.isNotEmpty() && payloads.all { it === progressPayload } ->
                 bindProgress(holder, items[position])
-            payloads.isNotEmpty() && payloads.all { it === durationPayload } ->
-                bindDuration(holder, items[position])
             else -> super.onBindViewHolder(holder, position, payloads)
         }
     }

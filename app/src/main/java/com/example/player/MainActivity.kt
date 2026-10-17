@@ -14,7 +14,6 @@ import android.app.Application
 import android.content.ComponentName
 import android.content.res.Configuration
 import android.database.ContentObserver
-import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -23,7 +22,6 @@ import android.os.SystemClock
 import android.provider.MediaStore
 import android.view.View
 import android.widget.TextView
-import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.OptIn
@@ -87,6 +85,9 @@ class MainActivity : AppCompatActivity() {
 
         /** 播放列表变更后延迟保存的防抖时长。 */
         const val SAVE_PLAYLIST_DEBOUNCE_MS = 2_000L
+
+        /** 媒体库变化后延迟扫描的防抖时长。 */
+        const val MEDIA_CHANGE_DEBOUNCE_MS = 800L
     }
 
     private val notifPermission = registerForActivityResult(
@@ -97,29 +98,21 @@ class MainActivity : AppCompatActivity() {
         ActivityResultContracts.RequestMultiplePermissions()
     ) { grants: Map<String, Boolean> ->
         if (grants.values.any { it }) {
-            Toast.makeText(this, R.string.toast_permission_granted, Toast.LENGTH_SHORT).show()
+            toast(R.string.toast_permission_granted)
         }
     }
 
-    /** 从列表与播放队列中移除指定下标的条目，并清除其进度。 */
-    private fun removeItemAt(index: Int) {
+    /** 删除单条：同步列表、播放队列与进度，然后刷新 UI、保存并提示。 */
+    private fun removeItemFromPlaylist(index: Int) {
         if (index !in playlist.indices) return
         controller?.let(::rebuildQueueIfNeeded)
-        clearProgress(playlist[index].uri)
+        PlayerService.dropProgress(playlist[index].uri.toString())
         playlist.removeAt(index)
         controller?.removeMediaItem(index)
-    }
-
-    /** 删除条目（含刷新 UI、保存、可选提示）。 */
-    private fun removeItemFromPlaylist(index: Int, showToast: Boolean = true) {
-        if (index !in playlist.indices) return
-        removeItemAt(index)
         syncAdapterPlayingState()
         refreshPlaylist()
         savePlaylist()
-        if (showToast) {
-            Toast.makeText(this, R.string.toast_deleted, Toast.LENGTH_SHORT).show()
-        }
+        toast(R.string.toast_deleted)
     }
 
     private fun submitPlaylist() {
@@ -142,21 +135,23 @@ class MainActivity : AppCompatActivity() {
         )
     }
 
-    /** 用播放器解析出的真实时长回填列表条目。 */
+    /** 用播放器解析出的真实时长回填列表条目（只写单行，不触发整表替换）。 */
     private fun updateDurationAt(index: Int, duration: Long) {
         if (index !in playlist.indices || playlist[index].duration == duration) return
         playlist[index] = playlist[index].copy(duration = duration)
-        adapter.updateItem(index, playlist[index])
-        savePlaylist()
+        submitPlaylist()
+        PlayerRepository.updatePlaylistDuration(playlist[index].uri, duration)
     }
 
     private val savePlaylistRunnable = Runnable { savePlaylistNow() }
-    private val saveHandler = Handler(Looper.getMainLooper())
+
+    /** 界面侧共用的主线程 Handler（保存防抖与扫描防抖）。 */
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     /** 防抖保存播放列表。 */
     private fun savePlaylist() {
-        saveHandler.removeCallbacks(savePlaylistRunnable)
-        saveHandler.postDelayed(savePlaylistRunnable, SAVE_PLAYLIST_DEBOUNCE_MS)
+        mainHandler.removeCallbacks(savePlaylistRunnable)
+        mainHandler.postDelayed(savePlaylistRunnable, SAVE_PLAYLIST_DEBOUNCE_MS)
     }
 
     private fun savePlaylistNow() {
@@ -166,28 +161,22 @@ class MainActivity : AppCompatActivity() {
 
     /** 取消防抖并立即保存（onStop 调用）。 */
     private fun flushPendingSave() {
-        saveHandler.removeCallbacks(savePlaylistRunnable)
+        mainHandler.removeCallbacks(savePlaylistRunnable)
         savePlaylistNow()
     }
 
     private fun existingUriKeys(): Set<String> = playlist.map { normalizeUri(it.uri) }.toSet()
 
-    /** 从仓库把已存列表并入当前列表（按归一化 URI 去重）。 */
-    private fun loadPlaylist() {
-        val existingKeys = existingUriKeys().toMutableSet()
-        for (item in PlayerRepository.getPlaylist()) {
-            val key = normalizeUri(item.uri)
-            if (key in existingKeys) continue
-            existingKeys.add(key)
-            playlist.add(item)
-        }
-    }
+    /** 按播放器侧的原始 uri 定位列表条目（与仓库的进度键保持一致）。 */
+    private fun indexOfUri(uri: String): Int =
+        playlist.indexOfFirst { it.uri.toString() == uri }
 
-    /** 清除某 uri 的进度（服务侧缓存 + 仓库）。 */
-    private fun clearProgress(uri: Uri) {
-        val key = uri.toString()
-        PlayerService.dropProgress(key)
-        PlayerRepository.applyProgressUpdates(emptyMap(), setOf(key))
+    private fun findItemByUri(uri: String): MediaItemData? =
+        playlist.firstOrNull { it.uri.toString() == uri }
+
+    /** 从仓库把已存列表载入当前列表（仅在首次加载、列表为空时调用）。 */
+    private fun loadPlaylist() {
+        playlist.addAll(PlayerRepository.getPlaylist())
     }
 
     private val playerListener = object : Player.Listener {
@@ -204,6 +193,7 @@ class MainActivity : AppCompatActivity() {
         override fun onIsPlayingChanged(isPlaying: Boolean) {
             syncAdapterPlayingState()
             if (!isPlaying) {
+                // 先落盘再刷新：仓储内存同步更新后，下一行才能读到最新进度（服务侧落盘幂等）
                 PlayerService.flushCurrentPosition()
                 adapter.refreshProgress(controller?.currentMediaItemIndex ?: -1)
             }
@@ -224,9 +214,7 @@ class MainActivity : AppCompatActivity() {
 
             // 被其他应用暂时抢占音频焦点：提示稍后自动续播
             if (playbackSuppressionReason == Player.PLAYBACK_SUPPRESSION_REASON_TRANSIENT_AUDIO_FOCUS_LOSS) {
-                Toast.makeText(
-                    this@MainActivity, R.string.toast_playback_interrupted, Toast.LENGTH_SHORT
-                ).show()
+                toast(R.string.toast_playback_interrupted)
             }
         }
 
@@ -267,12 +255,12 @@ class MainActivity : AppCompatActivity() {
 
         val curUri = ctrl.currentMediaItem?.localConfiguration?.uri?.toString()
         val curPos = ctrl.currentPosition
-        val curIdx = curUri?.let { u -> playlist.indexOfFirst { it.uri.toString() == u } } ?: -1
-
-        PlayerService.flushCurrentPosition()
+        val curIdx = curUri?.let(::indexOfUri) ?: -1
 
         val items = playlist.map(::buildMediaItem)
         if (curIdx >= 0) {
+            // 仅当当前项仍在列表时才需要先落盘再重建，避免为已移除项写回进度
+            PlayerService.flushCurrentPosition()
             ctrl.setMediaItems(items, curIdx, curPos)
         } else {
             ctrl.setMediaItems(items)
@@ -305,7 +293,7 @@ class MainActivity : AppCompatActivity() {
         val ctrl = controller ?: return
         if (ctrl.playWhenReady || ctrl.isPlaying) return
         val lastUri = PlayerRepository.getLastItem() ?: return
-        val idx = playlist.indexOfFirst { it.uri.toString() == lastUri }
+        val idx = indexOfUri(lastUri)
         if (idx !in playlist.indices) return
 
         seekToResume(idx)
@@ -345,9 +333,7 @@ class MainActivity : AppCompatActivity() {
     /** 找到当前速度对应的档位下标；不在档位内时回退到 1x。 */
     private fun speedsIndex(speed: Float): Int {
         val idx = speedLevels.indexOfFirst { it == speed }
-        if (idx >= 0) return idx
-        val one = speedLevels.indexOfFirst { it == 1.0f }
-        return if (one >= 0) one else 0
+        return if (idx >= 0) idx else speedLevels.indexOfFirst { it == 1.0f }.coerceAtLeast(0)
     }
 
     /** 弹出倍速选择对话框。 */
@@ -375,7 +361,7 @@ class MainActivity : AppCompatActivity() {
     @OptIn(UnstableApi::class)
     private fun showTrackSelection(trackType: Int, @StringRes titleRes: Int) {
         val ctrl = controller ?: run {
-            Toast.makeText(this, R.string.toast_player_not_connected, Toast.LENGTH_SHORT).show()
+            toast(R.string.toast_player_not_connected)
             return
         }
         try {
@@ -384,7 +370,7 @@ class MainActivity : AppCompatActivity() {
                 .build()
                 .show()
         } catch (_: Exception) {
-            Toast.makeText(this, R.string.toast_no_tracks, Toast.LENGTH_SHORT).show()
+            toast(R.string.toast_no_tracks)
         }
     }
 
@@ -392,35 +378,26 @@ class MainActivity : AppCompatActivity() {
     @Volatile
     private var scanJob: Job? = null
 
-    /** 监听媒体库变化：防抖 800ms 后静默增量扫描。 */
-    private val mediaChangeObserver = object : ContentObserver(Handler(Looper.getMainLooper())) {
+    /** 监听媒体库变化：防抖后静默扫描。 */
+    private val mediaChangeObserver = object : ContentObserver(mainHandler) {
         override fun onChange(selfChange: Boolean) {
-            scanHandler.removeCallbacks(debouncedScanRunnable)
-            scanHandler.postDelayed(debouncedScanRunnable, 800)
+            mainHandler.removeCallbacks(debouncedScanRunnable)
+            mainHandler.postDelayed(debouncedScanRunnable, MEDIA_CHANGE_DEBOUNCE_MS)
         }
     }
-    private val scanHandler = Handler(Looper.getMainLooper())
-    private val debouncedScanRunnable = Runnable {
-        if (hasStoragePermission()) scanLocalMedia(silent = true)
-    }
+    private val debouncedScanRunnable = Runnable { startScan(silent = true) }
 
-    private fun scanLocalMedia(silent: Boolean = false) {
-        ensureScanJob(silent)
-    }
-
-    private suspend fun scanLocalMediaSuspend(silent: Boolean = false) {
-        ensureScanJob(silent).join()
-    }
-
-    /** 复用进行中的扫描任务；无任务时新建一个。 */
-    private fun ensureScanJob(silent: Boolean): Job {
+    /** 启动或复用一次扫描任务；调用方可对返回的 Job 选择是否 join。 */
+    private fun startScan(silent: Boolean): Job {
         scanJob?.takeIf { it.isActive }?.let { return it }
-        return lifecycleScope.launch { scanLocalMediaInternal(silent) }.also { scanJob = it }
+        return lifecycleScope.launch {
+            if (!hasStoragePermission()) return@launch
+            scanMediaInternal(silent)
+        }.also { scanJob = it }
     }
 
     /** 在 IO 线程查询媒体库，回到主线程对账。 */
-    private suspend fun scanLocalMediaInternal(silent: Boolean) {
-        if (silent && !hasStoragePermission()) return
+    private suspend fun scanMediaInternal(silent: Boolean) {
         val (videos, audios) = withContext(Dispatchers.IO) {
             scanner.queryVideos() to scanner.queryAudios()
         }
@@ -440,7 +417,7 @@ class MainActivity : AppCompatActivity() {
     ) {
         if (scannedVideos == null && scannedAudios == null) {
             if (!silent) {
-                Toast.makeText(this, R.string.toast_scan_failed, Toast.LENGTH_SHORT).show()
+                toast(R.string.toast_scan_failed)
             }
             return
         }
@@ -463,7 +440,7 @@ class MainActivity : AppCompatActivity() {
 
         if (ordered == before && removedCount == 0) {
             if (!silent) {
-                Toast.makeText(this, R.string.toast_no_new_media, Toast.LENGTH_SHORT).show()
+                toast(R.string.toast_no_new_media)
             }
             return
         }
@@ -471,17 +448,20 @@ class MainActivity : AppCompatActivity() {
         playlist.addAll(ordered)
         refreshPlaylist()
         savePlaylist()
-        controller?.let { rebuildQueueIfNeeded(it) }
+        controller?.let { ctrl ->
+            if (playlist.isEmpty() && removedCount > 0) {
+                // 列表被清空：rebuildQueueIfNeeded 对空列表直接返回，这里显式清空队列
+                ctrl.clearMediaItems()
+            } else {
+                rebuildQueueIfNeeded(ctrl)
+            }
+        }
         if (!silent) {
             val parts = mutableListOf<String>()
             if (removedCount > 0) parts.add(getString(R.string.toast_scan_removed, removedCount))
             if (newItems.isNotEmpty()) parts.add(getString(R.string.toast_scan_added, newItems.size))
             if (orderReorganized) parts.add(getString(R.string.toast_scan_reordered))
-            Toast.makeText(
-                this,
-                parts.reduce { acc, part -> getString(R.string.toast_scan_join, acc, part) },
-                Toast.LENGTH_SHORT
-            ).show()
+            toastMessage(parts.joinToString("，"))
         }
     }
 
@@ -522,29 +502,44 @@ class MainActivity : AppCompatActivity() {
         val missingNow = mutableSetOf<String>()
         val observedNow = mutableSetOf<String>()
         val removedNow = mutableSetOf<String>()
+        val removedUris = mutableSetOf<String>()
+        val survivors = ArrayList<MediaItemData>(playlist.size)
         val now = System.currentTimeMillis()
-        for (i in playlist.indices.reversed()) {
-            val item = playlist[i]
+        for (item in playlist) {
             val uriStr = item.uri.toString()
             val keys = when {
                 uriStr.startsWith(videoPrefix) -> videoKeys
                 uriStr.startsWith(audioPrefix) -> audioKeys
                 else -> null
             }
-            if (keys == null) continue
+            if (keys == null) {
+                survivors.add(item)
+                continue
+            }
             observedNow.add(uriStr)
             val key = normalizeUri(item.uri)
-            if (key in keys) continue
+            if (key in keys) {
+                survivors.add(item)
+                continue
+            }
             missingNow.add(uriStr)
             val prev = PlayerRepository.getMissingInfo(uriStr)
             val missingBefore = prev != null && prev.missCount >= 1
             val oldEnough = prev != null &&
                 now - prev.firstMissingMs >= PlayerRepository.MISSING_DELETE_GRACE_MS
             if (missingBefore && oldEnough) {
-                removeItemAt(i)
+                removedUris.add(uriStr)
                 removedNow.add(uriStr)
                 removed++
+            } else {
+                survivors.add(item)
             }
+        }
+        if (removedUris.isNotEmpty()) {
+            playlist.clear()
+            playlist.addAll(survivors)
+            // 进度一次批量删除；播放队列由本轮扫描末尾的 rebuildQueueIfNeeded 统一重建
+            PlayerService.dropProgress(removedUris)
         }
         PlayerRepository.updateMissingRecords(missingNow, observedNow, removedNow)
         if (removed > 0) {
@@ -564,11 +559,7 @@ class MainActivity : AppCompatActivity() {
                 val now = SystemClock.elapsedRealtime()
                 if (now - lastShownMs < WRITE_FAILURE_TOAST_MIN_INTERVAL_MS) return@collect
                 lastShownMs = now
-                Toast.makeText(
-                    this@MainActivity,
-                    R.string.toast_repository_write_failed,
-                    Toast.LENGTH_LONG
-                ).show()
+                toastLong(R.string.toast_repository_write_failed)
             }
         }
 
@@ -580,9 +571,7 @@ class MainActivity : AppCompatActivity() {
                 if (isFileGone && event.uri != null) {
                     PlayerRepository.recordMissing(event.uri)
                 }
-                val name = event.uri?.let { u ->
-                    playlist.firstOrNull { it.uri.toString() == u }?.name
-                } ?: "未知文件"
+                val name = event.uri?.let(::findItemByUri)?.name ?: "未知文件"
                 val message = when {
                     event.exhausted -> getString(R.string.toast_playback_error_all_failed)
                     isFileGone -> getString(
@@ -596,7 +585,7 @@ class MainActivity : AppCompatActivity() {
                         name
                     )
                 }
-                Toast.makeText(this@MainActivity, message, Toast.LENGTH_SHORT).show()
+                toastMessage(message)
             }
         }
 
@@ -607,27 +596,21 @@ class MainActivity : AppCompatActivity() {
         // 列表适配器：点击续播、长按删除、实时读取进度
         adapter = MediaListAdapter(
             onClick = { uri ->
-                val index = playlist.indexOfFirst { it.uri.toString() == uri }
+                val index = indexOfUri(uri)
                 if (index >= 0) {
-
                     PlayerService.resetErrorCount()
-
                     PlayerService.flushCurrentPosition()
-
                     seekToResume(index)
                     controller?.play()
                 }
             },
             onDelete = { uri ->
-                val item = playlist.firstOrNull { it.uri.toString() == uri }
-                    ?: return@MediaListAdapter
+                val item = findItemByUri(uri) ?: return@MediaListAdapter
                 AlertDialog.Builder(this)
                     .setTitle(R.string.delete_dialog_title)
                     .setMessage(getString(R.string.delete_dialog_message, item.name))
                     .setPositiveButton(R.string.delete) { _, _ ->
-
-                        playlist.indexOfFirst { it.uri.toString() == uri }
-                            .takeIf { it >= 0 }?.let { removeItemFromPlaylist(it) }
+                        indexOfUri(uri).takeIf { it >= 0 }?.let { removeItemFromPlaylist(it) }
                     }
                     .setNegativeButton(R.string.cancel, null)
                     .show()
@@ -644,7 +627,7 @@ class MainActivity : AppCompatActivity() {
         // 扫描按钮：有权限直接扫，否则先申请
         binding.btnScan.setOnClickListener {
             if (hasStoragePermission()) {
-                scanLocalMedia()
+                startScan(silent = false)
             } else {
                 requestStoragePermission()
             }
@@ -720,11 +703,7 @@ class MainActivity : AppCompatActivity() {
                 when {
 
                     // 数据加载失败：提示并等待自动重试
-                    !loaded -> Toast.makeText(
-                        this@MainActivity,
-                        R.string.toast_repository_load_failed,
-                        Toast.LENGTH_LONG
-                    ).show()
+                    !loaded -> toastLong(R.string.toast_repository_load_failed)
 
                     // 首次进入：把已存列表载入内存
                     !playlistLoaded -> {
@@ -737,10 +716,9 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 if (!isCurrentController(future, ctrl)) return@launch
-                scanLocalMediaSuspend(silent = true)
+                startScan(silent = true).join()
 
                 if (!isCurrentController(future, ctrl)) return@launch
-
                 rebuildQueueIfNeeded(ctrl)
                 restoreLastPlayed()
                 refreshPlaylist()
@@ -751,7 +729,7 @@ class MainActivity : AppCompatActivity() {
     override fun onStop() {
         updateManager.unregisterReceivers()
         contentResolver.unregisterContentObserver(mediaChangeObserver)
-        scanHandler.removeCallbacks(debouncedScanRunnable)
+        mainHandler.removeCallbacks(debouncedScanRunnable)
         scanJob?.cancel()
         scanJob = null
         flushPendingSave()
@@ -774,19 +752,15 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
-        // 回到前台补弹检查期间被推迟的更新提示
+        // 回到前台补弹检查期间被推迟的更新提示与安装确认
         updateManager.resumePendingUpdateDialog()
+        updateManager.resumePendingInstallPrompt()
     }
 
     override fun onUserLeaveHint() {
         super.onUserLeaveHint()
         // 播放视频时按 Home 自动进入小窗
         fullscreenPip.enterPipWhenPlayingVideo()
-    }
-
-    override fun onDestroy() {
-        updateManager.unregisterReceivers()
-        super.onDestroy()
     }
 
     override fun onPictureInPictureModeChanged(

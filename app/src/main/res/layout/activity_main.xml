@@ -5,8 +5,7 @@
     android:id="@+id/root_layout"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:orientation="vertical"
-    android:background="@color/bg_dark">
+    android:orientation="vertical">
 
     <!-- 播放器卡片（全屏 / 小窗时由 FullscreenPipHelper 动态调整圆角与边距） -->
     <com.google.android.material.card.MaterialCardView
@@ -20,8 +19,7 @@
         android:layout_marginBottom="4dp"
         app:cardBackgroundColor="@color/surface_1"
         app:cardCornerRadius="18dp"
-        app:cardElevation="0dp"
-        app:strokeWidth="0dp">
+        app:cardElevation="0dp">
 
         <!-- 使用应用自有的控制栏布局与图标，避免绑定 Media3 私有资源 -->
         <androidx.media3.ui.PlayerView

@@ -1,7 +1,7 @@
 /**
  * 纯逻辑单元测试（不依赖 Android 运行时）：
- * 时长格式化、进度合并与末尾裁决、更新下载源顺序与完整性校验、
- * 旧数据迁移解析、缺失记录序列化、文件夹分组键与集数自然序等。
+ * 时长格式化、进度合并与末尾裁决、安装包完整性校验、
+ * 缺失记录序列化、文件夹分组键与集数自然序等。
  */
 package com.example.player
 
@@ -137,111 +137,6 @@ class ProgressDecisionTest {
     }
 }
 
-/** 下载源顺序：直连优先，加速前缀仅对 GitHub 地址生效。 */
-class DownloadSourceOrderTest {
-
-    private val apk =
-        "https://github.com/niu0506/player/releases/download/v1.5.0/player-v1.5.0-release.apk"
-    private val accelerators = listOf("https://gh-proxy.com/", "https://ghproxy.net")
-
-    @Test
-    fun `direct url comes first`() {
-        assertEquals(apk, orderedDownloadUrls(apk, accelerators).first())
-    }
-
-    @Test
-    fun `accelerators follow as fallback with normalized prefix`() {
-        assertEquals(
-            listOf(apk, "https://gh-proxy.com/$apk", "https://ghproxy.net/$apk"),
-            orderedDownloadUrls(apk, accelerators)
-        )
-    }
-
-    @Test
-    fun `without accelerators only the direct url remains`() {
-        assertEquals(listOf(apk), orderedDownloadUrls(apk, emptyList()))
-    }
-
-    @Test
-    fun `non github url returns only the direct url`() {
-        val cdn = "https://cdn.jsdelivr.net/gh/niu0506/player@main/apk/player-v1.5.0-release.apk"
-        assertEquals(listOf(cdn), orderedDownloadUrls(cdn, accelerators))
-    }
-
-    @Test
-    fun `github url without https prefix is not accelerated`() {
-        val insecure = apk.replaceFirst("https://", "http://")
-        assertEquals(listOf(insecure), orderedDownloadUrls(insecure, accelerators))
-    }
-}
-
-/** 旧版 SharedPreferences 数据解析与迁移。 */
-class LegacyPrefsMigrationTest {
-
-    @Test
-    fun `null progress json returns empty map`() {
-        assertEquals(emptyMap<String, Long>(), parseLegacyProgressJson(null))
-    }
-
-    @Test
-    fun `empty progress json returns empty map`() {
-        assertEquals(emptyMap<String, Long>(), parseLegacyProgressJson(""))
-    }
-
-    @Test
-    fun `garbage progress json returns empty map`() {
-        assertEquals(emptyMap<String, Long>(), parseLegacyProgressJson("{not valid json"))
-    }
-
-    @Test
-    fun `zero and negative progress values are dropped`() {
-        val json = """{"a":1000,"b":0,"c":-5}"""
-        assertEquals(mapOf("a" to 1000L), parseLegacyProgressJson(json))
-    }
-
-    @Test
-    fun `positive progress values are kept`() {
-        val json = """{"a":1000,"b":250000}"""
-        assertEquals(mapOf("a" to 1000L, "b" to 250000L), parseLegacyProgressJson(json))
-    }
-
-    @Test
-    fun `null playlist json returns empty list`() {
-        assertEquals(emptyList<LegacyPlaylistItem>(), parseLegacyPlaylistJson(null))
-    }
-
-    @Test
-    fun `garbage playlist json returns empty list`() {
-        assertEquals(emptyList<LegacyPlaylistItem>(), parseLegacyPlaylistJson("[broken"))
-    }
-
-    @Test
-    fun `playlist items parsed in order with duration default`() {
-        val json = """[
-            {"uri":"content://video/1","name":"a.mp4","duration":60000},
-            {"uri":"content://audio/2","name":"b.mp3"}
-        ]"""
-        val items = parseLegacyPlaylistJson(json)
-        assertEquals(2, items.size)
-        assertEquals("content://video/1", items[0].uri)
-        assertEquals("a.mp4", items[0].name)
-        assertEquals(60000L, items[0].duration)
-        assertEquals(0L, items[1].duration)
-    }
-
-    @Test
-    fun `duplicate uri entries are deduped keeping first occurrence`() {
-        val json = """[
-            {"uri":"content://video/1","name":"first.mp4","duration":1000},
-            {"uri":"content://video/1","name":"dup.mp4","duration":2000}
-        ]"""
-        val items = parseLegacyPlaylistJson(json)
-        assertEquals(1, items.size)
-        assertEquals("first.mp4", items[0].name)
-        assertEquals(1000L, items[0].duration)
-    }
-}
-
 /** 适配器「当前播放项」更新：越界防护、仅刷新受影响条目等。 */
 class MediaListAdapterCurrentPlayingTest {
 
@@ -259,7 +154,7 @@ class MediaListAdapterCurrentPlayingTest {
 
     @Before
     fun setUp() {
-        adapter = MediaListAdapter(onClick = {}, onDelete = {})
+        adapter = MediaListAdapter(onClick = {}, onDelete = {}, getProgress = { 0L })
         observer = RecordingObserver()
         attachObserver(adapter, observer)
     }
@@ -462,31 +357,31 @@ class UpdateIntegrityTest {
     }
 }
 
-/** 安装包校验和裁决：缺失 / 匹配 / 不匹配。 */
-class ApkChecksumVerdictTest {
+/** 安装包校验结论：缺失 / 匹配 / 不匹配。 */
+class ApkValidationTest {
 
     private val hex64 = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
 
     @Test
     fun `missing expected checksum is rejected`() {
-        assertEquals(ApkChecksumVerdict.MISSING, verifyApkChecksum(null, hex64))
-        assertEquals(ApkChecksumVerdict.MISSING, verifyApkChecksum("", hex64))
+        assertEquals(ApkValidation.MISSING_CHECKSUM, verifyApkChecksum(null, hex64))
+        assertEquals(ApkValidation.MISSING_CHECKSUM, verifyApkChecksum("", hex64))
     }
 
     @Test
     fun `matching checksum is accepted`() {
-        assertEquals(ApkChecksumVerdict.OK, verifyApkChecksum(hex64, hex64))
+        assertEquals(ApkValidation.OK, verifyApkChecksum(hex64, hex64))
     }
 
     @Test
     fun `checksum comparison ignores case`() {
-        assertEquals(ApkChecksumVerdict.OK, verifyApkChecksum(hex64.uppercase(), hex64))
-        assertEquals(ApkChecksumVerdict.OK, verifyApkChecksum(hex64, hex64.uppercase()))
+        assertEquals(ApkValidation.OK, verifyApkChecksum(hex64.uppercase(), hex64))
+        assertEquals(ApkValidation.OK, verifyApkChecksum(hex64, hex64.uppercase()))
     }
 
     @Test
     fun `mismatched checksum is flagged`() {
-        assertEquals(ApkChecksumVerdict.MISMATCH, verifyApkChecksum(hex64.dropLast(1) + "0", hex64))
+        assertEquals(ApkValidation.INVALID, verifyApkChecksum(hex64.dropLast(1) + "0", hex64))
     }
 }
 

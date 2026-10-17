@@ -8,7 +8,7 @@
 
 ### 播放
 
-- **本地媒体库扫描**：基于 MediaStore 扫描设备上的视频与音频，自动构建播放列表；自动监听媒体库变化（防抖合并增量扫描），回前台时对账清理已被外部删除的文件
+- **本地媒体库扫描**：基于 MediaStore 扫描设备上的视频与音频，自动构建播放列表；自动监听媒体库变化（防抖合并的全量查询 + 差量对账），回前台时对账清理已被外部删除的文件
 - **按文件夹分组连播**：记录每个文件所属目录（API 29+ 取 `RELATIVE_PATH`，更低版本由绝对路径取父目录），列表按「文件夹 + 组内集数自然序」排序——`第2集` 排在 `第10集` 之前，同一部剧的分集连续相邻，自动连播不会在几部剧之间来回跳；已存列表在首次扫描时按扫描结果回填目录并重排（进度按 URI 记录，重排不影响续播）。**建议每部剧放在独立文件夹**：同一文件夹里混放多部剧时无法区分；读不到目录的条目统一排在列表末尾
 - **播放控制**：播放/暂停、进度拖动、快退/快进 15s、随机播放、循环模式（顺序/单曲/列表）
 - **音轨/字幕选择**：多音轨视频可切换音轨，内嵌字幕可切换
@@ -34,9 +34,9 @@
 
 ### 更新
 
-- **应用内更新**：检查 GitHub Releases 新版本（GitHub API 优先，响应无法解析时自动回退 jsDelivr CDN；`version.json` 即该回退源）
-- **下载与安装**：经系统 DownloadManager 下载，**GitHub 直连优先、CDN 反代（gh-proxy / ghproxy）加速兜底**，失败自动换源；下载完成先校验产物确为可解析的 APK（防反代返回 200 + HTML 错误页或残包），通过后才调起系统安装器
-- **更新包完整性（fail-closed）**：必须校验 SHA-256 才允许安装——校验和取自 `version.json` 的 `sha256`、GitHub Release 资产的 `digest` 或打包元数据；**拿不到校验和时拒绝安装并提示手动下载**（包名/版本号可被第三方反代伪造，不足以作为信任依据）。校验和不匹配视为残包/篡改，自动尝试下一镜像
+- **应用内更新**：经 GitHub Releases API 检查新版本
+- **下载与安装**：经系统 DownloadManager 从 GitHub Release 资产直连下载；下载完成先校验产物确为可解析的 APK（防残包 / 错误页），通过后弹确认框，用户确认才调起系统安装器
+- **更新包完整性（fail-closed）**：必须校验 SHA-256 才允许安装——校验和取自 GitHub Release 资产的 `digest`；**拿不到校验和时拒绝安装并提示手动下载**（包名/版本号可被伪造，不足以作为信任依据）。校验和不匹配视为残包/篡改，直接判定下载失败
 - **更新提示时机**：更新弹窗只在界面处于前台（resumed）时创建，检查期间切走则由 `onResume` 补弹；且不响应「点外部取消」，避免菜单收起等残留触摸把刚弹出的提示框立刻关掉
 - **权限适配**：Android 8+ 的「安装未知应用」授权流程；应用替换成功后自动清理下载目录中的旧更新包
 
@@ -52,7 +52,7 @@
 - 播放器：androidx.media3 1.11.0（ExoPlayer + MediaSession + MediaController）
 - 架构：前台服务（`PlayerService`）+ 单 Activity（`MainActivity`），经 MediaController 通信；源码扁平化为单包 5 文件，UI 逻辑拆分为 `GestureController`、`FullscreenPipHelper`、`MediaStoreScanner` 等职责类（见 `PlayerUi.kt` / `PlayerRepository.kt` / `UpdateManager.kt`）；依赖版本集中在 `gradle/libs.versions.toml`
 - 控制栏：使用应用自有的尺寸、颜色、样式与图标资源；仅依赖 Media3 文档化的控制视图 ID 和图标属性，避免绑定其私有布局资源
-- 持久化：Room 数据库（播放列表、进度映射、KV 分表存储，统一「合并写」入口；首次启动自动迁移旧 SharedPreferences 数据）；schema 导出至 `app/schemas/` 并纳入版本控制。加载失败**不是终态**：会按需重试（30 秒冷却），失败期间的写入不再被静默丢弃，界面给出提示
+- 持久化：Room 数据库（播放列表、进度映射、KV 分表存储，统一「合并写」入口）；schema 导出至 `app/schemas/` 并纳入版本控制。加载失败**不是终态**：会按需重试（30 秒冷却），失败期间的写入不再被静默丢弃，界面给出提示
 - 更新下载：系统 DownloadManager 写入**应用外部私有** `getExternalFilesDir(DIRECTORY_DOWNLOADS)`（全版本免存储权限，分区存储下可用）；安装器经 FileProvider content URI 授权直读。注意 `setDestinationUri` 只接受 `file://`，传 `content://`（MediaStore 目标）会抛 `IllegalArgumentException` —— 这正是 v1.4.8 修复的「点立即更新闪退」根因，勿回退为 MediaStore 目标
 - UI：ViewBinding + RecyclerView（DiffUtil 后台差分刷新）
 - 构建：AGP + Kotlin DSL (Gradle)，GitHub Actions CI 自动构建
@@ -110,10 +110,10 @@ Release 签名信息按优先级取自：
 ### 发布新版本
 
 1. 递增 `app/build.gradle.kts` 的 `versionCode` 与 `versionName`；
-2. 更新仓库根 `version.json`（`version` / `apkUrl` / `notes`）：它是应用内更新在 GitHub API 不可达时的回退源，`apkUrl` 必须指向本次 tag 的 Release 资产，否则「立即更新」会 404；
+2. 更新仓库根 `version.json` 的 `notes`（供 CI 生成 Release 说明；版本号以 `build.gradle.kts` 为唯一来源）；
 3. 提交并推送 `main`，再推送与 `versionName` 同名的 `v<版本>` tag（CI 的 Release job 只在 `v*` tag 上触发）；
 4. CI 自动构建**签名** Release APK 并创建 GitHub Release，资产名 `player-v<版本>-release.apk`，同时生成同名 `.sha256` 并在 Release 正文附上 `SHA-256`；
-5. **回填 `version.json` 的 `sha256`**：从第 4 步的 Release 正文 / `.sha256` 资产（或 `gh api repos/<owner>/<repo>/releases/latest` 的资产 `digest`）取得本次 APK 的 SHA-256，写入 `version.json` 后提交推送。缺此字段时应用会按 fail-closed **拒绝**自动安装（防止第三方反代返回被篡改的包），仅能手动安装。
+5. 应用内更新的 SHA-256 直接取自 GitHub Release 资产的 `digest`（GitHub 对上传资产自动计算）。若该字段缺失，应用会按 fail-closed **拒绝**安装，仅能手动安装。
 
 ## 安装
 
@@ -124,13 +124,13 @@ Release 签名信息按优先级取自：
 ```
 app/src/main/java/com/example/player/
 ├── MainActivity.kt                  # UI 入口（含 PlayerApp 初始化）、播放列表、进度恢复与更新流程编排
-├── PlayerRepository.kt              # 数据模型 + 媒体库扫描 + Room 数据库与统一合并写入口（含旧数据迁移）
+├── PlayerRepository.kt              # 数据模型 + 媒体库扫描 + Room 数据库与统一合并写入口
 ├── PlayerService.kt                 # 前台服务、后台播放、进度持久化
 ├── PlayerUi.kt                      # 手势控制、全屏与画中画切换、播放列表适配器（DiffUtil 后台差分）
-└── UpdateManager.kt                 # 应用内更新检查（GitHub Releases / jsDelivr 兜底）+ 下载与安装流程
+└── UpdateManager.kt                 # 应用内更新检查（GitHub Releases）+ 下载、校验与安装流程
 
 app/src/test/java/com/example/player/
-└── PlayerTests.kt                   # 进度合并语义 / 进度末尾裁决 / 旧数据迁移 / 时长格式化 / 列表高亮越界防护 / 版本比较 / 更新下载源顺序 / 文件夹分组键与集数自然序
+└── PlayerTests.kt                   # 进度合并语义 / 进度末尾裁决 / 时长格式化 / 列表高亮越界防护 / 版本比较 / 安装包完整性校验 / 文件夹分组键与集数自然序
 
 app/schemas/com.example.player.PlayerDatabase/
 ├── 1.json                           # Room 导出的 schema（须提交，作为后续 Migration 的 diff 基准）

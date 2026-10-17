@@ -1,9 +1,10 @@
 /**
  * 应用内更新。
  *
- * 检查：优先请求 GitHub Releases API，失败时回退 jsDelivr 上的 version.json。
- * 下载：经系统 DownloadManager，GitHub 直连优先、CDN 反代兜底，失败自动换源。
+ * 检查：请求 GitHub Releases API。
+ * 下载：经系统 DownloadManager，从 GitHub Release 资产直连下载。
  * 校验：安装前必须通过包名 / 版本号 / SHA-256 校验（fail-closed：拿不到校验和即拒绝安装）。
+ * 安装：校验通过后由用户确认，再调起系统安装器（不自动安装）。
  */
 package com.example.player
 
@@ -18,7 +19,6 @@ import android.os.Environment
 import android.provider.MediaStore
 import android.provider.Settings
 import android.util.Log
-import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
@@ -37,7 +37,7 @@ import java.net.URL
 import java.security.MessageDigest
 import androidx.core.content.edit
 
-/** 版本检查器：从 GitHub API 或 jsDelivr 回退源解析最新 Release 信息。 */
+/** 版本检查器：从 GitHub Releases API 解析最新 Release 信息。 */
 class UpdateChecker {
 
     /**
@@ -45,7 +45,7 @@ class UpdateChecker {
      * @property version 版本号（已去掉 v 前缀）
      * @property apkUrl 安装包下载地址
      * @property notes 更新说明
-     * @property sha256 安装包 SHA-256（可能为 null，此时将拒绝自动安装）
+     * @property sha256 安装包 SHA-256（可能为 null，此时将拒绝安装）
      */
     data class Release(
         val version: String,
@@ -59,46 +59,38 @@ class UpdateChecker {
     private fun normalizeVersion(raw: String): String =
         raw.trim().removePrefix("v").removePrefix("V").trim()
 
-    /** 检查最新版本：GitHub API 优先，解析失败回退 jsDelivr version.json。 */
+    /** 检查最新版本：请求 GitHub Releases API。 */
     fun checkLatest(): Release? {
-        parseRelease(GITHUB_API_LATEST, "Accept" to "application/vnd.github+json")?.let { return it }
-
-        return parseRelease(JS_VERSION_JSON_URL)
+        val body = fetchLatestReleaseJson() ?: return null
+        return parseRelease(body)
     }
 
-    private fun httpGet(url: String, vararg headers: Pair<String, String>): String? {
-        val conn = URL(url).openConnection() as HttpURLConnection
+    /** 请求 GitHub Releases API；任何网络或 HTTP 异常都返回 null。 */
+    private fun fetchLatestReleaseJson(): String? {
+        var conn: HttpURLConnection? = null
         return try {
-            conn.connectTimeout = CONNECT_TIMEOUT_MS
-            conn.readTimeout = READ_TIMEOUT_MS
-            for ((name, value) in headers) conn.setRequestProperty(name, value)
-            if (conn.responseCode != 200) null
-            else conn.inputStream.bufferedReader().use { it.readText() }
+            val current = URL(GITHUB_API_LATEST).openConnection() as HttpURLConnection
+            conn = current
+            current.connectTimeout = CONNECT_TIMEOUT_MS
+            current.readTimeout = READ_TIMEOUT_MS
+            current.setRequestProperty("Accept", "application/vnd.github+json")
+            if (current.responseCode != 200) null
+            else current.inputStream.bufferedReader().use { it.readText() }
         } catch (_: Exception) {
             null
         } finally {
-            conn.disconnect()
+            conn?.disconnect()
         }
     }
 
-    /** 解析 JSON：兼容 GitHub Release 与 version.json 两种字段命名。 */
-    private fun parseRelease(url: String, vararg headers: Pair<String, String>): Release? {
-        val body = httpGet(url, *headers) ?: return null
+    /** 解析 GitHub Release JSON。 */
+    private fun parseRelease(body: String): Release? {
         return try {
             val obj = JSONObject(body)
-            val version = normalizeVersion(
-                obj.text("version").ifBlank { obj.text("tag_name") }
-            ).ifBlank { return null }
+            val version = normalizeVersion(obj.text("tag_name")).ifBlank { return null }
             val asset = findApkAsset(obj.optJSONArray("assets"))
-            val apkUrl = obj.text("apkUrl").ifBlank {
-                asset?.text("browser_download_url").orEmpty()
-            }.trim().ifBlank { return null }
-            val notes = obj.text("notes").ifBlank { obj.text("body") }
-            // 校验和来源优先级：version.json 的 sha256 / apkSha256 → Release 资产 digest
-            val sha256 = parseSha256Digest(obj.text("sha256"))
-                ?: parseSha256Digest(obj.text("apkSha256"))
-                ?: parseSha256Digest(asset?.text("digest"))
-            Release(version, apkUrl, notes, sha256)
+            val apkUrl = asset?.text("browser_download_url").orEmpty().trim().ifBlank { return null }
+            Release(version, apkUrl, obj.text("body"), parseSha256Digest(asset?.text("digest")))
         } catch (_: Exception) {
             null
         }
@@ -117,8 +109,6 @@ class UpdateChecker {
     }
 
     companion object {
-        private const val JS_CDN = "https://cdn.jsdelivr.net/gh/niu0506/player"
-        private const val JS_VERSION_JSON_URL = "$JS_CDN@main/version.json"
         private const val GITHUB_API_LATEST = "https://api.github.com/repos/niu0506/player/releases/latest"
         private const val CONNECT_TIMEOUT_MS = 10_000
         private const val READ_TIMEOUT_MS = 20_000
@@ -136,14 +126,6 @@ class UpdateChecker {
             }
             return false
         }
-    }
-}
-
-/** 生成下载源顺序：直连优先，随后依次拼接各加速前缀兜底；非 GitHub 地址不加速。 */
-internal fun orderedDownloadUrls(apkUrl: String, accelerators: List<String>): List<String> {
-    if (!apkUrl.startsWith("https://github.com/")) return listOf(apkUrl)
-    return (listOf("") + accelerators).map { prefix ->
-        if (prefix.isEmpty()) apkUrl else prefix.trimEnd('/') + "/" + apkUrl
     }
 }
 
@@ -167,38 +149,28 @@ internal fun toHex(bytes: ByteArray): String {
 
 private const val HEX_DIGITS = "0123456789abcdef"
 
-/** 校验和核对结果。 */
-internal enum class ApkChecksumVerdict {
-    OK,
-
-    /** 期望值缺失（fail-closed：应拒绝安装）。 */
-    MISSING,
-
-    MISMATCH,
-}
-
-/** 比较期望与实际校验和（忽略大小写）。 */
-internal fun verifyApkChecksum(expected: String?, actual: String): ApkChecksumVerdict {
-    if (expected.isNullOrEmpty()) return ApkChecksumVerdict.MISSING
-    return if (actual.equals(expected, ignoreCase = true)) {
-        ApkChecksumVerdict.OK
-    } else {
-        ApkChecksumVerdict.MISMATCH
-    }
-}
-
-/** 安装包整体校验结论。 */
+/** 安装包校验结论。 */
 internal enum class ApkValidation {
     OK,
 
-    /** 缺少校验和，拒绝安装。 */
+    /** 缺少校验和，拒绝安装（fail-closed）。 */
     MISSING_CHECKSUM,
 
     /** 文件残缺 / 元数据不符 / 校验不匹配。 */
     INVALID,
 }
 
-/** 应用内更新编排：检查、下载（多源重试）、校验与安装。 */
+/** 比较期望与实际校验和（忽略大小写）。 */
+internal fun verifyApkChecksum(expected: String?, actual: String): ApkValidation {
+    if (expected.isNullOrEmpty()) return ApkValidation.MISSING_CHECKSUM
+    return if (actual.equals(expected, ignoreCase = true)) {
+        ApkValidation.OK
+    } else {
+        ApkValidation.INVALID
+    }
+}
+
+/** 应用内更新编排：检查、下载、校验与安装。 */
 class UpdateManager(private val activity: AppCompatActivity) {
 
     companion object {
@@ -207,14 +179,16 @@ class UpdateManager(private val activity: AppCompatActivity) {
         private const val DOWNLOAD_PREFS = "update_download"
         private const val KEY_DOWNLOAD_ID = "downloadId"
         private const val KEY_DOWNLOAD_VERSION = "downloadVersion"
-        private const val KEY_DOWNLOAD_RETRY_URLS = "downloadRetryUrls"
         private const val KEY_DOWNLOAD_SHA256 = "downloadSha256"
         private const val KEY_PENDING_INSTALL_PATH = "pendingInstallPath"
 
         const val APK_NAME_PREFIX = "player-v"
         const val APK_NAME_SUFFIX = "-release.apk"
 
-        /** 应用替换成功后清理旧更新包（MediaStore Downloads 目录 + 应用私有下载目录）。 */
+        /**
+         * 应用替换成功后清理旧更新包：应用私有下载目录，
+         * 以及 v1.4.x 时期遗留在 MediaStore Downloads 中的包（历史兼容，后续版本可移除）。
+         */
         fun cleanupUpdateApks(context: Context) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 try {
@@ -244,9 +218,6 @@ class UpdateManager(private val activity: AppCompatActivity) {
         activity.getSharedPreferences(DOWNLOAD_PREFS, Context.MODE_PRIVATE)
     }
 
-    /** 等待授权后要安装的 APK uri。 */
-    private var pendingInstallUri: Uri? = null
-
     /** 当前下载目标文件。 */
     private var pendingDownloadFile: File? = null
 
@@ -256,17 +227,16 @@ class UpdateManager(private val activity: AppCompatActivity) {
     /** 当前下载对应的期望 SHA-256。 */
     private var pendingDownloadSha256: String? = null
 
-    private var downloadStartInFlight = false
+    /** 下载流程阶段：同时防止重复入队与重复处理完成回调。 */
+    private var downloadState = DownloadState.IDLE
 
-    private var downloadRetryInFlight = false
-
-    private var completionInFlight = false
-
-    /** 剩余待尝试的下载源（顺序即优先级）。 */
-    private var pendingDownloadUrls: ArrayDeque<String> = ArrayDeque()
+    private enum class DownloadState { IDLE, STARTING, COMPLETING }
 
     /** 因界面非前台而暂存的更新提示。 */
     private var pendingUpdate: UpdateChecker.Release? = null
+
+    /** 因界面非前台而暂存的待确认安装 uri。 */
+    private var pendingInstallPrompt: Uri? = null
 
     /** 系统下载完成广播：只处理本次发起的下载 id。 */
     private val downloadCompleteReceiver = object : BroadcastReceiver() {
@@ -294,36 +264,33 @@ class UpdateManager(private val activity: AppCompatActivity) {
         }
     }
 
-    /** 下载结束处理：失败换源重试；成功则校验（OK 安装 / 缺校验和拒绝 / 无效换源）。 */
+    /** 下载结束处理：失败提示；成功则校验（OK 待确认安装 / 缺校验和拒绝 / 无效提示）。 */
     private suspend fun handleDownloadOutcome(id: Long, context: Context = activity) {
         when (withContext(Dispatchers.IO) { queryDownloadStatus(id) }) {
-            DownloadManager.STATUS_FAILED -> retryDownloadOrFinish(context)
+            DownloadManager.STATUS_FAILED -> failDownload(context)
             DownloadManager.STATUS_SUCCESSFUL -> {
-                if (completionInFlight) return
-                completionInFlight = true
+                if (downloadState == DownloadState.COMPLETING) return
+                downloadState = DownloadState.COMPLETING
                 try {
                     when (withContext(Dispatchers.IO) { validateDownloadedApk() }) {
                         ApkValidation.OK -> {
                             val uri = downloadedInstallUri()
                             clearPersistedDownload()
-                            if (uri != null) installApk(uri)
+                            if (uri != null) {
+                                persistPendingInstall()
+                                promptInstall(uri)
+                            }
                         }
                         ApkValidation.MISSING_CHECKSUM -> abortUnverifiedInstall()
-                        ApkValidation.INVALID -> retryDownloadOrFinish(context)
+                        ApkValidation.INVALID -> failDownload(context)
                     }
                 } finally {
-                    completionInFlight = false
+                    downloadState = DownloadState.IDLE
                 }
             }
             else -> Unit
         }
     }
-
-    /** CDN 反代加速前缀（直连失败时兜底）。 */
-    private val downloadAccelerators = listOf(
-        "https://gh-proxy.com/",
-        "https://ghproxy.net/",
-    )
 
     fun registerReceivers() {
         ContextCompat.registerReceiver(
@@ -340,17 +307,13 @@ class UpdateManager(private val activity: AppCompatActivity) {
         }
     }
 
-    /** onStart 调用：恢复上次未完成的下载与待授权安装。 */
+    /** onStart 调用：恢复上次未完成的下载（待确认安装统一由 onResume 补弹）。 */
     fun resumePendingInstall() {
-
         activity.lifecycleScope.launch { resumePendingDownload() }
-        val uri = restorePendingInstallUri() ?: return
-        if (canInstallPackages()) installApk(uri)
     }
 
-    /** 恢复待安装 APK 的 uri（文件校验通过才返回）。 */
+    /** 恢复待确认安装的 APK uri（文件与路径均有效才返回）。 */
     private fun restorePendingInstallUri(): Uri? {
-        pendingInstallUri?.let { return it }
         val path = downloadPrefs.getString(KEY_PENDING_INSTALL_PATH, null) ?: return null
         val file = File(path)
         if (!file.exists() || file.length() == 0L) {
@@ -358,9 +321,7 @@ class UpdateManager(private val activity: AppCompatActivity) {
             return null
         }
         pendingDownloadFile = file
-        val uri = fileToInstallUri(file)
-        if (uri == null) clearPendingInstall()
-        return uri
+        return downloadedInstallUri().also { if (it == null) clearPendingInstall() }
     }
 
     /** 经 FileProvider 生成安装用 content:// uri（路径不在授权范围时返回 null）。 */
@@ -381,18 +342,13 @@ class UpdateManager(private val activity: AppCompatActivity) {
     }
 
     private fun clearPendingInstall() {
-        pendingInstallUri = null
         downloadPrefs.edit { remove(KEY_PENDING_INSTALL_PATH) }
     }
 
     /** 检查更新；manual 为 true 时会 Toast 提示「已最新 / 检查失败」。 */
     fun checkForUpdate(manual: Boolean) {
         activity.lifecycleScope.launch(Dispatchers.IO) {
-            val release = try {
-                updateChecker.checkLatest()
-            } catch (_: Exception) {
-                null
-            }
+            val release = updateChecker.checkLatest()
             withContext(Dispatchers.Main) {
                 if (activity.isFinishing || activity.isDestroyed) return@withContext
 
@@ -404,14 +360,10 @@ class UpdateManager(private val activity: AppCompatActivity) {
                 }
                 when {
                     current == null || release == null -> if (manual) {
-                        Toast.makeText(activity, R.string.update_check_failed, Toast.LENGTH_SHORT).show()
+                        activity.toast(R.string.update_check_failed)
                     }
                     !UpdateChecker.isNewer(release.version, current) -> if (manual) {
-                        Toast.makeText(
-                            activity,
-                            activity.getString(R.string.update_up_to_date, current),
-                            Toast.LENGTH_SHORT
-                        ).show()
+                        activity.toast(R.string.update_up_to_date, current)
                     }
                     else -> showUpdateDialog(release)
                 }
@@ -423,12 +375,41 @@ class UpdateManager(private val activity: AppCompatActivity) {
     fun resumePendingUpdateDialog() {
         val release = pendingUpdate ?: return
         pendingUpdate = null
-        if (!activity.isFinishing && !activity.isDestroyed) showUpdateDialog(release)
+        showUpdateDialog(release)
+    }
+
+    /** onResume 调用：补弹待确认安装（内存暂存优先，其次从持久化路径恢复）。 */
+    fun resumePendingInstallPrompt() {
+        val uri = pendingInstallPrompt ?: restorePendingInstallUri()
+        pendingInstallPrompt = null
+        if (uri != null) promptInstall(uri)
+    }
+
+    /** 界面可安全弹窗：未销毁且已处于前台。 */
+    private fun canShowDialog(): Boolean =
+        !activity.isFinishing && !activity.isDestroyed &&
+            activity.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)
+
+    /** 下载校验通过后交由用户确认，确认后才调起系统安装器（不再自动安装）。 */
+    private fun promptInstall(apkUri: Uri) {
+        if (!canShowDialog()) {
+            pendingInstallPrompt = apkUri
+            return
+        }
+        val dialog = AlertDialog.Builder(activity)
+            .setTitle(R.string.update_install_title)
+            .setMessage(R.string.update_install_prompt)
+            .setPositiveButton(R.string.update_install_now) { _, _ -> installApk(apkUri) }
+            .setNegativeButton(R.string.cancel) { _, _ -> clearPendingInstall() }
+            .create()
+        dialog.setCanceledOnTouchOutside(false)
+        dialog.setOnCancelListener { clearPendingInstall() }
+        dialog.show()
     }
 
     /** 显示更新弹窗；界面未处于前台则暂存，待 onResume 补弹。 */
     private fun showUpdateDialog(release: UpdateChecker.Release) {
-        if (!activity.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
+        if (!canShowDialog()) {
             pendingUpdate = release
             return
         }
@@ -444,34 +425,32 @@ class UpdateManager(private val activity: AppCompatActivity) {
         dialog.show()
     }
 
-    /** 开始下载：记录版本 / 校验和 / 源顺序，写入应用私有下载目录。 */
+    /** 开始下载：记录版本 / 校验和，写入应用私有下载目录。 */
     private fun downloadApk(release: UpdateChecker.Release) {
-        if (downloadStartInFlight) {
-            Toast.makeText(activity, R.string.update_download_in_progress, Toast.LENGTH_SHORT).show()
+        if (downloadState != DownloadState.IDLE) {
+            activity.toast(R.string.update_download_in_progress)
             return
         }
-        downloadStartInFlight = true
+        downloadState = DownloadState.STARTING
         activity.lifecycleScope.launch {
             try {
                 if (withContext(Dispatchers.IO) { hasActiveDownload() }) {
-                    Toast.makeText(activity, R.string.update_download_in_progress, Toast.LENGTH_SHORT).show()
+                    activity.toast(R.string.update_download_in_progress)
                     return@launch
                 }
                 pendingDownloadVersion = release.version
                 pendingDownloadSha256 = release.sha256
-                pendingDownloadUrls = ArrayDeque(
-                    orderedDownloadUrls(release.apkUrl, downloadAccelerators)
-                )
                 val dir = activity.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
                 if (dir == null) {
-                    Toast.makeText(activity, R.string.update_storage_unavailable, Toast.LENGTH_SHORT).show()
+                    activity.toast(R.string.update_storage_unavailable)
                     return@launch
                 }
                 pendingDownloadFile = File(dir, apkFileName(release.version))
-                enqueueDownload(pendingDownloadUrls.removeFirst())
-                Toast.makeText(activity, R.string.update_download_started, Toast.LENGTH_SHORT).show()
+                enqueueDownload(release.apkUrl)
+                activity.toast(R.string.update_download_started)
             } finally {
-                downloadStartInFlight = false
+                // 完成回调可能已把状态推进到 COMPLETING，此时不要回退
+                if (downloadState == DownloadState.STARTING) downloadState = DownloadState.IDLE
             }
         }
     }
@@ -505,7 +484,6 @@ class UpdateManager(private val activity: AppCompatActivity) {
             putLong(KEY_DOWNLOAD_ID, lastDownloadId)
                 .putString(KEY_DOWNLOAD_VERSION, pendingDownloadVersion)
                 .putString(KEY_DOWNLOAD_SHA256, pendingDownloadSha256.orEmpty())
-                .putString(KEY_DOWNLOAD_RETRY_URLS, JSONArray(pendingDownloadUrls.toList()).toString())
         }
     }
 
@@ -514,24 +492,14 @@ class UpdateManager(private val activity: AppCompatActivity) {
         pendingDownloadSha256 = null
         downloadPrefs.edit {
             remove(KEY_DOWNLOAD_ID).remove(KEY_DOWNLOAD_VERSION)
-                .remove(KEY_DOWNLOAD_SHA256).remove(KEY_DOWNLOAD_RETRY_URLS)}
+                .remove(KEY_DOWNLOAD_SHA256)
+        }
     }
 
-    /** 换源重试；没有更多源时提示失败并清理状态。 */
-    private suspend fun retryDownloadOrFinish(context: Context = activity) {
-        if (downloadRetryInFlight) return
-        downloadRetryInFlight = true
-        try {
-            val next = pendingDownloadUrls.removeFirstOrNull()
-            if (next != null) {
-                enqueueDownload(next)
-            } else {
-                Toast.makeText(context, R.string.update_download_failed, Toast.LENGTH_SHORT).show()
-                clearPersistedDownload()
-            }
-        } finally {
-            downloadRetryInFlight = false
-        }
+    /** 下载失败：提示并清理状态。 */
+    private fun failDownload(context: Context = activity) {
+        context.toast(R.string.update_download_failed)
+        clearPersistedDownload()
     }
 
     /** 从持久化状态恢复未完成的下载并处理其结果。 */
@@ -548,21 +516,7 @@ class UpdateManager(private val activity: AppCompatActivity) {
         val dir = activity.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: return
         pendingDownloadFile = File(dir, apkFileName(pendingDownloadVersion))
 
-        pendingDownloadUrls = readRetryUrls() ?: ArrayDeque()
         handleDownloadOutcome(id)
-    }
-
-    /** 读回剩余待重试的下载源。 */
-    private fun readRetryUrls(): ArrayDeque<String>? {
-        val raw = downloadPrefs.getString(KEY_DOWNLOAD_RETRY_URLS, null) ?: return null
-        return try {
-            val array = JSONArray(raw)
-            ArrayDeque((0 until array.length()).mapNotNull { index ->
-                array.optString(index).takeIf { it.isNotBlank() }
-            })
-        } catch (_: Exception) {
-            ArrayDeque()
-        }
     }
 
     private fun downloadedInstallUri(): Uri? =
@@ -591,12 +545,12 @@ class UpdateManager(private val activity: AppCompatActivity) {
         }
         val actualHash = sha256OfFile(file) ?: return ApkValidation.INVALID
         return when (verifyApkChecksum(pendingDownloadSha256, actualHash)) {
-            ApkChecksumVerdict.OK -> ApkValidation.OK
-            ApkChecksumVerdict.MISSING -> {
+            ApkValidation.OK -> ApkValidation.OK
+            ApkValidation.MISSING_CHECKSUM -> {
                 Log.w(TAG, "更新包未提供 SHA-256，无法验证完整性，拒绝安装")
                 ApkValidation.MISSING_CHECKSUM
             }
-            ApkChecksumVerdict.MISMATCH -> {
+            ApkValidation.INVALID -> {
                 Log.w(TAG, "更新包校验和不匹配：期望 ${pendingDownloadSha256}，实际 $actualHash")
                 ApkValidation.INVALID
             }
@@ -606,7 +560,7 @@ class UpdateManager(private val activity: AppCompatActivity) {
     /** 缺校验和时的终止路径：清理下载并提示手动安装。 */
     private fun abortUnverifiedInstall() {
         clearPersistedDownload()
-        Toast.makeText(activity, R.string.update_unverified, Toast.LENGTH_LONG).show()
+        activity.toastLong(R.string.update_unverified)
     }
 
     /** 计算文件 SHA-256（分块读取，避免大包占用内存）。 */
@@ -625,11 +579,9 @@ class UpdateManager(private val activity: AppCompatActivity) {
         null
     }
 
-    /** 调起系统安装器；若无「安装未知应用」权限，先引导授权并记录待安装 uri。 */
+    /** 调起系统安装器；若无「安装未知应用」权限，先引导授权，返回后再次确认安装。 */
     private fun installApk(apkUri: Uri) {
         if (!canInstallPackages()) {
-            pendingInstallUri = apkUri
-            persistPendingInstall()
             try {
                 activity.startActivity(
                     Intent(
@@ -639,7 +591,7 @@ class UpdateManager(private val activity: AppCompatActivity) {
                 )
             } catch (_: Exception) {
             }
-            Toast.makeText(activity, R.string.update_install_permission, Toast.LENGTH_LONG).show()
+            activity.toastLong(R.string.update_install_permission)
             return
         }
         val intent = Intent(Intent.ACTION_VIEW).apply {
@@ -651,7 +603,7 @@ class UpdateManager(private val activity: AppCompatActivity) {
             activity.startActivity(intent)
             clearPendingInstall()
         } catch (_: Exception) {
-            Toast.makeText(activity, R.string.update_installer_failed, Toast.LENGTH_SHORT).show()
+            activity.toast(R.string.update_installer_failed)
         }
     }
 }

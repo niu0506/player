@@ -21,6 +21,7 @@
     <color name="player_control_text">#FFFFFFFF</color>
     <color name="player_control_muted_text">#B3FFFFFF</color>
 
+    <!-- 点号命名的隐式父样式：PlayerControls.* 均继承它，不能删除 -->
     <style name="PlayerControls" />
     <style name="PlayerControls.Button">
         <item name="android:background">?android:attr/selectableItemBackgroundBorderless</item>
@@ -28,6 +29,17 @@
         <item name="android:layout_marginLeft">@dimen/player_control_icon_margin</item>
         <item name="android:layout_marginRight">@dimen/player_control_icon_margin</item>
         <item name="android:contentDescription">@string/player_control_action</item>
+    </style>
+    <style name="PlayerControls.TextButton">
+        <item name="android:layout_width">wrap_content</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:layout_gravity">center_vertical</item>
+        <item name="android:paddingStart">10dp</item>
+        <item name="android:paddingEnd">10dp</item>
+        <item name="android:gravity">center</item>
+        <item name="android:textSize">13sp</item>
+        <item name="android:textColor">@color/player_control_text</item>
+        <item name="android:background">?android:attr/selectableItemBackgroundBorderless</item>
     </style>
     <style name="PlayerControls.Button.Bottom" parent="PlayerControls.Button">
         <item name="android:layout_width">@dimen/player_control_small_icon_size</item>

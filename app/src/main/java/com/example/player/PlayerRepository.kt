@@ -13,7 +13,6 @@
 package com.example.player
 
 import android.content.Context
-import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.database.Cursor
 import android.net.Uri
@@ -24,7 +23,6 @@ import android.provider.MediaStore
 import android.util.Log
 import android.util.LruCache
 import androidx.core.content.ContextCompat
-import androidx.core.content.edit
 import androidx.core.net.toUri
 import androidx.room.ColumnInfo
 import androidx.room.Dao
@@ -36,7 +34,6 @@ import androidx.room.PrimaryKey
 import androidx.room.Query
 import androidx.room.Room
 import androidx.room.RoomDatabase
-import androidx.room.Transaction
 import androidx.room.migration.Migration
 import androidx.room.withTransaction
 import androidx.sqlite.db.SupportSQLiteDatabase
@@ -53,7 +50,6 @@ import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import org.json.JSONArray
 import org.json.JSONObject
 import java.util.Locale
 import kotlin.time.Duration.Companion.milliseconds
@@ -227,9 +223,6 @@ class MediaStoreScanner(private val context: Context) {
     /** 查询所有音频；失败（权限/异常）返回 null。 */
     fun queryAudios(): List<MediaItemData>? = query(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI)
 
-    @Suppress("InlinedApi")
-    private val durationColumn: String = MediaStore.MediaColumns.DURATION
-
     /** 用于提取文件夹分组键的列：API 29+ 用 RELATIVE_PATH，更低版本用 DATA。 */
     @Suppress("DEPRECATION")
     private val folderColumn: String =
@@ -249,23 +242,23 @@ class MediaStoreScanner(private val context: Context) {
         }
 
     /** 执行一次查询；任何异常或 cursor 为空都返回 null，交由调用方按「扫描失败」处理。 */
+    @Suppress("InlinedApi") // DURATION 常量 API 29+，但为编译期内联字符串，低版本可安全使用
     private fun query(contentUri: Uri): List<MediaItemData>? {
         val items = mutableListOf<MediaItemData>()
         val projection = arrayOf(
             BaseColumns._ID,
             MediaStore.MediaColumns.DISPLAY_NAME,
-            durationColumn,
+            MediaStore.MediaColumns.DURATION,
             folderColumn
         )
         return try {
             val cursor = context.contentResolver.query(
-                contentUri, projection, null, null,
-                "${MediaStore.MediaColumns.DISPLAY_NAME} ASC"
+                contentUri, projection, null, null, null
             ) ?: return null
             cursor.use {
                 val idIdx = it.getColumnIndexOrThrow(BaseColumns._ID)
                 val nameIdx = it.getColumnIndexOrThrow(MediaStore.MediaColumns.DISPLAY_NAME)
-                val durIdx = it.getColumnIndexOrThrow(durationColumn)
+                val durIdx = it.getColumnIndexOrThrow(MediaStore.MediaColumns.DURATION)
                 val folderIdx = it.getColumnIndex(folderColumn)
                 while (it.moveToNext()) {
                     val id = it.getLong(idIdx)
@@ -367,8 +360,11 @@ interface PlaylistDao {
     @Query("DELETE FROM playlist")
     suspend fun clear()
 
-    /** 事务内整体替换：先清空再插入，保证读到的列表要么是旧全量要么是新全量。 */
-    @Transaction
+    /** 只更新单条时长，避免为一次回填整表替换。 */
+    @Query("UPDATE playlist SET duration = :duration WHERE uri = :uri")
+    suspend fun updateDuration(uri: String, duration: Long)
+
+    /** 整体替换：先清空再插入（调用方已开启事务）。 */
     suspend fun replaceAll(items: List<PlaylistItemEntity>) {
         clear()
         insertAll(items)
@@ -429,16 +425,17 @@ object PlayerRepository {
     private const val TAG = "PlayerRepository"
     private const val DB_NAME = "player.db"
 
+    /** 进度批量删除时单条 SQL 的最大绑定数（SQLite 约 999）。 */
+    private const val PROGRESS_DELETE_CHUNK = 500
+
     /** KV 表里存放「缺失文件记录」的键。 */
     private const val KEY_MISSING_URIS = "missingUris"
 
     /** 文件消失后需等待此时长才允许从列表中删除，避免外部瞬时不可用导致误删。 */
     internal const val MISSING_DELETE_GRACE_MS = 24 * 60 * 60 * 1000L
 
-    /** 旧版 SharedPreferences 存储名与键（用于一次性迁移到 Room）。 */
-    private const val LEGACY_PREFS = "player"
+    /** KV 表里存放「上次播放项」的键。 */
     private const val KEY_LAST_ITEM = "lastItem"
-    private const val KEY_MIGRATED = "migratedFromPrefs"
 
     /** 单线程 IO 作用域：保证所有数据库写入按提交顺序串行执行。 */
     private val persistScope =
@@ -447,8 +444,8 @@ object PlayerRepository {
     private val writeMutex = Mutex()
 
     /** 落盘失败事件（合并型，避免重复刷屏）。 */
-    private val writeFailureChannel = Channel<WriteFailure>(Channel.CONFLATED)
-    val writeFailures: Flow<WriteFailure> = writeFailureChannel.receiveAsFlow()
+    private val writeFailureChannel = Channel<Unit>(Channel.CONFLATED)
+    val writeFailures: Flow<Unit> = writeFailureChannel.receiveAsFlow()
 
     /** 保护内存状态（playlistState 等）读写的锁。 */
     private val stateLock = Any()
@@ -482,9 +479,6 @@ object PlayerRepository {
     /** 已记录缺失的文件（uri → 缺失信息）。 */
     @Volatile
     private var missingState: Map<String, MissingInfo> = emptyMap()
-
-    /** 落盘失败事件的消息载体。 */
-    data class WriteFailure(val message: String)
 
     /** 是否已成功加载过（失败时为 false，读取将返回空数据）。 */
     @Volatile
@@ -553,7 +547,10 @@ object PlayerRepository {
                 progressState = mergeProgressMap(progressState, writesSnapshot, removesSnapshot)
             },
             dbPart = {
-                if (removesSnapshot.isNotEmpty()) progressDao().deleteAll(removesSnapshot)
+                // 单条 SQL 的绑定参数有上限，批量删除按块提交
+                for (chunk in removesSnapshot.chunked(PROGRESS_DELETE_CHUNK)) {
+                    progressDao().deleteAll(chunk.toSet())
+                }
 
                 val rows = writesSnapshot.filterValues { it > 0 }
                     .map { ProgressEntity(it.key, it.value) }
@@ -563,7 +560,12 @@ object PlayerRepository {
         )
     }
 
-    /** 全量保存播放列表（内存立即更新，数据库异步替换）。 */
+    /**
+     * 全量保存播放列表（内存立即更新，数据库异步整体替换）。
+     *
+     * 增删/重排会让所有条目的 sortOrder 变化，逐行 diff 并不比整体替换更省；
+     * 单条时长回填请走 [updatePlaylistDuration]，避免为一处变更重写整表。
+     */
     fun savePlaylist(items: List<MediaItemData>) {
         val itemsSnapshot = items.toList()
         dispatchWrite(
@@ -576,6 +578,18 @@ object PlayerRepository {
                 }
                 playlistDao().replaceAll(entities)
             }
+        )
+    }
+
+    /** 回填单条时长：只更新目标行，避免为一次回填整表替换。 */
+    fun updatePlaylistDuration(uri: Uri, duration: Long) {
+        dispatchWrite(
+            memPart = {
+                playlistState = playlistState.map {
+                    if (it.uri == uri) it.copy(duration = duration) else it
+                }
+            },
+            dbPart = { playlistDao().updateDuration(uri.toString(), duration) }
         )
     }
 
@@ -710,7 +724,7 @@ object PlayerRepository {
 
     private fun nowMs(): Long = System.nanoTime() / 1_000_000
 
-    /** 在写锁与事务中执行一次落盘，最多重试 3 次；最终失败会广播 [WriteFailure]。 */
+    /** 在写锁与事务中执行一次落盘，最多重试 3 次；最终失败会广播 [writeFailures]。 */
     private suspend fun persist(block: suspend PlayerDatabase.() -> Unit): Boolean {
         repeat(3) { attempt ->
             val database = db
@@ -725,7 +739,7 @@ object PlayerRepository {
                     delay(200.milliseconds)
                 } else {
                     Log.e(TAG, "数据库写入三次失败，本次变更未落盘", e)
-                    writeFailureChannel.trySend(WriteFailure(e.message ?: "database write failed"))
+                    writeFailureChannel.trySend(Unit)
                     return false
                 }
             }
@@ -733,21 +747,13 @@ object PlayerRepository {
         return false
     }
 
-    /** 真正打开数据库、按需执行旧数据迁移，并把全量数据载入内存。 */
+    /** 真正打开数据库并把全量数据载入内存。 */
     private suspend fun loadInternal(appCtx: Context) {
 
         val database = Room.databaseBuilder(appCtx, PlayerDatabase::class.java, DB_NAME)
             .addMigrations(PlayerDatabase.MIGRATION_1_2)
             .build()
         db = database
-        val prefs = appCtx.getSharedPreferences(LEGACY_PREFS, Context.MODE_PRIVATE)
-        if (database.kvDao().get(KEY_MIGRATED) == null) {
-            migrateFromPrefs(database, prefs)
-        } else if (prefs.contains("playlist") || prefs.contains("progress")
-            || prefs.contains("lastItem")
-        ) {
-            prefs.edit { clear() }
-        }
         playlistState = database.playlistDao().getAll().map {
             MediaItemData(it.uri.toUri(), it.name, it.duration, it.folder)
         }
@@ -756,24 +762,6 @@ object PlayerRepository {
         missingState = parseMissingJson(database.kvDao().get(KEY_MISSING_URIS))
 
         loadSucceeded = true
-    }
-
-    /** 把旧版 SharedPreferences 中的播放列表/进度/最后播放项一次性迁移进 Room，随后清空旧数据。 */
-    private suspend fun migrateFromPrefs(database: PlayerDatabase, prefs: SharedPreferences) {
-        val items = parseLegacyPlaylistJson(prefs.getString("playlist", null))
-        val progress = parseLegacyProgressJson(prefs.getString("progress", null))
-        val last = prefs.getString("lastItem", null)
-        database.withTransaction {
-            database.playlistDao().replaceAll(
-                items.mapIndexed { i, it ->
-                    PlaylistItemEntity(it.uri, it.name, it.duration, i)
-                }
-            )
-            database.progressDao().upsertAll(progress.map { ProgressEntity(it.key, it.value) })
-            database.kvDao().put(KvEntity(KEY_MIGRATED, "1"))
-            if (last != null) database.kvDao().put(KvEntity(KEY_LAST_ITEM, last))
-        }
-        prefs.edit { clear() }
     }
 }
 
@@ -790,7 +778,7 @@ internal sealed interface ProgressWriteDecision {
     data object Skip : ProgressWriteDecision
 }
 
-/** 末尾容差：距末尾 5 秒内视为已看完（周期落盘采样点常落方位词）。 */
+/** 末尾容差：距末尾 5 秒内视为已看完（周期落盘采样点常落在末尾几秒内）。 */
 internal const val PROGRESS_FINISH_TAIL_MS = 5_000L
 
 /** 判断位置是否已到达末尾（容差不超过总时长的 10%，适配超短片）。 */
@@ -864,47 +852,4 @@ internal fun encodeMissingJson(map: Map<String, MissingInfo>): String {
         )
     }
     return obj.toString()
-}
-
-/** 解析旧版进度 JSON（仅保留 > 0 的值）。 */
-internal fun parseLegacyProgressJson(json: String?): Map<String, Long> {
-    if (json.isNullOrEmpty()) return emptyMap()
-    return try {
-        val obj = JSONObject(json)
-        buildMap {
-            for (key in obj.keys()) {
-                val v = obj.getLong(key)
-                if (v > 0) put(key, v)
-            }
-        }
-    } catch (_: Exception) {
-        emptyMap()
-    }
-}
-
-/** 旧版播放列表条目（迁移用）。 */
-internal data class LegacyPlaylistItem(
-    val uri: String,
-    val name: String,
-    val duration: Long,
-)
-
-/** 解析旧版播放列表 JSON（按顺序去重，重复 uri 保留首次出现）。 */
-internal fun parseLegacyPlaylistJson(json: String?): List<LegacyPlaylistItem> {
-    if (json.isNullOrEmpty()) return emptyList()
-    return try {
-        val arr = JSONArray(json)
-        val seen = mutableSetOf<String>()
-        buildList {
-            for (i in 0 until arr.length()) {
-                val obj = arr.getJSONObject(i)
-                val uri = obj.getString("uri")
-                if (uri in seen) continue
-                seen.add(uri)
-                add(LegacyPlaylistItem(uri, obj.getString("name"), obj.optLong("duration", 0L)))
-            }
-        }
-    } catch (_: Exception) {
-        emptyList()
-    }
 }

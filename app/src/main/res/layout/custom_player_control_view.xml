@@ -16,18 +16,14 @@
       android:layout_height="@dimen/player_control_bottom_bar_height"
       android:layout_marginTop="@dimen/player_control_bottom_bar_top_margin"
       android:layout_gravity="bottom"
-      android:background="@color/player_control_bar"
-      android:layoutDirection="ltr">
+      android:background="@color/player_control_bar">
 
     <LinearLayout android:id="@id/exo_time"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:paddingStart="@dimen/player_control_time_padding"
         android:paddingEnd="@dimen/player_control_time_padding"
-        android:paddingLeft="@dimen/player_control_time_padding"
-        android:paddingRight="@dimen/player_control_time_padding"
-        android:layout_gravity="center_vertical|start"
-        android:layoutDirection="ltr">
+        android:layout_gravity="center_vertical|start">
 
       <!-- 当前时间 / 总时长 -->
       <TextView android:id="@id/exo_position"
@@ -44,33 +40,16 @@
     <LinearLayout android:id="@id/exo_basic_controls"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:layout_gravity="center_vertical|end"
-        android:layoutDirection="ltr">
+        android:layout_gravity="center_vertical|end">
 
-      <!-- 应用自定义入口：音轨切换 -->
+      <!-- 应用自定义入口：音轨 / 字幕 / 倍速 -->
       <TextView android:id="@+id/btn_audio"
-          android:layout_width="wrap_content"
-          android:layout_height="wrap_content"
-          android:layout_gravity="center_vertical"
-          android:paddingLeft="10dp"
-          android:paddingRight="10dp"
-          android:gravity="center"
-          android:text="@string/track_audio"
-          android:textSize="13sp"
-          android:textColor="#FFFFFF"
-          android:background="?attr/selectableItemBackgroundBorderless"/>
+          style="@style/PlayerControls.TextButton"
+          android:text="@string/track_audio"/>
 
       <TextView android:id="@+id/btn_subtitle"
-          android:layout_width="wrap_content"
-          android:layout_height="wrap_content"
-          android:layout_gravity="center_vertical"
-          android:paddingLeft="10dp"
-          android:paddingRight="10dp"
-          android:gravity="center"
-          android:text="@string/track_subtitle"
-          android:textSize="13sp"
-          android:textColor="#FFFFFF"
-          android:background="?attr/selectableItemBackgroundBorderless"/>
+          style="@style/PlayerControls.TextButton"
+          android:text="@string/track_subtitle"/>
 
       <!-- 随机播放 -->
       <ImageButton android:id="@id/exo_shuffle"
@@ -80,17 +59,9 @@
           style="@style/PlayerControls.Button.Repeat"/>
 
       <TextView android:id="@+id/btn_speed"
-          android:layout_width="wrap_content"
-          android:layout_height="wrap_content"
-          android:layout_gravity="center_vertical"
-          android:paddingLeft="10dp"
-          android:paddingRight="10dp"
-          android:gravity="center"
+          style="@style/PlayerControls.TextButton"
           android:text="@string/speed_default_label"
-          android:textSize="13sp"
-          android:textColor="#FFFFFF"
-          android:textStyle="bold"
-          android:background="?attr/selectableItemBackgroundBorderless"/>
+          android:textStyle="bold"/>
 
       <ImageButton android:id="@id/exo_fullscreen"
           style="@style/PlayerControls.Button.Fullscreen"/>
@@ -108,8 +79,7 @@
 
       <LinearLayout android:id="@id/exo_extra_controls"
           android:layout_width="wrap_content"
-          android:layout_height="wrap_content"
-          android:layoutDirection="ltr">
+          android:layout_height="wrap_content">
 
         <ImageButton android:id="@id/exo_overflow_hide"
             style="@style/PlayerControls.Button.OverflowHide"/>
@@ -132,8 +102,7 @@
       android:layout_gravity="bottom|end"
       android:layout_marginBottom="@dimen/player_control_minimal_margin_bottom"
       android:orientation="horizontal"
-      android:gravity="center_vertical"
-      android:layoutDirection="ltr">
+      android:gravity="center_vertical">
 
     <ImageButton android:id="@id/exo_minimal_fullscreen"
         style="@style/PlayerControls.Button.Fullscreen"/>
@@ -149,8 +118,7 @@
       android:background="@android:color/transparent"
       android:gravity="center"
       android:padding="@dimen/player_control_center_padding"
-      android:clipToPadding="false"
-      android:layoutDirection="ltr">
+      android:clipToPadding="false">
 
     <ImageButton android:id="@id/exo_prev"
         style="@style/PlayerControls.Button.Previous"/>

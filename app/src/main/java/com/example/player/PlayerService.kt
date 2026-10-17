@@ -79,14 +79,10 @@ class PlayerService : MediaSessionService() {
         }
 
         override fun onPlaybackStateChanged(playbackState: Int) {
+            if (playbackState != Player.STATE_ENDED) return
             val player = mediaSession?.player ?: return
             // 顺序播放到末尾后主动暂停，避免停在 ENDED 状态
-            if (playbackState == Player.STATE_ENDED
-                && player.playbackState == Player.STATE_ENDED
-                && player.repeatMode == Player.REPEAT_MODE_OFF
-            ) {
-                player.pause()
-            }
+            if (player.repeatMode == Player.REPEAT_MODE_OFF) player.pause()
         }
 
         override fun onPositionDiscontinuity(
@@ -299,24 +295,23 @@ class PlayerService : MediaSessionService() {
             instance?.consecutiveErrorCount = 0
         }
 
-        /** 删除某 uri 的进度（服务未启动时直接写库）。 */
-        fun dropProgress(uri: String) {
-            val svc = instance
-            if (svc == null) {
-                PlayerRepository.applyProgressUpdates(emptyMap(), setOf(uri))
-                return
-            }
-            svc.progressCache.remove(uri)
-            svc.removedUris.add(uri)
+        /** 批量删除进度：仓库一次写入，服务缓存一并清理（扫描清理已消失文件时用）。 */
+        fun dropProgress(uris: Collection<String>) {
+            if (uris.isEmpty()) return
+            val keys = uris.toSet()
+            PlayerRepository.applyProgressUpdates(emptyMap(), keys)
+            val svc = instance ?: return
+            for (key in keys) svc.progressCache.remove(key)
+            svc.removedUris.addAll(keys)
             svc.scheduleProgressTicker()
         }
 
+        /** 删除单条进度。 */
+        fun dropProgress(uri: String) = dropProgress(listOf(uri))
+
         /** 立即把当前播放位置落盘（暂停 / 切后台 / 点播前调用）。 */
         fun flushCurrentPosition() {
-            val svc = instance ?: return
-            val player = svc.mediaSession?.player ?: return
-            svc.cacheCurrentPosition(player)
-            svc.persistProgress()
+            instance?.persistProgress()
         }
     }
 }

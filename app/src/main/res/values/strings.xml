@@ -42,8 +42,6 @@
     <string name="toast_scan_reordered">已按文件夹整理</string>
     <string name="toast_scan_removed">删除 %1$d 个已消失文件</string>
     <string name="toast_scan_added">添加 %1$d 个文件</string>
-    
-    <string name="toast_scan_join">%1$s，%2$s</string>
 
     <string name="toast_file_unreadable">无法读取「%1$s」</string>
     <string name="toast_file_unreadable_last">无法读取「%1$s」，已是最后一项</string>
@@ -90,11 +88,14 @@
     <string name="update_download_failed">下载失败，请手动下载安装</string>
     <string name="update_unverified">无法验证更新包完整性，已取消安装，请手动下载</string>
     <string name="update_storage_unavailable">存储不可用，无法下载更新包</string>
-    <string name="update_download_started">开始下载，完成后自动弹出安装</string>
+    <string name="update_download_started">开始下载，完成后提示安装</string>
     <string name="update_download_in_progress">已在下载中</string>
     <string name="update_download_title">影音盒 v%1$s</string>
     <string name="update_download_description">正在下载更新包</string>
-    <string name="update_install_permission">请允许本应用安装未知应用，返回后将自动继续</string>
+    <string name="update_install_title">更新包已就绪</string>
+    <string name="update_install_prompt">新版本已下载完成，是否立即安装？</string>
+    <string name="update_install_now">安装</string>
+    <string name="update_install_permission">请允许本应用安装未知应用，返回后再次点击安装</string>
     <string name="update_installer_failed">无法启动安装器，请在下载通知中手动安装</string>
 
     <!-- 播放器控制栏无障碍描述 -->
