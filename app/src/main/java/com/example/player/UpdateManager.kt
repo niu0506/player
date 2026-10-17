@@ -230,6 +230,9 @@ class UpdateManager(private val activity: AppCompatActivity) {
     /** 因界面非前台而暂存的更新提示。 */
     private var pendingUpdate: UpdateChecker.Release? = null
 
+    /** 当前已展示的更新提示，避免重复创建导致旧弹窗被顶掉。 */
+    private var shownUpdateDialog: AlertDialog? = null
+
     /** 系统下载完成广播：只处理本次发起的下载 id。 */
     private val downloadCompleteReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -363,6 +366,21 @@ class UpdateManager(private val activity: AppCompatActivity) {
             pendingUpdate = release
             return
         }
+        // 检查是异步返回的，弹窗可能在当前输入事件 / 界面遍历尚未结束时就被创建，
+        // 从而刚显示即被系统移除（表现为「一闪即逝」）。延后到下一轮主线程消息再弹，
+        // 让当前批次的事件与布局先处理完；重建后重新校验界面状态。
+        activity.window.decorView.post { presentUpdateDialog(release) }
+    }
+
+    /** 在主线程下一轮消息中创建并弹出更新提示；重复调用不会叠加弹窗。 */
+    private fun presentUpdateDialog(release: UpdateChecker.Release) {
+        if (!canShowDialog()) {
+            pendingUpdate = release
+            return
+        }
+        // 已有弹窗在展示：不重复创建（否则旧弹窗会被后建的顶掉，视觉上像「闪一下」）
+        if (shownUpdateDialog?.isShowing == true) return
+
         val notes = release.notes.trim().ifEmpty { activity.getString(R.string.update_notes_fallback) }
         try {
             val dialog = AlertDialog.Builder(activity)
@@ -373,6 +391,10 @@ class UpdateManager(private val activity: AppCompatActivity) {
                 .create()
             // 不响应点外部取消，避免残留触摸立刻关掉刚弹出的提示
             dialog.setCanceledOnTouchOutside(false)
+            dialog.setOnDismissListener {
+                if (shownUpdateDialog === dialog) shownUpdateDialog = null
+            }
+            shownUpdateDialog = dialog
             dialog.show()
         } catch (e: Exception) {
             Log.w(TAG, "显示更新提示失败", e)
