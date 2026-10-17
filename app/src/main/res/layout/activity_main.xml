@@ -19,7 +19,8 @@
         android:layout_marginBottom="4dp"
         app:cardBackgroundColor="@color/bg_dark"
         app:cardCornerRadius="18dp"
-        app:cardElevation="0dp">
+        app:cardElevation="0dp"
+        app:strokeWidth="0dp">
 
         <!-- 使用应用自有的控制栏布局与图标，避免绑定 Media3 私有资源 -->
         <androidx.media3.ui.PlayerView
