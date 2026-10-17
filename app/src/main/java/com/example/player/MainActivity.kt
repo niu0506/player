@@ -105,7 +105,6 @@ class MainActivity : AppCompatActivity() {
     /** 删除单条：同步列表、播放队列与进度，然后刷新 UI、保存并提示。 */
     private fun removeItemFromPlaylist(index: Int) {
         if (index !in playlist.indices) return
-        controller?.let(::rebuildQueueIfNeeded)
         PlayerService.dropProgress(playlist[index].uri.toString())
         playlist.removeAt(index)
         controller?.removeMediaItem(index)

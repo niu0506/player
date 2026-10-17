@@ -450,6 +450,8 @@ object PlayerRepository {
     /** 保护内存状态（playlistState 等）读写的锁。 */
     private val stateLock = Any()
 
+    /** 数据库句柄：跨线程读写（主线程发起加载 / 后台串行落盘），需保证可见性。 */
+    @Volatile
     private var db: PlayerDatabase? = null
     private var loadJob: Deferred<Unit>? = null
     private val loadLock = Any()

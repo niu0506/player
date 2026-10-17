@@ -402,11 +402,40 @@ class UpdateManager(private val activity: AppCompatActivity) {
         "$APK_NAME_PREFIX$version$APK_NAME_SUFFIX"
 
     /**
+     * 入队前删除公共「下载」目录中的同名旧包，避免 DownloadManager 因目标文件已存在
+     * （ERROR_FILE_ALREADY_EXISTS）判定下载失败。删除失败（非本应用所有 / 无权限）时静默忽略，
+     * 与 [cleanupUpdateApks] 采用同一套 MediaStore 删除方式。
+     */
+    private fun deleteExistingDownloadFile(fileName: String) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            try {
+                activity.contentResolver.delete(
+                    MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                    "${MediaStore.MediaColumns.DISPLAY_NAME} = ?",
+                    arrayOf(fileName)
+                )
+            } catch (_: Exception) {
+            }
+        } else {
+            try {
+                @Suppress("DEPRECATION")
+                File(
+                    Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+                    fileName
+                ).delete()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    /**
      * 经 DownloadManager 入队一次下载到公共「下载」目录。
      * 使用 `setDestinationInExternalPublicDir`（内部为 `file://`），
      * 不可传 `content://` 目标（会抛 IllegalArgumentException）——这正是 v1.4.8 的闪退根因。
      */
     private fun enqueueDownload(url: String) {
+        val fileName = apkFileName(pendingDownloadVersion)
+        deleteExistingDownloadFile(fileName)
         val request = DownloadManager.Request(url.toUri())
             .setTitle(activity.getString(R.string.update_download_title, pendingDownloadVersion))
             .setDescription(activity.getString(R.string.update_download_description))
@@ -414,7 +443,7 @@ class UpdateManager(private val activity: AppCompatActivity) {
             .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
             .setDestinationInExternalPublicDir(
                 Environment.DIRECTORY_DOWNLOADS,
-                apkFileName(pendingDownloadVersion)
+                fileName
             )
         lastDownloadId = downloadManager.enqueue(request)
         persistDownload()
