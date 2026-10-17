@@ -1,5 +1,6 @@
 <resources>
-    
+    <!-- 注意：本文件集中管理全部用户可见文案（含控制栏与手势浮层），代码中一律经资源引用 -->
+
     <string name="app_name">影音盒</string>
 
     <string name="scan_local">扫描</string>
@@ -10,6 +11,7 @@
     
     <string name="check_update">检查更新</string>
 
+    <!-- 播放列表 -->
     <string name="list_item_index">%1$d</string>
     
     <string name="list_count">%1$d 个</string>
@@ -30,6 +32,7 @@
     
     <string name="delete_dialog_message">确定从播放列表中删除「%1$s」吗？\n该文件的播放进度也会被清除。</string>
 
+    <!-- 提示信息 -->
     <string name="toast_deleted">已删除</string>
     <string name="toast_permission_granted">权限已授予，请点击扫描</string>
     <string name="toast_scan_failed">扫描失败，请稍后重试</string>
@@ -50,6 +53,7 @@
     <string name="toast_repository_write_failed">本地数据保存失败，请稍后重试</string>
     <string name="toast_playback_interrupted">已被其他应用暂时打断，稍后自动续播</string>
 
+    <!-- 音轨 / 字幕 / 倍速 -->
     <string name="track_audio">音轨</string>
     
     <string name="track_subtitle">字幕</string>
@@ -62,6 +66,7 @@
     <string name="speed_default_label">1x</string>
     <string name="cancel">取消</string>
 
+    <!-- 手势反馈 -->
     <string name="gesture_seek_back">快退 15 秒</string>
     <string name="gesture_seek_forward">快进 15 秒</string>
     
@@ -71,10 +76,12 @@
     <string name="gesture_brightness">亮度 %1$d%%</string>
     <string name="gesture_volume">音量 %1$d%%</string>
 
+    <!-- 画中画 -->
     <string name="toast_pip_unsupported">系统不支持小窗播放</string>
     <string name="toast_pip_no_video">当前没有正在播放的视频</string>
     <string name="toast_pip_failed">无法进入小窗模式</string>
 
+    <!-- 应用内更新 -->
     <string name="update_check_failed">检查更新失败，请稍后重试</string>
     <string name="update_up_to_date">已是最新版本 v%1$s</string>
     <string name="update_dialog_title">发现新版本 v%1$s</string>
@@ -90,6 +97,7 @@
     <string name="update_install_permission">请允许本应用安装未知应用，返回后将自动继续</string>
     <string name="update_installer_failed">无法启动安装器，请在下载通知中手动安装</string>
 
+    <!-- 播放器控制栏无障碍描述 -->
     <string name="player_control_action">播放器操作</string>
     <string name="player_control_shuffle">随机播放</string>
     <string name="player_control_repeat">循环模式</string>

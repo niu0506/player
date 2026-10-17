@@ -10,12 +10,14 @@
     android:paddingVertical="12dp"
     android:background="@drawable/bg_item_ripple">
 
+    <!-- 条目首行：序号 / 播放指示、名称、时长、删除 -->
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:orientation="horizontal"
         android:gravity="center_vertical">
 
+        <!-- 同一位置叠放「序号」与「正在播放」图标，播放时显示图标隐藏序号 -->
         <FrameLayout
             android:layout_width="24dp"
             android:layout_height="24dp">
@@ -69,6 +71,7 @@
             android:contentDescription="@string/delete" />
     </LinearLayout>
 
+    <!-- 进度行：进度条 + 进度文案（有进度时才显示） -->
     <LinearLayout
         android:id="@+id/progress_row"
         android:layout_width="match_parent"

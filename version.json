@@ -1,5 +1,5 @@
 {
-  "version": "1.5.5",
-  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.5.5/player-v1.5.5-release.apk",
-  "notes": "修复并发重试加载成功后内存播放列表被误清空的竞态问题。修复服务未运行时删除播放进度不生效的问题。数据库迁移脚本改为可测试定义，媒体库变化监听改用非废弃接口。"
+  "version": "1.5.6",
+  "apkUrl": "https://github.com/niu0506/player/releases/download/v1.5.6/player-v1.5.6-release.apk",
+  "notes": "播放进度落盘周期由 2 秒调整为 5 秒，减少空闲 IO。播放错误处理收敛到服务端统一上报、界面端集中处理，去除双端重复逻辑。播放列表保存改为 2 秒防抖，进度刷新改为增量更新避免重建整项。全屏旋转改用 requestedOrientation 控制，修复亮度手势不落盘与手势区域除零，更新下载仅保留 GitHub 直连并增加完成校验防重入。全量补充代码中文注释。"
 }

@@ -1,4 +1,5 @@
 <resources>
+    <!-- 应用主题：基于 Material3 深色无标题栏 -->
     <style name="Theme.Player" parent="Theme.Material3.Dark.NoActionBar">
         <item name="colorPrimary">@color/accent</item>
         <item name="colorOnPrimary">#FF17102A</item>

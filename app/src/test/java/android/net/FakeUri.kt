@@ -1,11 +1,11 @@
+/**
+ * 单元测试用的 Uri 替身：仅实现比较与 toString，避免测试依赖 Android 运行时。
+ * 放在 android.net 包下以便替换真实 [android.net.Uri]。
+ */
 package android.net
 
 import android.os.Parcel
 
-/**
- * 单元测试用的极简 [Uri] 实现：仅实现测试所需的 toString/equals/hashCode，
- * 其余方法返回默认值或抛异常，从而避免依赖 Android 运行时。
- */
 class FakeUri(private val s: String) : Uri() {
     override fun toString(): String = s
     override fun equals(other: Any?): Boolean = other is FakeUri && other.s == s

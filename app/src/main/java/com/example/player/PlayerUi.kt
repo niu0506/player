@@ -1,3 +1,9 @@
+/**
+ * 界面组件集合（与业务无关的纯 UI 逻辑）：
+ * - [FullscreenPipHelper]：全屏 / 画中画切换与系统栏、视频表面样式管理；
+ * - [GestureController]：播放器手势（单击显隐控制栏、双击快退快进、横滑快进快退、上下滑调亮度 / 音量）；
+ * - [MediaListAdapter]：播放列表 RecyclerView 适配器（DiffUtil 后台差分刷新）。
+ */
 package com.example.player
 
 import android.annotation.SuppressLint
@@ -47,10 +53,9 @@ import kotlin.math.max
 import androidx.core.content.edit
 
 /**
- * 全屏与画中画（PiP）辅助类。
+ * 全屏与画中画（PiP）辅助类：统一管理视频表面样式、系统栏显隐与方向。
  *
- * 统一管理界面在“普通 / 全屏 / 画中画”三种状态下的视觉表现：
- * 控制工具栏与列表显隐、系统栏显隐、屏幕方向、播放画面缩放模式与圆角等。
+ * @param controllerProvider 惰性获取当前 MediaController（可能为 null）
  */
 @OptIn(UnstableApi::class)
 class FullscreenPipHelper(
@@ -58,46 +63,49 @@ class FullscreenPipHelper(
     private val binding: ActivityMainBinding,
     private val controllerProvider: () -> MediaController?
 ) {
-    /** 是否处于全屏模式。 */
     var isFullscreen = false
         private set
 
-    /** 是否处于画中画模式。 */
     var isInPipMode = false
         private set
 
-    /** 画中画模式切换回调：更新视觉状态。 */
+    /** 系统 PiP 模式切换回调：退出 PiP 且非全屏时恢复系统栏。 */
     fun onPipModeChanged(isInPictureInPictureMode: Boolean) {
         isInPipMode = isInPictureInPictureMode
+        if (!isInPictureInPictureMode && !isFullscreen) {
+            showSystemBars()
+        }
         applyVisualState()
     }
 
-    /** 控制工具栏与播放列表容器的显隐。 */
+    /** 控制标题栏与播放列表容器的显隐。 */
     private fun setChromeVisible(visible: Boolean) {
         val visibility = if (visible) View.VISIBLE else View.GONE
         binding.toolbarLayout.visibility = visibility
         binding.playlistContainer.visibility = visibility
     }
 
-    /** 根据当前模式统一应用界面样式。 */
+    /** 根据当前（普通 / 全屏 / PiP）状态统一套用界面样式。 */
     private fun applyVisualState() {
         setChromeVisible(!isInPipMode && !isFullscreen)
         binding.playerView.useController = !isInPipMode
         when {
+            // PiP：按真实比例缩放铺满小窗
             isInPipMode -> applyEdgeToEdgeSurface(AspectRatioFrameLayout.RESIZE_MODE_ZOOM)
+            // 全屏：等比放大铺满，无黑边
             isFullscreen -> applyEdgeToEdgeSurface(AspectRatioFrameLayout.RESIZE_MODE_FIT)
             else -> applyNormalVideoSurfaceStyle()
         }
     }
 
-    /** 进入画中画前的过渡状态：隐藏控件、铺满屏幕（避免切换闪烁）。 */
+    /** 进入 PiP 前的过渡状态：隐藏界面元素、关闭控制栏。 */
     private fun applyPipPreparingState() {
         setChromeVisible(false)
         binding.playerView.useController = false
         applyEdgeToEdgeSurface(AspectRatioFrameLayout.RESIZE_MODE_ZOOM)
     }
 
-    /** 让播放画面边到边铺满：无圆角、无外边距。 */
+    /** 边到边视频表面：去除卡片圆角与边距。 */
     private fun applyEdgeToEdgeSurface(resizeMode: Int) {
         binding.playerView.setResizeMode(resizeMode)
         binding.playerCard.radius = 0f
@@ -106,7 +114,7 @@ class FullscreenPipHelper(
         binding.playerCard.layoutParams = lp
     }
 
-    /** 普通模式下的播放画面样式：固定比例、带外边距与圆角。 */
+    /** 普通内嵌样式：恢复卡片圆角与内边距。 */
     private fun applyNormalVideoSurfaceStyle() {
         binding.playerView.setResizeMode(AspectRatioFrameLayout.RESIZE_MODE_FIT)
         val lp = binding.playerCard.layoutParams as ViewGroup.MarginLayoutParams
@@ -116,7 +124,7 @@ class FullscreenPipHelper(
         binding.playerCard.layoutParams = lp
     }
 
-    /** 切换全屏：进入时锁定横屏并隐藏系统栏，退出时恢复方向与系统栏。 */
+    /** 切换全屏（横屏 + 隐藏系统栏）。 */
     fun setFullscreen(enabled: Boolean) {
         isFullscreen = enabled
         if (enabled) {
@@ -129,7 +137,6 @@ class FullscreenPipHelper(
         applyVisualState()
     }
 
-    /** 隐藏系统栏（沉浸式，滑动可临时唤出）。 */
     private fun hideSystemBars() {
         WindowCompat.setDecorFitsSystemWindows(activity.window, false)
         val insetsController = WindowInsetsControllerCompat(activity.window, binding.root)
@@ -138,29 +145,29 @@ class FullscreenPipHelper(
             WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
     }
 
-    /** 显示系统栏。 */
     private fun showSystemBars() {
         WindowCompat.setDecorFitsSystemWindows(activity.window, true)
         WindowInsetsControllerCompat(activity.window, binding.root)
             .show(WindowInsetsCompat.Type.systemBars())
     }
 
-    /** 正在播放视频时自动进入画中画（用于 onUserLeaveHint）。 */
+    /** 仅在正在播放视频时自动进入 PiP（Home 键触发），失败不提示。 */
     fun enterPipWhenPlayingVideo(): Boolean {
         val ctrl = controllerProvider() ?: return false
         return !(!ctrl.isPlaying || !hasVideo(ctrl.videoSize)) && enterPipMode(showError = false)
     }
 
-    /** 进入画中画模式，返回是否成功。 */
+    /**
+     * 尝试进入 PiP 模式，按视频真实宽高比设置小窗比例。
+     * @param showError 失败时是否 Toast 提示
+     */
     fun enterPipMode(showError: Boolean = true): Boolean {
-        // Android 8.0 以下不支持画中画
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
             if (showError) {
                 Toast.makeText(activity, R.string.toast_pip_unsupported, Toast.LENGTH_SHORT).show()
             }
             return false
         }
-        // 无视频画面时不进入画中画
         val vs = controllerProvider()?.videoSize
         if (vs == null || !hasVideo(vs)) {
             if (showError) {
@@ -168,13 +175,14 @@ class FullscreenPipHelper(
             }
             return false
         }
-        if (isFullscreen) {
-            setFullscreen(false)
+        val wasFullscreen = isFullscreen
+        if (wasFullscreen) {
+            isFullscreen = false
+            activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
         }
         applyPipPreparingState()
         try {
 
-            // 画中画窗口比例：按视频宽高比，异常时回退为 16:9
             val ratio = try {
                 Rational(vs.width, vs.height)
             } catch (_: Exception) {
@@ -183,7 +191,11 @@ class FullscreenPipHelper(
             if (activity.enterPictureInPictureMode(buildPipParams(ratio))) return true
         } catch (_: Exception) {
         }
-        // 进入失败：恢复原视觉状态并提示
+        // 进入失败：回滚全屏状态与界面样式
+        if (wasFullscreen) {
+            isFullscreen = true
+            activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        }
         applyVisualState()
         if (showError) {
             Toast.makeText(activity, R.string.toast_pip_failed, Toast.LENGTH_SHORT).show()
@@ -191,11 +203,10 @@ class FullscreenPipHelper(
         return false
     }
 
-    /** 视频尺寸是否有效（宽高均大于 0）。 */
     private fun hasVideo(videoSize: VideoSize): Boolean =
         videoSize.width > 0 && videoSize.height > 0
 
-    /** 构建画中画参数（比例，Android 12+ 开启无缝缩放）。 */
+    /** 构造 PiP 参数；API 31+ 开启无缝缩放。 */
     @RequiresApi(Build.VERSION_CODES.O)
     private fun buildPipParams(ratio: Rational): PictureInPictureParams {
         val builder = PictureInPictureParams.Builder().setAspectRatio(ratio)
@@ -205,7 +216,7 @@ class FullscreenPipHelper(
         return builder.build()
     }
 
-    /** 画中画模式下根据视频尺寸更新窗口比例。 */
+    /** 视频尺寸变化时更新 PiP 小窗比例（仅 PiP 中生效）。 */
     @RequiresApi(Build.VERSION_CODES.O)
     fun updatePipAspectRatio(videoSize: VideoSize) {
         if (videoSize.width <= 0 || videoSize.height <= 0) return
@@ -221,7 +232,7 @@ class FullscreenPipHelper(
         }
     }
 
-    /** 界面停止时：若在画中画中则暂停播放并退出画中画标记。 */
+    /** Activity onStop：若仍在 PiP 则暂停并退出 PiP 标记。 */
     fun onStopped() {
         if (isInPipMode) {
             controllerProvider()?.pause()
@@ -231,10 +242,16 @@ class FullscreenPipHelper(
 }
 
 /**
- * 手势控制器。
+ * 播放器手势控制。
  *
- * 支持：单击切换控件显隐、双击左右两侧快退/快进、左右滑动拖动进度、
- * 左侧上下滑动调节亮度、右侧上下滑动调节音量，并显示短暂的手势提示浮层。
+ * 手势：
+ * - 单击 → 显隐控制栏；
+ * - 双击左半屏 → 快退 15s；双击右半屏 → 快进 15s；
+ * - 横向滑动（滑动结束时才 seek）→ 快进/快退，浮层实时预览目标进度；
+ * - 左半屏上下滑动 → 亮度；右半屏上下滑动 → 音量。
+ *
+ * @param overlay 手势反馈浮层
+ * @param controllerProvider 惰性获取当前 MediaController
  */
 @OptIn(UnstableApi::class)
 class GestureController(
@@ -248,19 +265,21 @@ class GestureController(
         const val GESTURE_SEEK = 1
         const val GESTURE_BRIGHTNESS = 2
         const val GESTURE_VOLUME = 3
+
+        /** 时长未知等无法处理的滑动：本轮手势忽略。 */
+        const val GESTURE_IGNORED = 4
         const val BRIGHTNESS_PREFS = "gesture_settings"
         const val KEY_BRIGHTNESS = "manual_brightness"
     }
 
     private val handler = Handler(Looper.getMainLooper())
 
-    /** 亮度偏好存储，用于记住用户手动设置的亮度。 */
+    /** 记忆用户手动设置的亮度（退出重进后沿用）。 */
     private val brightnessPrefs by lazy {
         activity.getSharedPreferences(BRIGHTNESS_PREFS, Context.MODE_PRIVATE)
     }
     private val hideOverlayRunnable = Runnable { overlay.visibility = View.GONE }
 
-    /** 当前手势模式（无/进度/亮度/音量）。 */
     private var gestureMode = GESTURE_NONE
     private var seekStartPosition = 0L
     private var seekTargetPosition = 0L
@@ -270,10 +289,10 @@ class GestureController(
         activity.getSystemService(Context.AUDIO_SERVICE) as AudioManager
     }
 
-    /** 初始化手势监听：应用已保存的亮度，并安装触摸/手势检测。 */
+    /** 安装手势检测器与触摸监听。 */
     @SuppressLint("ClickableViewAccessibility")
     fun setup() {
-        // 恢复上次手动设置的亮度
+        // 恢复上次的亮度设置
         if (brightnessPrefs.contains(KEY_BRIGHTNESS)) {
             applyBrightness(brightnessPrefs.getFloat(KEY_BRIGHTNESS, 0.5f), persist = false)
         }
@@ -281,7 +300,7 @@ class GestureController(
 
             override fun onDown(e: MotionEvent): Boolean = true
 
-            /** 单击：切换播放控件的显示/隐藏。 */
+            // 单击：显隐控制栏
             override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
                 if (playerView.isControllerFullyVisible) {
                     playerView.hideController()
@@ -291,7 +310,7 @@ class GestureController(
                 return true
             }
 
-            /** 双击：左半屏快退、右半屏快进。 */
+            // 双击：左快退 / 右快进 15s
             override fun onDoubleTap(e: MotionEvent): Boolean {
                 val ctrl = controllerProvider() ?: return true
                 if (e.x < playerView.width / 2f) {
@@ -308,29 +327,25 @@ class GestureController(
                 return true
             }
 
-            /** 滑动：首次滑动时判定方向与区域（进度/亮度/音量），随后持续调整。 */
             override fun onScroll(
                 e1: MotionEvent?, e2: MotionEvent, dX: Float, dY: Float
             ): Boolean {
                 val start = e1 ?: return false
                 val ctrl = controllerProvider() ?: return false
 
-                // 手势开始：根据水平/垂直位移及起手位置确定模式
+                // 首次滑动：按主轴方向与起点位置判定本次手势类型
                 if (gestureMode == GESTURE_NONE) {
                     if (playerView.isControllerFullyVisible) {
                         playerView.hideController()
                     }
                     gestureMode = if (abs(e2.x - start.x) > abs(e2.y - start.y)) {
-                        // 横向为主 -> 拖动进度
                         seekStartPosition = ctrl.currentPosition
                         seekTargetPosition = seekStartPosition
                         GESTURE_SEEK
                     } else if (start.x < playerView.width / 2f) {
-                        // 左半屏纵向 -> 亮度
                         brightnessStart = currentBrightness()
                         GESTURE_BRIGHTNESS
                     } else {
-                        // 右半屏纵向 -> 音量
                         volumeStart = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
                         GESTURE_VOLUME
                     }
@@ -339,10 +354,10 @@ class GestureController(
                     GESTURE_SEEK -> {
                         val duration = ctrl.duration
                         if (duration == C.TIME_UNSET || duration <= 0) {
-                            gestureMode = GESTURE_NONE
-                            return false
+                            gestureMode = GESTURE_IGNORED
+                            return true
                         }
-                        // 每像素对应的毫秒数，限制最小灵敏度
+                        // 每秒对应的像素：让整屏滑动约等于 1.2 倍时长
                         val msPerPx = max(300f, duration / playerView.width * 1.2f)
                         val target = (seekStartPosition + (e2.x - start.x) * msPerPx)
                             .toLong().coerceIn(0L, duration)
@@ -361,9 +376,8 @@ class GestureController(
                         )
                     }
                     GESTURE_BRIGHTNESS -> {
-                        // 向上滑增大亮度
-                        val delta = (start.y - e2.y) / playerView.height
-                        applyBrightness(brightnessStart + delta)
+                        val delta = (start.y - e2.y) / playerView.height.coerceAtLeast(1)
+                        applyBrightness(brightnessStart + delta, persist = false)
                         showGestureOverlay(
                             activity.getString(
                                 R.string.gesture_brightness, (currentBrightness() * 100).toInt()
@@ -374,7 +388,7 @@ class GestureController(
                         val maxVolume =
                             audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
                         val delta =
-                            ((start.y - e2.y) / playerView.height * maxVolume).toInt()
+                            ((start.y - e2.y) / playerView.height.coerceAtLeast(1) * maxVolume).toInt()
                         val target = (volumeStart + delta).coerceIn(0, maxVolume)
                         audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, target, 0)
                         val pct = if (maxVolume > 0) target * 100 / maxVolume else 0
@@ -388,7 +402,7 @@ class GestureController(
         playerView.setOnTouchListener { _, event ->
             detector.onTouchEvent(event)
 
-            // 手指抬起/取消时结束手势（拖动进度在此刻才真正 seek）
+            // 抬手 / 取消时结束手势（seek 与亮度持久化在此提交）
             if (event.actionMasked == MotionEvent.ACTION_UP
                 || event.actionMasked == MotionEvent.ACTION_CANCEL
             ) {
@@ -398,26 +412,27 @@ class GestureController(
         }
     }
 
-    /** 取消待执行的浮层隐藏任务。 */
+    /** 取消浮层的延迟隐藏（onStop 调用，避免残留回调）。 */
     fun cancelPendingHide() {
         handler.removeCallbacks(hideOverlayRunnable)
     }
 
-    /** 结束手势：若为进度手势则执行 seek。 */
+    /** 手势结束：seek 落到目标位置，亮度才持久化。 */
     private fun endGesture() {
-        if (gestureMode == GESTURE_SEEK) {
-            controllerProvider()?.seekTo(seekTargetPosition)
+        when (gestureMode) {
+            GESTURE_SEEK -> controllerProvider()?.seekTo(seekTargetPosition)
+            GESTURE_BRIGHTNESS -> applyBrightness(currentBrightness(), persist = true)
         }
         gestureMode = GESTURE_NONE
     }
 
-    /** 获取当前窗口亮度（系统未设置时为 0.5）。 */
+    /** 当前亮度；系统未手动设置过（<0）时按 0.5 处理。 */
     private fun currentBrightness(): Float {
         val b = activity.window.attributes.screenBrightness
         return if (b < 0f) 0.5f else b
     }
 
-    /** 应用窗口亮度（限制在 0.02~1.0），可选持久化。 */
+    /** 应用屏幕亮度（限制在 2%~100%），可选持久化。 */
     private fun applyBrightness(value: Float, persist: Boolean = true) {
         val lp = activity.window.attributes
         lp.screenBrightness = value.coerceIn(0.02f, 1f)
@@ -425,7 +440,7 @@ class GestureController(
         if (persist) brightnessPrefs.edit {putFloat(KEY_BRIGHTNESS, lp.screenBrightness) }
     }
 
-    /** 显示手势提示浮层，800ms 后自动隐藏。 */
+    /** 显示手势反馈浮层，800ms 后自动隐藏。 */
     private fun showGestureOverlay(text: String) {
         handler.removeCallbacks(hideOverlayRunnable)
         overlay.text = text
@@ -435,8 +450,14 @@ class GestureController(
 }
 
 /**
- * 播放列表适配器：展示媒体名称、时长、播放进度，并标记当前正在播放项。
- * 列表差异计算放到后台线程执行，避免大数据量时的卡顿。
+ * 播放列表适配器。
+ *
+ * 使用 DiffUtil 在后台线程计算差量，避免主线程卡顿；
+ * 对「仅进度变化」「仅时长变化」通过 payload 做局部刷新。
+ *
+ * @param onClick 点击条目回调（传入 uri）
+ * @param onDelete 点击删除回调（传入 uri）
+ * @param getProgress 读取某 uri 当前进度的回调
  */
 class MediaListAdapter(
     private val onClick: (String) -> Unit,
@@ -444,17 +465,20 @@ class MediaListAdapter(
     private val getProgress: (String) -> Long = { 0L }
 ) : RecyclerView.Adapter<MediaListAdapter.VH>() {
 
+    /** 局部刷新 payload：仅更新进度，不重绑整个条目。 */
     private val progressPayload = Any()
+
+    /** 局部刷新 payload：仅更新时长。 */
+    private val durationPayload = Any()
 
     private val items = mutableListOf<MediaItemData>()
 
-    /** 当前正在播放的 uri。 */
     private var currentPlayingUri: String? = null
     private var isPlaying = false
     private var diffScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
     private var diffJob: Job? = null
 
-    /** 提交新列表：在后台计算差异后回到主线程分发更新。 */
+    /** 提交新列表：取消上一次差分任务，后台计算后回主线程分发更新。 */
     fun submitList(list: List<MediaItemData>) {
         if (items == list) return
         val oldItems = ArrayList(items)
@@ -470,7 +494,7 @@ class MediaListAdapter(
                     oldItems[oldItemPosition] == list[newItemPosition]
             })
             withContext(Dispatchers.Main) {
-                // 若期间有新任务提交，则放弃本次结果
+                // 差分期间若又提交了新列表，放弃本次结果
                 if (myJob?.isActive != true) return@withContext
                 items.clear()
                 items.addAll(list)
@@ -479,32 +503,37 @@ class MediaListAdapter(
         }
     }
 
-    /** 查找某个 uri 在列表中的位置，找不到返回 -1。 */
     private fun indexOfUri(uri: String?): Int =
         if (uri == null) -1 else items.indexOfFirst { it.uri.toString() == uri }
 
-    /** 更新当前播放项与播放状态，并刷新受影响的行。 */
+    /** 设置当前播放项 / 播放状态，并只刷新受影响的条目。 */
     fun setCurrentPlaying(uri: String?, playing: Boolean = false) {
         val old = currentPlayingUri
+        val oldPlaying = isPlaying
+        if (old == uri && oldPlaying == playing) return
         currentPlayingUri = uri
         isPlaying = playing
-        if (old == uri) {
-            val idx = indexOfUri(uri)
-            if (idx >= 0) notifyItemChanged(idx)
-            return
+        val affected = mutableListOf<Int>()
+        if (old != uri) {
+            indexOfUri(old).takeIf { it >= 0 }?.let(affected::add)
         }
-        val oldIdx = indexOfUri(old)
-        if (oldIdx >= 0) notifyItemChanged(oldIdx)
-        val newIdx = indexOfUri(uri)
-        if (newIdx >= 0) notifyItemChanged(newIdx)
+        indexOfUri(uri).takeIf { it >= 0 }?.let(affected::add)
+        for (index in affected) notifyItemChanged(index)
     }
 
-    /** 刷新指定行的进度显示。 */
+    /** 更新某条目的时长（局部刷新）。 */
+    fun updateItem(index: Int, item: MediaItemData) {
+        if (index !in items.indices) return
+        items[index] = item
+        notifyItemChanged(index, durationPayload)
+    }
+
+    /** 刷新单条进度显示。 */
     fun refreshProgress(index: Int) {
         if (index in items.indices) notifyItemChanged(index, progressPayload)
     }
 
-    /** 刷新全部行的进度显示。 */
+    /** 刷新全部条目的进度显示。 */
     fun refreshAllProgress() {
         if (itemCount > 0) notifyItemRangeChanged(0, itemCount, progressPayload)
     }
@@ -523,8 +552,8 @@ class MediaListAdapter(
             context.getString(R.string.list_item_index, position + 1)
         holder.binding.tvName.text = item.name
         holder.binding.tvDuration.text = if (item.duration > 0) formatTime(item.duration) else ""
-        // 当前正在播放项高亮显示（名称变色 + 显示播放图标）
         val isActive = item.uri.toString() == currentPlayingUri && isPlaying
+        // 播放中隐藏序号、显示均衡器图标并高亮名称
         holder.binding.imgPlaying.visibility = if (isActive) View.VISIBLE else View.GONE
         holder.binding.tvIndex.visibility = if (isActive) View.GONE else View.VISIBLE
         holder.binding.tvName.setTextColor(
@@ -534,19 +563,26 @@ class MediaListAdapter(
         bindProgress(holder, item)
     }
 
+    /** 带 payload 的绑定：仅处理进度 / 时长局部刷新，其余走默认重绑。 */
     override fun onBindViewHolder(holder: VH, position: Int, payloads: MutableList<Any>) {
-        if (payloads.isNotEmpty() && payloads.all { it === progressPayload }) {
-            bindProgress(holder, items[position])
-        } else {
-            super.onBindViewHolder(holder, position, payloads)
+        when {
+            payloads.isNotEmpty() && payloads.all { it === progressPayload } ->
+                bindProgress(holder, items[position])
+            payloads.isNotEmpty() && payloads.all { it === durationPayload } ->
+                bindDuration(holder, items[position])
+            else -> super.onBindViewHolder(holder, position, payloads)
         }
     }
 
-    /** 仅更新进度相关视图，供 progress payload 使用。 */
+    private fun bindDuration(holder: VH, item: MediaItemData) {
+        holder.binding.tvDuration.text =
+            if (item.duration > 0) formatTime(item.duration) else ""
+    }
+
+    /** 绑定进度条与进度文案：播放中显示「播放中 x」，否则显示「x / 总时长」。 */
     private fun bindProgress(holder: VH, item: MediaItemData) {
         val context = holder.itemView.context
         val isActive = item.uri.toString() == currentPlayingUri && isPlaying
-        // 展示观看进度条与进度文本
         val progress = getProgress(item.uri.toString())
         if (progress > 0 && item.duration > 0) {
             val percent = (progress * 100 / item.duration).toInt().coerceIn(0, 100)
@@ -554,12 +590,10 @@ class MediaListAdapter(
             holder.binding.pbItem.progress = percent
             holder.binding.tvProgress.visibility = View.VISIBLE
             if (isActive) {
-                // 正在播放：只展示当前进度
                 holder.binding.tvProgress.text = context.getString(
                     R.string.playing_progress, formatTime(progress)
                 )
             } else {
-                // 未播放：展示“进度 / 总时长”
                 holder.binding.tvProgress.text = context.getString(
                     R.string.progress_range,
                     formatTime(progress), formatTime(item.duration)
@@ -574,7 +608,7 @@ class MediaListAdapter(
 
     override fun onAttachedToRecyclerView(recyclerView: RecyclerView) {
         super.onAttachedToRecyclerView(recyclerView)
-        // 曾被 detach 取消过的作用域在此重建，保证后续 submitList 的差异计算仍能执行
+        // 重新挂载时重建差分作用域（之前可能已被取消）
         if (!diffScope.isActive) {
             diffScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
         }
@@ -582,19 +616,16 @@ class MediaListAdapter(
 
     override fun onDetachedFromRecyclerView(recyclerView: RecyclerView) {
         super.onDetachedFromRecyclerView(recyclerView)
-        // 解绑时取消差异计算协程，避免泄漏
         diffScope.cancel()
     }
 
     inner class VH(val binding: ItemMediaBinding) : RecyclerView.ViewHolder(binding.root) {
 
-        /** 安全获取某位置对应的 uri（处理 NO_POSITION 越界）。 */
         private fun uriAt(position: Int): String? =
             if (position == RecyclerView.NO_POSITION) null
             else items.getOrNull(position)?.uri?.toString()
 
         init {
-            // 点击条目：播放；点击删除按钮：删除
             binding.itemRoot.setOnClickListener { uriAt(bindingAdapterPosition)?.let(onClick) }
             binding.btnDelete.setOnClickListener { uriAt(bindingAdapterPosition)?.let(onDelete) }
         }

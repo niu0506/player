@@ -1,3 +1,15 @@
+/**
+ * 数据与存储层。
+ *
+ * 主要职责：
+ * 1. 定义播放列表条目模型 [MediaItemData]，并提供 URI 归一化、文件夹分组键提取与自然排序；
+ * 2. 通过 [MediaStoreScanner] 扫描系统媒体库（视频 / 音频）；
+ * 3. 通过 Room（[PlayerDatabase]）持久化播放列表、播放进度与 KV 配置，作为全应用唯一的写入口；
+ * 4. 提供播放进度写入裁决（末尾容差）与「合并写」语义。
+ *
+ * 设计要点：内存状态始终为权威读取源（[PlayerRepository.getPlaylist] 等），
+ * 数据库写入经 [PlayerRepository.dispatchWrite] 串行化，失败会按冷却时间重试并对外广播。
+ */
 package com.example.player
 
 import android.content.Context
@@ -46,22 +58,24 @@ import org.json.JSONObject
 import java.util.Locale
 import kotlin.time.Duration.Companion.milliseconds
 
-/** 一条媒体条目（视频或音频）的运行时数据。 */
+/**
+ * 播放列表中的一个媒体条目。
+ *
+ * @property uri 媒体内容 URI（MediaStore 的 content:// 地址）
+ * @property name 展示名称（通常为文件名）
+ * @property duration 时长（毫秒），未知时为 0
+ * @property folderKey 文件夹分组键，空串表示「未分组」（排序时置于列表末尾）
+ */
 data class MediaItemData(
     val uri: Uri,
     val name: String,
-    /** 时长(毫秒)，未知时为 0。 */
     val duration: Long = 0L,
-    /**
-     * 所属文件夹分组键（相对外部存储的目录，如 `Movies/剧A`）；无法识别时为 ""。
-     * 用于把同一部剧的分集排在一起，保证连播不跨剧。
-     */
     val folderKey: String = "",
 )
 
 /**
- * 归一化 uri 作为去重键：去掉查询参数并裁掉结尾斜杠，再拼上末段路径。
- * 该键仅在内存中用于比较（不落盘），因此实现调整不影响已保存的数据。
+ * 将 URI 归一化为稳定的键：去掉 query 参数与结尾斜杠，再拼接最后一段路径。
+ * 用于跨扫描 / 存储对比同一个文件（避免 query 变化或末尾斜杠差异导致误判为新文件）。
  */
 fun normalizeUri(uri: Uri): String {
     val base = uri.toString().substringBefore('?').trimEnd('/')
@@ -69,17 +83,13 @@ fun normalizeUri(uri: Uri): String {
     return "$base|$lastSeg"
 }
 
-/**
- * 把 MediaStore 的 `RELATIVE_PATH`（如 `Movies/剧A/`）归一化为分组键。
- * 去掉首尾空白与结尾斜杠；值为空时返回 ""（视为无法分组）。
- */
+/** API 29+ 使用 MediaStore 的 RELATIVE_PATH 作为分组键：去除首尾空白与斜杠。 */
 internal fun folderKeyFromRelativePath(relativePath: String?): String =
     relativePath?.trim()?.trim('/')?.trim().orEmpty()
 
 /**
- * 低版本（API < 29）没有 `RELATIVE_PATH`，用文件绝对路径的父目录作为分组键，
- * 并剥掉主外部存储根前缀，使其与 [folderKeyFromRelativePath] 的结果形态一致。
- * 文件直接位于存储根目录时返回 ""；非主存储卷（如 SD 卡）保留绝对父目录。
+ * API 29 以下没有 RELATIVE_PATH，改用绝对路径取父目录。
+ * 若父目录位于主存储根之下，则返回相对根目录的路径；否则保留绝对父目录。
  */
 internal fun folderKeyFromAbsolutePath(absolutePath: String?, storageRoot: String?): String {
     val path = absolutePath?.trim().orEmpty()
@@ -93,17 +103,10 @@ internal fun folderKeyFromAbsolutePath(absolutePath: String?, storageRoot: Strin
     return parent.trimEnd('/')
 }
 
-/** 取分组键的末段作为展示用文件夹名（如 `Movies/剧A` -> `剧A`）；空键返回 ""。 */
-internal fun folderDisplayName(folderKey: String): String = folderKey.substringAfterLast('/')
-
-/** 数字段超过该位数时改用长度 + 字典序比较，避免转 Long 溢出。 */
+/** 超过此位数的数字段改用「长度 + 字典序」比较，避免 Long 溢出。 */
 private const val NATURAL_MAX_DIGITS = 18
 
-/**
- * 比较两个数字段（仅由数字字符组成）：
- * 忽略前导 0 按数值比较；数值相同则位数少者在前；超长数字段按长度再按字典序。
- * 仅当两段完全相等时返回 0。
- */
+/** 比较两段纯数字：先按数值大小，数值相同时用长度和字典序保证确定性（处理前导零）。 */
 private fun compareDigitSegments(a: String, b: String): Int {
     val x = a.trimStart('0').ifEmpty { "0" }
     val y = b.trimStart('0').ifEmpty { "0" }
@@ -114,15 +117,11 @@ private fun compareDigitSegments(a: String, b: String): Int {
     val vx = x.toLong()
     val vy = y.toLong()
     if (vx != vy) return if (vx < vy) -1 else 1
-    // 数值相同（如 "2" 与 "02"）：按位数打破平局，保证结果不依赖输入顺序
     val byLength = x.length.compareTo(y.length)
     return if (byLength != 0) byLength else x.compareTo(y)
 }
 
-/**
- * 比较两个非数字段：先忽略大小写比较，完全相同时再用区分大小写的比较打破平局。
- * 仅当两段完全相等时返回 0。
- */
+/** 比较两段非数字文本：忽略大小写优先，完全相同再按大小写敏感比较，保证排序确定性。 */
 private fun compareTextSegments(a: String, b: String): Int {
     val byIgnoreCase = a.compareTo(b, ignoreCase = true)
     if (byIgnoreCase != 0) return if (byIgnoreCase < 0) -1 else 1
@@ -131,12 +130,8 @@ private fun compareTextSegments(a: String, b: String): Int {
 }
 
 /**
- * 自然序比较：把字符串切成「连续数字段 / 连续非数字段」交替比较，数字段按数值大小。
- * 因此 `第2集` 排在 `第10集` 之前，`E02` 排在 `E10` 之前。
- *
- * 数字段排在非数字段之前，段数与长度不足则短串在前，最后按原文兜底 ——
- * 这样保证是**全序**（自反、反对称、传递），排序结果不依赖输入顺序，
- * 避免每次扫描都误判“顺序变了”而反复重建播放队列。
+ * 自然排序：把字符串切成「数字段 / 文本段」交替比较。
+ * 效果：`第2集` < `第10集`（按数值而非字典序），数字段排在文本段之前。
  */
 internal fun naturalCompare(a: String, b: String): Int {
     var i = 0
@@ -164,8 +159,8 @@ internal fun naturalCompare(a: String, b: String): Int {
 }
 
 /**
- * 播放列表项比较：先按文件夹分组键（**无法分组的空键统一排在最后**），
- * 再按文件名自然序，最后按 uri 兜底（同名不同 uri 时顺序也确定）。
+ * 播放列表排序比较器：先按文件夹分组（未分组排最后），组内按名称自然序，
+ * 名称完全相同再以 URI 兜底，确保排序是全序且稳定。
  */
 internal fun comparePlaylistItems(a: MediaItemData, b: MediaItemData): Int {
     val aUngrouped = a.folderKey.isEmpty()
@@ -180,13 +175,13 @@ internal fun comparePlaylistItems(a: MediaItemData, b: MediaItemData): Int {
     return a.uri.toString().compareTo(b.uri.toString())
 }
 
-/** 按「文件夹分组 + 组内自然序」重排播放列表（稳定排序，幂等）。 */
+/** 按 [comparePlaylistItems] 对整份播放列表排序。 */
 internal fun sortPlaylist(items: List<MediaItemData>): List<MediaItemData> =
     items.sortedWith(Comparator { a, b -> comparePlaylistItems(a, b) })
 
 /**
- * 用扫描结果（uri 键 -> 文件夹键）回填播放列表中缺失的分组键：
- * 只填空值、不覆盖已有非空值，映射缺失则保持为空；无变化时原样返回。
+ * 回填缺失的文件夹分组键：仅对 [MediaItemData.folderKey] 为空的条目，
+ * 按扫描结果的 uri→folder 映射补齐（已有分组不覆盖）。无变化时原样返回。
  */
 internal fun backfillFolderKeys(
     items: List<MediaItemData>,
@@ -204,10 +199,10 @@ internal fun backfillFolderKeys(
     return if (changed) result else items
 }
 
-/** 时间格式化结果的 LRU 缓存，避免列表滚动时重复计算。 */
+/** 时间格式化结果缓存，避免列表中大量相同时长反复格式化。 */
 private val timeFormatCache = LruCache<Long, String>(512)
 
-/** 把毫秒格式化为 mm:ss 或 h:mm:ss。 */
+/** 将毫秒格式化为 `mm:ss` 或 `h:mm:ss`（不足 1 小时不显示小时位）。 */
 fun formatTime(ms: Long): String {
     timeFormatCache.get(ms)?.let { return it }
     val totalSec = ms / 1000
@@ -220,20 +215,22 @@ fun formatTime(ms: Long): String {
     return result
 }
 
-/** 通过 MediaStore 扫描设备上的视频与音频。 */
+/**
+ * MediaStore 扫描器：查询设备上的视频与音频，构造 [MediaItemData]。
+ * 目录列在 API 29+ 用 RELATIVE_PATH，低版本退回 DATA（绝对路径）。
+ */
 class MediaStoreScanner(private val context: Context) {
 
-    /** 查询设备视频，失败返回 null。 */
+    /** 查询所有视频；失败（权限/异常）返回 null。 */
     fun queryVideos(): List<MediaItemData>? = query(MediaStore.Video.Media.EXTERNAL_CONTENT_URI)
 
-    /** 查询设备音频，失败返回 null。 */
+    /** 查询所有音频；失败（权限/异常）返回 null。 */
     fun queryAudios(): List<MediaItemData>? = query(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI)
 
-    /**
-     * 用于读取所属文件夹的 MediaStore 列名：
-     * API 29+ 为 `RELATIVE_PATH`（相对外部存储的目录）；更低版本回退到 `DATA`（绝对路径）。
-     * 只会查询本机存在的列，避免把“列不存在”变成整次查询失败。
-     */
+    @Suppress("InlinedApi")
+    private val durationColumn: String = MediaStore.MediaColumns.DURATION
+
+    /** 用于提取文件夹分组键的列：API 29+ 用 RELATIVE_PATH，更低版本用 DATA。 */
     @Suppress("DEPRECATION")
     private val folderColumn: String =
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -242,7 +239,7 @@ class MediaStoreScanner(private val context: Context) {
             MediaStore.MediaColumns.DATA
         }
 
-    /** 低版本剥绝对路径前缀时用的主外部存储根目录（API 29+ 用不到）。 */
+    /** API 29 以下把 DATA 绝对路径转相对路径时用到的存储根目录。 */
     @Suppress("DEPRECATION")
     private val storageRoot: String? =
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
@@ -251,15 +248,13 @@ class MediaStoreScanner(private val context: Context) {
             null
         }
 
-    /**
-     * 按内容 uri 执行查询，返回 id/名称/时长/所属文件夹列表；异常时返回 null 以区分“无数据”。
-     */
+    /** 执行一次查询；任何异常或 cursor 为空都返回 null，交由调用方按「扫描失败」处理。 */
     private fun query(contentUri: Uri): List<MediaItemData>? {
         val items = mutableListOf<MediaItemData>()
         val projection = arrayOf(
             BaseColumns._ID,
             MediaStore.MediaColumns.DISPLAY_NAME,
-            MediaStore.MediaColumns.DURATION,
+            durationColumn,
             folderColumn
         )
         return try {
@@ -270,8 +265,7 @@ class MediaStoreScanner(private val context: Context) {
             cursor.use {
                 val idIdx = it.getColumnIndexOrThrow(BaseColumns._ID)
                 val nameIdx = it.getColumnIndexOrThrow(MediaStore.MediaColumns.DISPLAY_NAME)
-                val durIdx = it.getColumnIndexOrThrow(MediaStore.MediaColumns.DURATION)
-                // 文件夹列可能缺失：用 getColumnIndex 判 -1 并逐项降级，不能 OrThrow
+                val durIdx = it.getColumnIndexOrThrow(durationColumn)
                 val folderIdx = it.getColumnIndex(folderColumn)
                 while (it.moveToNext()) {
                     val id = it.getLong(idIdx)
@@ -293,10 +287,7 @@ class MediaStoreScanner(private val context: Context) {
         }
     }
 
-    /**
-     * 读取某一行的文件夹分组键；列不存在或取值失败时返回 ""，
-     * 保证路径不可读只影响该项的排序位置，不会丢掉整批扫描结果。
-     */
+    /** 从当前行读取目录列并归一化为文件夹分组键。 */
     private fun folderKeyOf(cursor: Cursor, folderIdx: Int): String {
         if (folderIdx < 0) return ""
         return runCatching {
@@ -309,16 +300,11 @@ class MediaStoreScanner(private val context: Context) {
         }.getOrDefault("")
     }
 
-    /** 是否拥有某种媒体类型的完整读取权限。 */
-    fun hasFullMediaAccess(permission: String): Boolean {
-        return hasMediaReadAccess(context, permission, includePartial = false)
-    }
 }
 
 /**
- * 判断是否拥有媒体读取权限。
- * Android 13 以下使用 READ_EXTERNAL_STORAGE；
- * Android 13+ 使用传入的分类型权限；Android 14+ 还支持“仅选择部分照片/视频”的部分授权。
+ * 判断是否拥有指定媒体读取权限。
+ * @param includePartial API 34+ 允许把「仅访问选中的照片/视频」也算作有权限
  */
 fun hasMediaReadAccess(context: Context, permission: String, includePartial: Boolean): Boolean {
     if (Build.VERSION.SDK_INT < 33) {
@@ -333,33 +319,43 @@ fun hasMediaReadAccess(context: Context, permission: String, includePartial: Boo
         ) == PackageManager.PERMISSION_GRANTED)
 }
 
-/** 播放列表项（Room 实体）。 */
+/** 视频或音频任一读取权限即视为有访问权（低版本为 READ_EXTERNAL_STORAGE）。 */
+fun hasAnyMediaReadAccess(context: Context, includePartial: Boolean): Boolean =
+    if (Build.VERSION.SDK_INT < 33) {
+        hasMediaReadAccess(
+            context,
+            android.Manifest.permission.READ_EXTERNAL_STORAGE,
+            includePartial
+        )
+    } else {
+        hasMediaReadAccess(context, android.Manifest.permission.READ_MEDIA_VIDEO, includePartial) ||
+            hasMediaReadAccess(context, android.Manifest.permission.READ_MEDIA_AUDIO, includePartial)
+    }
+
+/** 播放列表表：uri 为主键，sortOrder 维持用户可见顺序，folder 为文件夹分组键。 */
 @Entity(tableName = "playlist")
 data class PlaylistItemEntity(
     @PrimaryKey val uri: String,
     val name: String,
     val duration: Long,
-    /** 列表中的排序序号。 */
     val sortOrder: Int,
-    /** 所属文件夹分组键；旧数据与无法识别的项为空串。 */
     @ColumnInfo(defaultValue = "''") val folder: String = "",
 )
 
-/** 播放进度（Room 实体）：uri -> 位置(毫秒)。 */
+/** 播放进度表：按 uri 记录最后播放位置（毫秒）。 */
 @Entity(tableName = "progress")
 data class ProgressEntity(
     @PrimaryKey val uri: String,
     val positionMs: Long,
 )
 
-/** 通用键值对（Room 实体），用于保存“上次播放项”等状态。 */
+/** 通用 KV 表：存放最后播放项、缺失文件记录等零散配置。 */
 @Entity(tableName = "kv")
 data class KvEntity(
     @PrimaryKey @ColumnInfo(name = "key") val key: String,
     val value: String?,
 )
 
-/** 播放列表数据访问对象。 */
 @Dao
 interface PlaylistDao {
     @Query("SELECT * FROM playlist ORDER BY sortOrder ASC")
@@ -371,7 +367,7 @@ interface PlaylistDao {
     @Query("DELETE FROM playlist")
     suspend fun clear()
 
-    /** 事务内整体替换播放列表（先清空再插入）。 */
+    /** 事务内整体替换：先清空再插入，保证读到的列表要么是旧全量要么是新全量。 */
     @Transaction
     suspend fun replaceAll(items: List<PlaylistItemEntity>) {
         clear()
@@ -379,7 +375,6 @@ interface PlaylistDao {
     }
 }
 
-/** 播放进度数据访问对象。 */
 @Dao
 interface ProgressDao {
     @Query("SELECT * FROM progress")
@@ -392,7 +387,6 @@ interface ProgressDao {
     suspend fun deleteAll(uris: Set<String>)
 }
 
-/** 键值对数据访问对象。 */
 @Dao
 interface KvDao {
     @Query("SELECT value FROM kv WHERE `key` = :key")
@@ -402,7 +396,11 @@ interface KvDao {
     suspend fun put(entry: KvEntity)
 }
 
-/** 应用 Room 数据库，包含播放列表、进度与键值对三张表。 */
+/**
+ * Room 数据库。注意：**未启用** fallbackToDestructiveMigration，
+ * 新增字段/表时必须在下方补 Migration 并递增 version，否则打开数据库会直接报错，
+ * 而不会静默清空用户数据。
+ */
 @Database(
     entities = [PlaylistItemEntity::class, ProgressEntity::class, KvEntity::class],
     version = 2,
@@ -414,11 +412,7 @@ abstract class PlayerDatabase : RoomDatabase() {
     abstract fun kvDao(): KvDao
 
     companion object {
-        /**
-         * v1 -> v2：播放列表项新增「文件夹分组键」列。
-         * 旧数据统一填默认空串（随后由扫描结果回填），不删除任何用户数据。
-         * 定义在 companion（internal）便于迁移单测直接引用。
-         */
+        /** v1→v2：playlist 新增 folder 列（默认空串，与实体 defaultValue 一致）。 */
         internal val MIGRATION_1_2 = object : Migration(1, 2) {
             override fun migrate(db: SupportSQLiteDatabase) {
                 db.execSQL("ALTER TABLE playlist ADD COLUMN folder TEXT NOT NULL DEFAULT ''")
@@ -428,104 +422,90 @@ abstract class PlayerDatabase : RoomDatabase() {
 }
 
 /**
- * 播放数据仓库（单例）。
- *
- * 采用“内存镜像 + 异步落盘”的模式：读操作直接读内存镜像（[playlistState] /
- * [progressState] / [lastItemState]），写操作先更新内存镜像，再在单线程作用域内
- * 串行写数据库；数据库加载失败时会重置内存镜像并在冷却后自动重试。
+ * 全局单例仓库：内存状态为权威读取源，所有写操作经 [dispatchWrite] 串行落盘。
+ * 加载失败不是终态，会按 [LOAD_RETRY_COOLDOWN_MS] 冷却重试。
  */
 object PlayerRepository {
     private const val TAG = "PlayerRepository"
     private const val DB_NAME = "player.db"
 
-    /** 缺失记录在 kv 表中的键名。 */
+    /** KV 表里存放「缺失文件记录」的键。 */
     private const val KEY_MISSING_URIS = "missingUris"
 
-    /**
-     * 缺失条目真正删除前的宽限期：首次缺失需超过该时长、且至少经历过两次缺失才清理，
-     * 用于抵御存储卷暂时不可用/媒体库重建导致的瞬时漏扫。
-     */
+    /** 文件消失后需等待此时长才允许从列表中删除，避免外部瞬时不可用导致误删。 */
     internal const val MISSING_DELETE_GRACE_MS = 24 * 60 * 60 * 1000L
 
-    // 旧版使用 SharedPreferences 存储，这里定义用于一次性迁移到 Room 的键名
+    /** 旧版 SharedPreferences 存储名与键（用于一次性迁移到 Room）。 */
     private const val LEGACY_PREFS = "player"
     private const val KEY_LAST_ITEM = "lastItem"
     private const val KEY_MIGRATED = "migratedFromPrefs"
 
-    /** 串行落盘作用域：限制并发为 1，保证写库顺序。 */
+    /** 单线程 IO 作用域：保证所有数据库写入按提交顺序串行执行。 */
     private val persistScope =
         CoroutineScope(SupervisorJob() + Dispatchers.IO.limitedParallelism(1))
 
-    /** 保护数据库事务的互斥锁。 */
     private val writeMutex = Mutex()
 
-    /** 写盘失败通知通道，供界面层监听并提示。CONFLATED：只保留最新一条，避免失败时积压刷屏。 */
+    /** 落盘失败事件（合并型，避免重复刷屏）。 */
     private val writeFailureChannel = Channel<WriteFailure>(Channel.CONFLATED)
     val writeFailures: Flow<WriteFailure> = writeFailureChannel.receiveAsFlow()
 
-    /** 保护内存镜像状态的锁。 */
+    /** 保护内存状态（playlistState 等）读写的锁。 */
     private val stateLock = Any()
 
     private var db: PlayerDatabase? = null
     private var loadJob: Deferred<Unit>? = null
     private val loadLock = Any()
 
-    /** 应用上下文（Application），用于数据库与 SharedPreferences。 */
     @Volatile
     private var appContext: Context? = null
 
+    /** 上次发起加载的时间（用于失败后的冷却重试）。 */
     @Volatile
     private var lastLoadAttemptMs = 0L
 
-    /** 加载失败后的重试冷却时间。 */
+    /** 加载失败后再次重试的最小间隔。 */
     private const val LOAD_RETRY_COOLDOWN_MS = 30_000L
 
-    /** 播放列表内存镜像。 */
+    /** 内存中的权威播放列表。 */
     @Volatile
     private var playlistState: List<MediaItemData> = emptyList()
 
-    /** 播放进度内存镜像：uri -> 位置(毫秒)。 */
+    /** 内存中的权威进度映射（uri → 毫秒）。 */
     @Volatile
     private var progressState: Map<String, Long> = emptyMap()
 
-    /** “上次播放项”内存镜像。 */
+    /** 上次播放的 uri。 */
     @Volatile
     private var lastItemState: String? = null
 
-    /** 缺失记录内存镜像：uri -> (首次缺失时间, 已观察到的缺失次数)。 */
+    /** 已记录缺失的文件（uri → 缺失信息）。 */
     @Volatile
     private var missingState: Map<String, MissingInfo> = emptyMap()
 
-    /** 写盘失败信息。 */
+    /** 落盘失败事件的消息载体。 */
     data class WriteFailure(val message: String)
 
-    /** 数据库是否已成功加载。 */
+    /** 是否已成功加载过（失败时为 false，读取将返回空数据）。 */
     @Volatile
     private var loadSucceeded = false
 
-    /** 确保数据库已开始加载（幂等）：尚未成功且无进行中的加载时，触发一次加载。 */
+    /** 确保在应用启动早期调用：只会在未加载且无进行中任务时发起一次加载。 */
     fun ensureLoaded(context: Context) {
-        appContext = context.applicationContext
         synchronized(loadLock) {
+            if (appContext == null) appContext = context.applicationContext
             val running = loadJob?.isCompleted == false
             if (!running && !loadSucceeded) restartLoadLocked()
         }
     }
 
-    /**
-     * 等待数据库加载完成。
-     * 返回是否加载成功；所等待的加载失败且期间无并发重试成功时，清空内存镜像，
-     * 便于下次调用重试（若并发方已重试成功，则保留其新装载的数据并按成功返回）。
-     */
+    /** 挂起等待加载完成；失败时清空内存状态并返回 false，供界面提示。 */
     suspend fun awaitLoaded(context: Context): Boolean {
         ensureLoaded(context)
         val job = synchronized(loadLock) { loadJob } ?: return false
         val failure = job.awaitOrNull() ?: return true
         Log.e(TAG, "数据库加载失败", failure)
         synchronized(loadLock) {
-            // 仅当失败的 job 仍是当前加载任务时才清空镜像：若并发写入方已通过
-            // reloadAfterFailure 重试成功（镜像已重新装载），迟到的清空会把好数据抹掉
-            // （loadSucceeded 已为 true 后不会再重载，镜像将保持为空直到进程重启）
             if (loadJob === job && !loadSucceeded) {
                 synchronized(stateLock) {
                     playlistState = emptyList()
@@ -535,27 +515,27 @@ object PlayerRepository {
                 }
             }
         }
-        // 按当前实际加载状态返回：并发重试可能已成功，此时不应误报失败
         return loadSucceeded
     }
 
-    /** 读取播放列表内存镜像。 */
+    /** 返回当前内存中的播放列表。 */
     fun getPlaylist(): List<MediaItemData> = playlistState
 
-    /** 数据库是否已成功加载（未加载成功时不应把内存镜像落盘，以免覆盖库中已有数据）。 */
+    /** 数据是否已成功加载。 */
     fun isLoaded(): Boolean = loadSucceeded
 
-    /** 读取某 uri 的进度，无记录返回 null。 */
+    /** 读取某 uri 的进度；无记录返回 null。 */
     fun getProgress(uri: String): Long? = progressState[uri]
 
-    /** 读取上次播放项 uri。 */
+    /** 读取上次播放的 uri。 */
     fun getLastItem(): String? = lastItemState
 
     /**
-     * 应用一批进度更新：先合并进内存镜像，再异步落盘。
-     * @param writes 需要写入的 uri -> 位置
-     * @param removes 需要删除的 uri 集合
-     * @param onPersisted 落盘完成回调，参数表示是否成功
+     * 应用一批进度变更（合并写）。
+     *
+     * @param writes uri → 位置；仅保留 > 0 的值（0 不覆盖已有进度）
+     * @param removes 需要删除进度记录的 uri
+     * @param onPersisted 落盘完成回调，true 表示已成功写入数据库
      */
     fun applyProgressUpdates(
         writes: Map<String, Long>,
@@ -569,13 +549,12 @@ object PlayerRepository {
         val writesSnapshot = writes.toMap()
         val removesSnapshot = removes.toSet()
         dispatchWrite(
-            // 内存部分：合并进度
-            memPart = { mergeProgressLocked(writesSnapshot, removesSnapshot) },
-            // 数据库部分：先删除再写入
+            memPart = {
+                progressState = mergeProgressMap(progressState, writesSnapshot, removesSnapshot)
+            },
             dbPart = {
                 if (removesSnapshot.isNotEmpty()) progressDao().deleteAll(removesSnapshot)
 
-                // 仅写入正数进度（0 视为无进度）
                 val rows = writesSnapshot.filterValues { it > 0 }
                     .map { ProgressEntity(it.key, it.value) }
                 if (rows.isNotEmpty()) progressDao().upsertAll(rows)
@@ -584,7 +563,7 @@ object PlayerRepository {
         )
     }
 
-    /** 保存整个播放列表：更新内存镜像并异步落盘。 */
+    /** 全量保存播放列表（内存立即更新，数据库异步替换）。 */
     fun savePlaylist(items: List<MediaItemData>) {
         val itemsSnapshot = items.toList()
         dispatchWrite(
@@ -592,7 +571,6 @@ object PlayerRepository {
                 playlistState = itemsSnapshot
             },
             dbPart = {
-                // 按顺序生成带 sortOrder 的实体并整体替换
                 val entities = itemsSnapshot.mapIndexed { i, it ->
                     PlaylistItemEntity(it.uri.toString(), it.name, it.duration, i, it.folderKey)
                 }
@@ -601,7 +579,7 @@ object PlayerRepository {
         )
     }
 
-    /** 记录“上次播放项”。 */
+    /** 记录上次播放的 uri。 */
     fun setLastItem(uri: String) {
         dispatchWrite(
             memPart = { lastItemState = uri },
@@ -609,14 +587,10 @@ object PlayerRepository {
         )
     }
 
-    /** 读取某 uri 的缺失记录，无记录返回 null。 */
+    /** 查询某 uri 的缺失记录。 */
     internal fun getMissingInfo(uri: String): MissingInfo? = missingState[uri]
 
-    /**
-     * 记录一次“错误路径”发现的缺失（例如播放时 FILE_NOT_FOUND）。
-     * 只保证存在一条记录以固定“首次缺失时间”，不累加缺失次数，因此不会单独触发删除；
-     * 真正删除仍需经历扫描并满足“缺失次数 + 宽限期”条件。
-     */
+    /** 播放出错（文件不存在）时登记一次缺失，首次记录时间为当前时间。 */
     fun recordMissing(uri: String) {
         if (missingState.containsKey(uri)) return
         val newState = missingState + (uri to MissingInfo(nowWallClockMs(), 0))
@@ -625,8 +599,10 @@ object PlayerRepository {
     }
 
     /**
-     * 合并一轮扫描的缺失判定。仍缺失的累加次数；本轮已观察到但不缺失、或已从列表删除的记录清除；
-     * 未参与本轮判定的 URI 保留原记录，避免权限不足或查询失败时重置宽限期。
+     * 用本轮扫描结果对账缺失记录。
+     * @param missingUris 本轮扫描中未见到的 uri（计数 +1）
+     * @param observedUris 本轮扫描中见到的 uri（视为恢复，移除缺失记录）
+     * @param removedUris 已从列表删除、需清除缺失记录的 uri
      */
     fun updateMissingRecords(
         missingUris: Collection<String>,
@@ -655,7 +631,6 @@ object PlayerRepository {
         persistMissing(newState)
     }
 
-    /** 异步持久化缺失记录（复用统一写调度）。 */
     private fun persistMissing(state: Map<String, MissingInfo>) {
         dispatchWrite(
             memPart = {},
@@ -663,18 +638,9 @@ object PlayerRepository {
         )
     }
 
-    /** 墙钟毫秒时间戳，用于“距首次缺失多久”的判定（不受设备休眠影响）。 */
     private fun nowWallClockMs(): Long = System.currentTimeMillis()
 
-    /** 在持锁状态下把更新合并进进度内存镜像。 */
-    private fun mergeProgressLocked(
-        writes: Map<String, Long>,
-        removes: Set<String>
-    ) {
-        progressState = mergeProgressMap(progressState, writes, removes)
-    }
-
-    /** 等待 Deferred，成功返回 null，失败返回异常（不吞掉取消）。 */
+    /** 等待任务完成：成功返回 null，普通异常返回该异常，取消异常继续抛出。 */
     private suspend fun Deferred<Unit>.awaitOrNull(): Exception? = try {
         await()
         null
@@ -685,8 +651,8 @@ object PlayerRepository {
     }
 
     /**
-     * 统一的写入调度：若数据库已就绪则直接更新内存并异步落盘；
-     * 否则等待加载完成（必要时重试）后再执行。
+     * 统一写入入口：先更新内存，再串行落盘。
+     * 若尚未加载成功，会在写入前尝试重试加载（受冷却限制），避免写入被静默丢弃。
      */
     private fun dispatchWrite(
         memPart: () -> Unit,
@@ -704,7 +670,6 @@ object PlayerRepository {
             persistScope.launch { onComplete(persist(dbPart)) }
         } else {
             persistScope.launch {
-                // 首次加载失败时尝试重试，仍失败则放弃本次写入
                 if (job.awaitOrNull() != null && !reloadAfterFailure()) {
                     Log.e(TAG, "数据库加载失败且重试未成功，本次写入未落盘")
                     onComplete(false)
@@ -716,7 +681,7 @@ object PlayerRepository {
         }
     }
 
-    /** 加载失败后按冷却策略重试，返回最终是否成功。 */
+    /** 加载失败后按冷却时间重启加载；返回是否已成功加载。 */
     private suspend fun reloadAfterFailure(): Boolean {
         val job = synchronized(loadLock) {
             if (loadSucceeded) return true
@@ -729,7 +694,7 @@ object PlayerRepository {
         return job.awaitOrNull() == null
     }
 
-    /** 重启加载流程（需持有 loadLock）：关闭旧库、重置状态并重新异步加载。 */
+    /** 关闭旧数据库并重新发起加载（调用方需持有 loadLock）。 */
     private fun restartLoadLocked() {
         val ctx = appContext ?: return
         loadJob = null
@@ -743,10 +708,9 @@ object PlayerRepository {
         loadJob = persistScope.async { loadInternal(ctx) }
     }
 
-    /** 基于纳秒时钟的毫秒时间戳，单调递增，适合做间隔判断。 */
     private fun nowMs(): Long = System.nanoTime() / 1_000_000
 
-    /** 在事务中执行一次写库，失败时最多重试 3 次；全部失败则上报通知。 */
+    /** 在写锁与事务中执行一次落盘，最多重试 3 次；最终失败会广播 [WriteFailure]。 */
     private suspend fun persist(block: suspend PlayerDatabase.() -> Unit): Boolean {
         repeat(3) { attempt ->
             val database = db
@@ -769,7 +733,7 @@ object PlayerRepository {
         return false
     }
 
-    /** 实际加载：打开数据库，（首次）执行旧数据迁移，再把数据读入内存镜像。 */
+    /** 真正打开数据库、按需执行旧数据迁移，并把全量数据载入内存。 */
     private suspend fun loadInternal(appCtx: Context) {
 
         val database = Room.databaseBuilder(appCtx, PlayerDatabase::class.java, DB_NAME)
@@ -777,7 +741,6 @@ object PlayerRepository {
             .build()
         db = database
         val prefs = appCtx.getSharedPreferences(LEGACY_PREFS, Context.MODE_PRIVATE)
-        // 首次启动：从旧版 SharedPreferences 迁移；否则清理可能残留的旧数据
         if (database.kvDao().get(KEY_MIGRATED) == null) {
             migrateFromPrefs(database, prefs)
         } else if (prefs.contains("playlist") || prefs.contains("progress")
@@ -795,7 +758,7 @@ object PlayerRepository {
         loadSucceeded = true
     }
 
-    /** 把旧版 SharedPreferences 中的播放列表/进度/上次播放项迁移到数据库，并清理旧数据。 */
+    /** 把旧版 SharedPreferences 中的播放列表/进度/最后播放项一次性迁移进 Room，随后清空旧数据。 */
     private suspend fun migrateFromPrefs(database: PlayerDatabase, prefs: SharedPreferences) {
         val items = parseLegacyPlaylistJson(prefs.getString("playlist", null))
         val progress = parseLegacyProgressJson(prefs.getString("progress", null))
@@ -814,51 +777,40 @@ object PlayerRepository {
     }
 }
 
-/** 播放进度写入决策：清空 / 写入指定位置 / 跳过。 */
+/** 进度写入裁决结果。 */
 internal sealed interface ProgressWriteDecision {
 
-    /** 视为播放完成，应从进度中移除。 */
+    /** 已看完（落在末尾容差内）：清除该条进度。 */
     data object Clear : ProgressWriteDecision
 
-    /** 记录该位置。 */
+    /** 正常记录该位置。 */
     data class Store(val positionMs: Long) : ProgressWriteDecision
 
-    /** 无需处理。 */
+    /** 无有效位置（<=0）：跳过，不写不删。 */
     data object Skip : ProgressWriteDecision
 }
 
-/** 判定“已播完”的尾部容差：不超过 5 秒，且不超过总时长的 1/10。 */
+/** 末尾容差：距末尾 5 秒内视为已看完（周期落盘采样点常落方位词）。 */
 internal const val PROGRESS_FINISH_TAIL_MS = 5_000L
 
-/** 判断是否已播放到接近结尾（视为看完/听完）。 */
+/** 判断位置是否已到达末尾（容差不超过总时长的 10%，适配超短片）。 */
 internal fun isProgressFinished(positionMs: Long, durationMs: Long): Boolean {
     if (durationMs <= 0) return false
     val tail = minOf(PROGRESS_FINISH_TAIL_MS, durationMs / 10)
     return positionMs >= durationMs - tail
 }
 
-/** 依据当前位置与时长决定进度写入策略。 */
+/** 根据位置与时长效决定一次进度写入：清除 / 记录 / 跳过。 */
 internal fun decideProgressWrite(positionMs: Long, durationMs: Long): ProgressWriteDecision {
     if (isProgressFinished(positionMs, durationMs)) return ProgressWriteDecision.Clear
     if (positionMs <= 0) return ProgressWriteDecision.Skip
     return ProgressWriteDecision.Store(positionMs)
 }
 
-/** 按决策执行对应的进度操作（写入或清除）。 */
-internal fun applyProgressDecision(
-    decision: ProgressWriteDecision,
-    uri: String,
-    store: (uri: String, positionMs: Long) -> Unit,
-    clear: (uri: String) -> Unit,
-) {
-    when (decision) {
-        is ProgressWriteDecision.Clear -> clear(uri)
-        is ProgressWriteDecision.Store -> store(uri, decision.positionMs)
-        ProgressWriteDecision.Skip -> Unit
-    }
-}
-
-/** 合并进度映射：先移除指定 uri，再写入正数进度。 */
+/**
+ * 合并写语义：先应用删除，再写入 > 0 的位置（0 不覆盖已有非零进度）。
+ * 同一 uri 同时出现在 removes 与 writes 时，以 writes 为准。
+ */
 internal fun mergeProgressMap(
     disk: Map<String, Long>,
     writes: Map<String, Long>,
@@ -873,16 +825,16 @@ internal fun mergeProgressMap(
 }
 
 /**
- * 缺失记录：首次缺失时间（墙钟毫秒）与已观察到的缺失次数。
- * 错误路径只负责创建记录（次数不加），扫描缺失才累加次数，
- * 因此“至少两次缺失”严格对应“至少两次不同的扫描”。
+ * 缺失文件记录。
+ * @property firstMissingMs 首次发现缺失的时间（墙钟毫秒，用于宽限期判断）
+ * @property missCount 连续未在扫描中见到的次数
  */
 internal data class MissingInfo(
     val firstMissingMs: Long,
     val missCount: Int,
 )
 
-/** 解析持久化的缺失记录 JSON，解析失败返回空映射。 */
+/** 解析缺失记录 JSON（容错：非法或非对象值一律跳过）。 */
 internal fun parseMissingJson(json: String?): Map<String, MissingInfo> {
     if (json.isNullOrEmpty()) return emptyMap()
     return try {
@@ -900,7 +852,7 @@ internal fun parseMissingJson(json: String?): Map<String, MissingInfo> {
     }
 }
 
-/** 把缺失记录编码为 JSON。 */
+/** 序列化缺失记录为 JSON。 */
 internal fun encodeMissingJson(map: Map<String, MissingInfo>): String {
     val obj = JSONObject()
     for ((uri, info) in map) {
@@ -914,7 +866,7 @@ internal fun encodeMissingJson(map: Map<String, MissingInfo>): String {
     return obj.toString()
 }
 
-/** 解析旧版进度 JSON（uri -> 位置），解析失败返回空映射。 */
+/** 解析旧版进度 JSON（仅保留 > 0 的值）。 */
 internal fun parseLegacyProgressJson(json: String?): Map<String, Long> {
     if (json.isNullOrEmpty()) return emptyMap()
     return try {
@@ -930,14 +882,14 @@ internal fun parseLegacyProgressJson(json: String?): Map<String, Long> {
     }
 }
 
-/** 旧版播放列表项（迁移用）。 */
+/** 旧版播放列表条目（迁移用）。 */
 internal data class LegacyPlaylistItem(
     val uri: String,
     val name: String,
     val duration: Long,
 )
 
-/** 解析旧版播放列表 JSON（数组），去重并解析失败时返回空列表。 */
+/** 解析旧版播放列表 JSON（按顺序去重，重复 uri 保留首次出现）。 */
 internal fun parseLegacyPlaylistJson(json: String?): List<LegacyPlaylistItem> {
     if (json.isNullOrEmpty()) return emptyList()
     return try {
@@ -947,7 +899,6 @@ internal fun parseLegacyPlaylistJson(json: String?): List<LegacyPlaylistItem> {
             for (i in 0 until arr.length()) {
                 val obj = arr.getJSONObject(i)
                 val uri = obj.getString("uri")
-                // 跳过重复项
                 if (uri in seen) continue
                 seen.add(uri)
                 add(LegacyPlaylistItem(uri, obj.getString("name"), obj.optLong("duration", 0L)))

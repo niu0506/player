@@ -1,13 +1,15 @@
 <resources>
-    
+    <!-- 主题强调色 -->
     <color name="accent">#FFA78BFA</color>
     <color name="accent_deep">#FF7C5CFF</color>
 
+    <!-- 深色背景与卡片层级 -->
     <color name="bg_dark">#FF0E0E13</color>
     <color name="surface_1">#FF17171F</color>
     <color name="surface_2">#FF23232E</color>
     <color name="divider">#FF2A2A36</color>
 
+    <!-- 文本 -->
     <color name="text_primary">#FFF2F2F7</color>
     <color name="text_secondary">#FF8E8E99</color>
 </resources>

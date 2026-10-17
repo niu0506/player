@@ -1,3 +1,10 @@
+/**
+ * 应用内更新。
+ *
+ * 检查：优先请求 GitHub Releases API，失败时回退 jsDelivr 上的 version.json。
+ * 下载：经系统 DownloadManager，GitHub 直连优先、CDN 反代兜底，失败自动换源。
+ * 校验：安装前必须通过包名 / 版本号 / SHA-256 校验（fail-closed：拿不到校验和即拒绝安装）。
+ */
 package com.example.player
 
 import android.app.DownloadManager
@@ -30,12 +37,16 @@ import java.net.URL
 import java.security.MessageDigest
 import androidx.core.content.edit
 
-/**
- * 更新检查器：从 GitHub Releases 或 CDN 上的 version.json 获取最新版本信息。
- */
+/** 版本检查器：从 GitHub API 或 jsDelivr 回退源解析最新 Release 信息。 */
 class UpdateChecker {
 
-    /** 一次版本发布信息：版本号、APK 下载地址、更新说明、可选的 SHA-256 校验和。 */
+    /**
+     * 最新版本信息。
+     * @property version 版本号（已去掉 v 前缀）
+     * @property apkUrl 安装包下载地址
+     * @property notes 更新说明
+     * @property sha256 安装包 SHA-256（可能为 null，此时将拒绝自动安装）
+     */
     data class Release(
         val version: String,
         val apkUrl: String,
@@ -43,21 +54,18 @@ class UpdateChecker {
         val sha256: String? = null,
     )
 
-    /** 安全读取 JSON 字符串字段，非字符串或缺失时返回空串。 */
     private fun JSONObject.text(key: String): String = (opt(key) as? String).orEmpty()
 
-    /** 规范化版本号：去掉首尾空白及前缀 v/V。 */
     private fun normalizeVersion(raw: String): String =
         raw.trim().removePrefix("v").removePrefix("V").trim()
 
-    /** 查询最新版本：优先 GitHub API，失败后回退到 CDN 的 version.json。 */
+    /** 检查最新版本：GitHub API 优先，解析失败回退 jsDelivr version.json。 */
     fun checkLatest(): Release? {
         parseRelease(GITHUB_API_LATEST, "Accept" to "application/vnd.github+json")?.let { return it }
 
         return parseRelease(JS_VERSION_JSON_URL)
     }
 
-    /** 发起一次 HTTP GET 请求并返回响应体，异常或非 200 时返回 null。 */
     private fun httpGet(url: String, vararg headers: Pair<String, String>): String? {
         val conn = URL(url).openConnection() as HttpURLConnection
         return try {
@@ -73,23 +81,20 @@ class UpdateChecker {
         }
     }
 
-    /** 解析返回的 JSON 为 [Release]，字段缺失或解析失败时返回 null。 */
+    /** 解析 JSON：兼容 GitHub Release 与 version.json 两种字段命名。 */
     private fun parseRelease(url: String, vararg headers: Pair<String, String>): Release? {
         val body = httpGet(url, *headers) ?: return null
         return try {
             val obj = JSONObject(body)
-            // 版本号：兼容 version / tag_name 两种字段
             val version = normalizeVersion(
                 obj.text("version").ifBlank { obj.text("tag_name") }
             ).ifBlank { return null }
-            // 下载地址：兼容 apkUrl 字段或从 assets 中寻找 .apk
             val asset = findApkAsset(obj.optJSONArray("assets"))
             val apkUrl = obj.text("apkUrl").ifBlank {
                 asset?.text("browser_download_url").orEmpty()
             }.trim().ifBlank { return null }
-            // 更新说明：兼容 notes / body 两种字段
             val notes = obj.text("notes").ifBlank { obj.text("body") }
-            // 校验和（可选）：version.json 的 sha256/apkSha256，或 GitHub 资产的 digest（"sha256:..."）
+            // 校验和来源优先级：version.json 的 sha256 / apkSha256 → Release 资产 digest
             val sha256 = parseSha256Digest(obj.text("sha256"))
                 ?: parseSha256Digest(obj.text("apkSha256"))
                 ?: parseSha256Digest(asset?.text("digest"))
@@ -99,7 +104,7 @@ class UpdateChecker {
         }
     }
 
-    /** 从 GitHub release 的 assets 数组中找出 APK 资产对象。 */
+    /** 在 Release 资产列表中查找 .apk 文件。 */
     private fun findApkAsset(assets: JSONArray?): JSONObject? {
         if (assets == null) return null
         for (i in 0 until assets.length()) {
@@ -118,7 +123,7 @@ class UpdateChecker {
         private const val CONNECT_TIMEOUT_MS = 10_000
         private const val READ_TIMEOUT_MS = 20_000
 
-        /** 比较版本号：remote 是否比 current 更新（逐段按数字比较，忽略 - / + 后缀）。 */
+        /** 逐段比较版本号，判断 remote 是否比 current 新（非数字段按 0 处理）。 */
         fun isNewer(remote: String, current: String): Boolean {
 
             fun normalized(value: String) = value.substringBefore('-').substringBefore('+')
@@ -134,16 +139,15 @@ class UpdateChecker {
     }
 }
 
-/** 根据加速前缀生成候选下载地址列表：首个为直连地址，其后为各镜像加速地址。 */
-internal fun orderedDownloadUrls(apkUrl: String, accelerators: List<String>): List<String> =
-    (listOf("") + accelerators).map { prefix ->
+/** 生成下载源顺序：直连优先，随后依次拼接各加速前缀兜底；非 GitHub 地址不加速。 */
+internal fun orderedDownloadUrls(apkUrl: String, accelerators: List<String>): List<String> {
+    if (!apkUrl.startsWith("https://github.com/")) return listOf(apkUrl)
+    return (listOf("") + accelerators).map { prefix ->
         if (prefix.isEmpty()) apkUrl else prefix.trimEnd('/') + "/" + apkUrl
     }
+}
 
-/**
- * 解析 SHA-256 摘要：支持 "sha256:<hex>" 前缀（大小写不敏感）或裸 hex。
- * 仅当结果为 64 位十六进制时才返回，否则返回 null（视为未提供校验和）。
- */
+/** 解析 SHA-256：支持裸 hex 或 `sha256:` 前缀，统一小写；非法返回 null。 */
 internal fun parseSha256Digest(raw: String?): String? {
     val trimmed = raw?.trim().orEmpty()
     if (trimmed.isEmpty()) return null
@@ -163,23 +167,17 @@ internal fun toHex(bytes: ByteArray): String {
 
 private const val HEX_DIGITS = "0123456789abcdef"
 
-/** 依据期望校验和与实际哈希得出的完整性结论。 */
+/** 校验和核对结果。 */
 internal enum class ApkChecksumVerdict {
-    /** 校验和匹配。 */
     OK,
 
-    /** 发布元数据未提供校验和，无法验证（拒绝安装）。 */
+    /** 期望值缺失（fail-closed：应拒绝安装）。 */
     MISSING,
 
-    /** 实际哈希与期望不符（完整性被破坏）。 */
     MISMATCH,
 }
 
-/**
- * 判定下载包的完整性：期望校验和缺失时返回 [ApkChecksumVerdict.MISSING]（fail-closed），
- * 不一致时返回 [ApkChecksumVerdict.MISMATCH]，一致时返回 [ApkChecksumVerdict.OK]。
- * 哈希比较忽略大小写。
- */
+/** 比较期望与实际校验和（忽略大小写）。 */
 internal fun verifyApkChecksum(expected: String?, actual: String): ApkChecksumVerdict {
     if (expected.isNullOrEmpty()) return ApkChecksumVerdict.MISSING
     return if (actual.equals(expected, ignoreCase = true)) {
@@ -189,24 +187,18 @@ internal fun verifyApkChecksum(expected: String?, actual: String): ApkChecksumVe
     }
 }
 
-/** 下载包校验的最终结论：通过、缺少校验和（不可验证）、或无效（可换源重试）。 */
+/** 安装包整体校验结论。 */
 internal enum class ApkValidation {
-    /** 校验通过，可安装。 */
     OK,
 
-    /** 缺少可信校验和，换源无济于事，应中止安装。 */
+    /** 缺少校验和，拒绝安装。 */
     MISSING_CHECKSUM,
 
-    /** 文件无效、包名/版本不符或校验和不匹配，可尝试其它镜像。 */
+    /** 文件残缺 / 元数据不符 / 校验不匹配。 */
     INVALID,
 }
 
-/**
- * 更新管理器：负责检查更新、下载 APK、处理下载结果并触发安装。
- *
- * 下载使用系统 [DownloadManager]，支持多镜像重试、断点续传场景下的状态恢复，
- * 以及 Android 8.0+ 的“未知来源安装权限”处理。
- */
+/** 应用内更新编排：检查、下载（多源重试）、校验与安装。 */
 class UpdateManager(private val activity: AppCompatActivity) {
 
     companion object {
@@ -222,7 +214,7 @@ class UpdateManager(private val activity: AppCompatActivity) {
         const val APK_NAME_PREFIX = "player-v"
         const val APK_NAME_SUFFIX = "-release.apk"
 
-        /** 清理历史残留的更新 APK（MediaStore 下载目录 + 应用外部下载目录）。 */
+        /** 应用替换成功后清理旧更新包（MediaStore Downloads 目录 + 应用私有下载目录）。 */
         fun cleanupUpdateApks(context: Context) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 try {
@@ -242,74 +234,53 @@ class UpdateManager(private val activity: AppCompatActivity) {
 
     private val updateChecker = UpdateChecker()
 
-    /** 系统下载管理器（懒加载）。 */
     private val downloadManager by lazy {
         activity.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
     }
 
-    /** 最近一次入队的下载任务 id，-1 表示无。 */
     private var lastDownloadId = -1L
 
-    /** 下载相关持久化偏好，用于进程重启后恢复下载状态。 */
     private val downloadPrefs by lazy {
         activity.getSharedPreferences(DOWNLOAD_PREFS, Context.MODE_PRIVATE)
     }
 
-    /** 因缺少安装权限而暂存的待安装 APK uri。 */
+    /** 等待授权后要安装的 APK uri。 */
     private var pendingInstallUri: Uri? = null
 
-    /** 本次下载的目标文件。 */
+    /** 当前下载目标文件。 */
     private var pendingDownloadFile: File? = null
 
-    /** 本次下载的目标版本号。 */
+    /** 当前下载对应的版本号（用于校验 APK 元数据）。 */
     private var pendingDownloadVersion = ""
 
-    /** 本次下载期望的 SHA-256 校验和（来自发布元数据，可能为空表示未提供）。 */
+    /** 当前下载对应的期望 SHA-256。 */
     private var pendingDownloadSha256: String? = null
 
-    /** 防止重复发起下载。 */
     private var downloadStartInFlight = false
 
-    /** 防止重复执行下载重试。 */
     private var downloadRetryInFlight = false
 
-    /** 待尝试的下载地址队列（用于镜像依次重试）。 */
+    private var completionInFlight = false
+
+    /** 剩余待尝试的下载源（顺序即优先级）。 */
     private var pendingDownloadUrls: ArrayDeque<String> = ArrayDeque()
 
-    /** 因界面未处于 RESUMED 而暂存的待展示更新弹窗。 */
+    /** 因界面非前台而暂存的更新提示。 */
     private var pendingUpdate: UpdateChecker.Release? = null
 
-    /** 下载完成广播接收器：校验结果并触发安装，失败则重试镜像。 */
+    /** 系统下载完成广播：只处理本次发起的下载 id。 */
     private val downloadCompleteReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             if (intent.action != DownloadManager.ACTION_DOWNLOAD_COMPLETE) return
             val id = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1L)
             if (id != lastDownloadId) return
-            // 校验涉及 APK 解析与整包哈希，放到 IO 线程执行，避免阻塞主线程
             activity.lifecycleScope.launch {
-                // 下载任务本身失败：换源重试
-                if (withContext(Dispatchers.IO) { queryDownloadStatus(id) }
-                    != DownloadManager.STATUS_SUCCESSFUL
-                ) {
-                    retryDownloadOrFinish(context)
-                    return@launch
-                }
-                when (withContext(Dispatchers.IO) { validateDownloadedApk() }) {
-                    ApkValidation.OK -> {
-                        clearPersistedDownload()
-                        val uri = downloadedInstallUri() ?: return@launch
-                        installApk(uri)
-                    }
-                    // 缺少可信校验和：换源也拿不到校验和，直接中止并提示
-                    ApkValidation.MISSING_CHECKSUM -> abortUnverifiedInstall()
-                    // 无效包：可能是镜像返回错误内容，换源重试
-                    ApkValidation.INVALID -> retryDownloadOrFinish(context)
-                }
+                handleDownloadOutcome(id, context)
             }
         }
     }
 
-    /** 查询下载任务状态，异常时按失败处理。 */
+    /** 查询系统下载任务状态；查询失败按 STATUS_FAILED 处理。 */
     private fun queryDownloadStatus(id: Long): Int {
         val cursor = try {
             downloadManager.query(DownloadManager.Query().setFilterById(id))
@@ -323,13 +294,37 @@ class UpdateManager(private val activity: AppCompatActivity) {
         }
     }
 
-    /** GitHub 资源加速镜像前缀列表。 */
+    /** 下载结束处理：失败换源重试；成功则校验（OK 安装 / 缺校验和拒绝 / 无效换源）。 */
+    private suspend fun handleDownloadOutcome(id: Long, context: Context = activity) {
+        when (withContext(Dispatchers.IO) { queryDownloadStatus(id) }) {
+            DownloadManager.STATUS_FAILED -> retryDownloadOrFinish(context)
+            DownloadManager.STATUS_SUCCESSFUL -> {
+                if (completionInFlight) return
+                completionInFlight = true
+                try {
+                    when (withContext(Dispatchers.IO) { validateDownloadedApk() }) {
+                        ApkValidation.OK -> {
+                            val uri = downloadedInstallUri()
+                            clearPersistedDownload()
+                            if (uri != null) installApk(uri)
+                        }
+                        ApkValidation.MISSING_CHECKSUM -> abortUnverifiedInstall()
+                        ApkValidation.INVALID -> retryDownloadOrFinish(context)
+                    }
+                } finally {
+                    completionInFlight = false
+                }
+            }
+            else -> Unit
+        }
+    }
+
+    /** CDN 反代加速前缀（直连失败时兜底）。 */
     private val downloadAccelerators = listOf(
         "https://gh-proxy.com/",
         "https://ghproxy.net/",
     )
 
-    /** 注册下载完成广播接收器。 */
     fun registerReceivers() {
         ContextCompat.registerReceiver(
             activity, downloadCompleteReceiver,
@@ -338,7 +333,6 @@ class UpdateManager(private val activity: AppCompatActivity) {
         )
     }
 
-    /** 注销下载完成广播接收器。 */
     fun unregisterReceivers() {
         try {
             activity.unregisterReceiver(downloadCompleteReceiver)
@@ -346,16 +340,15 @@ class UpdateManager(private val activity: AppCompatActivity) {
         }
     }
 
-    /** 恢复上次未完成的下载与安装流程（如从“未知来源”设置页返回后，或进程被杀后重启）。 */
+    /** onStart 调用：恢复上次未完成的下载与待授权安装。 */
     fun resumePendingInstall() {
 
         activity.lifecycleScope.launch { resumePendingDownload() }
         val uri = restorePendingInstallUri() ?: return
-        // 已获安装权限则直接安装
         if (canInstallPackages()) installApk(uri)
     }
 
-    /** 取回待安装 uri：优先内存，其次按持久化路径恢复（进程可被……杀续装）。 */
+    /** 恢复待安装 APK 的 uri（文件校验通过才返回）。 */
     private fun restorePendingInstallUri(): Uri? {
         pendingInstallUri?.let { return it }
         val path = downloadPrefs.getString(KEY_PENDING_INSTALL_PATH, null) ?: return null
@@ -365,32 +358,34 @@ class UpdateManager(private val activity: AppCompatActivity) {
             return null
         }
         pendingDownloadFile = file
-        return try {
-            FileProvider.getUriForFile(activity, "${activity.packageName}.file-provider", file)
-        } catch (_: Exception) {
-            clearPendingInstall()
-            null
-        }
+        val uri = fileToInstallUri(file)
+        if (uri == null) clearPendingInstall()
+        return uri
     }
 
-    /** 是否已具备安装“未知来源”应用的权限。 */
+    /** 经 FileProvider 生成安装用 content:// uri（路径不在授权范围时返回 null）。 */
+    private fun fileToInstallUri(file: File): Uri? = try {
+        FileProvider.getUriForFile(activity, "${activity.packageName}.file-provider", file)
+    } catch (_: IllegalArgumentException) {
+        null
+    }
+
+    /** Android 8+ 需用户授权「安装未知应用」。 */
     private fun canInstallPackages(): Boolean =
         Build.VERSION.SDK_INT < Build.VERSION_CODES.O ||
             activity.packageManager.canRequestPackageInstalls()
 
-    /** 持久化“待安装”状态，供进程被杀后恢复。 */
     private fun persistPendingInstall() {
         val path = pendingDownloadFile?.absolutePath ?: return
         downloadPrefs.edit { putString(KEY_PENDING_INSTALL_PATH, path) }
     }
 
-    /** 清除“待安装”状态。 */
     private fun clearPendingInstall() {
         pendingInstallUri = null
         downloadPrefs.edit { remove(KEY_PENDING_INSTALL_PATH) }
     }
 
-    /** 检查更新。[manual] 为 true 时（手动触发）会通过 Toast 反馈失败/已是最新等结果。 */
+    /** 检查更新；manual 为 true 时会 Toast 提示「已最新 / 检查失败」。 */
     fun checkForUpdate(manual: Boolean) {
         activity.lifecycleScope.launch(Dispatchers.IO) {
             val release = try {
@@ -401,7 +396,6 @@ class UpdateManager(private val activity: AppCompatActivity) {
             withContext(Dispatchers.Main) {
                 if (activity.isFinishing || activity.isDestroyed) return@withContext
 
-                // 读取当前已安装版本号
                 val current = try {
                     activity.packageManager.getPackageInfo(activity.packageName, 0).versionName
                         ?.takeIf { it.isNotBlank() }
@@ -409,11 +403,9 @@ class UpdateManager(private val activity: AppCompatActivity) {
                     null
                 }
                 when {
-                    // 查询失败或版本未知：仅手动检查时提示
                     current == null || release == null -> if (manual) {
                         Toast.makeText(activity, R.string.update_check_failed, Toast.LENGTH_SHORT).show()
                     }
-                    // 已是最新版本
                     !UpdateChecker.isNewer(release.version, current) -> if (manual) {
                         Toast.makeText(
                             activity,
@@ -421,21 +413,20 @@ class UpdateManager(private val activity: AppCompatActivity) {
                             Toast.LENGTH_SHORT
                         ).show()
                     }
-                    // 有新版本：弹出更新对话框
                     else -> showUpdateDialog(release)
                 }
             }
         }
     }
 
-    /** 恢复之前因界面未 RESUMED 而暂存的更新弹窗。 */
+    /** onResume 调用：补弹前台期间被推迟的更新提示。 */
     fun resumePendingUpdateDialog() {
         val release = pendingUpdate ?: return
         pendingUpdate = null
         if (!activity.isFinishing && !activity.isDestroyed) showUpdateDialog(release)
     }
 
-    /** 展示更新对话框；若界面未 RESUMED 则暂存，待恢复后再展示。 */
+    /** 显示更新弹窗；界面未处于前台则暂存，待 onResume 补弹。 */
     private fun showUpdateDialog(release: UpdateChecker.Release) {
         if (!activity.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
             pendingUpdate = release
@@ -448,11 +439,12 @@ class UpdateManager(private val activity: AppCompatActivity) {
             .setPositiveButton(R.string.update_now) { _, _ -> downloadApk(release) }
             .setNegativeButton(R.string.cancel, null)
             .create()
+        // 不响应点外部取消，避免残留触摸立刻关掉刚弹出的提示
         dialog.setCanceledOnTouchOutside(false)
         dialog.show()
     }
 
-    /** 开始下载 APK：检查是否已有下载在跑，随后初始化下载文件与地址队列并入队。 */
+    /** 开始下载：记录版本 / 校验和 / 源顺序，写入应用私有下载目录。 */
     private fun downloadApk(release: UpdateChecker.Release) {
         if (downloadStartInFlight) {
             Toast.makeText(activity, R.string.update_download_in_progress, Toast.LENGTH_SHORT).show()
@@ -484,11 +476,10 @@ class UpdateManager(private val activity: AppCompatActivity) {
         }
     }
 
-    /** 生成 APK 文件名，如 player-v1.2.3-release.apk。 */
     private fun apkFileName(version: String): String =
         "$APK_NAME_PREFIX$version$APK_NAME_SUFFIX"
 
-    /** 用系统下载管理器入队一次下载，并持久化下载状态。 */
+    /** 经 DownloadManager 入队一次下载；目标必须为副文件私有目录（不能用 content:// 目标）。 */
     private suspend fun enqueueDownload(url: String) {
         val file = pendingDownloadFile ?: return
         withContext(Dispatchers.IO) { file.delete() }
@@ -502,13 +493,13 @@ class UpdateManager(private val activity: AppCompatActivity) {
         persistDownload()
     }
 
-    /** 是否已有进行中的下载任务。 */
     private fun hasActiveDownload(): Boolean {
         val file = pendingDownloadFile
-        return !(file == null || lastDownloadId < 0) && queryDownloadStatus(lastDownloadId) != DownloadManager.STATUS_FAILED
+        return file != null && lastDownloadId >= 0 &&
+            queryDownloadStatus(lastDownloadId) != DownloadManager.STATUS_FAILED
     }
 
-    /** 持久化下载状态（id、版本、校验和、剩余重试地址）。 */
+    /** 持久化当前下载状态，供进程被杀后恢复。 */
     private fun persistDownload() {
         downloadPrefs.edit {
             putLong(KEY_DOWNLOAD_ID, lastDownloadId)
@@ -518,7 +509,6 @@ class UpdateManager(private val activity: AppCompatActivity) {
         }
     }
 
-    /** 清除持久化的下载状态。 */
     private fun clearPersistedDownload() {
         lastDownloadId = -1L
         pendingDownloadSha256 = null
@@ -527,7 +517,7 @@ class UpdateManager(private val activity: AppCompatActivity) {
                 .remove(KEY_DOWNLOAD_SHA256).remove(KEY_DOWNLOAD_RETRY_URLS)}
     }
 
-    /** 下载失败时尝试下一个镜像地址；若已无可用地址则提示失败并清理状态。 */
+    /** 换源重试；没有更多源时提示失败并清理状态。 */
     private suspend fun retryDownloadOrFinish(context: Context = activity) {
         if (downloadRetryInFlight) return
         downloadRetryInFlight = true
@@ -544,7 +534,7 @@ class UpdateManager(private val activity: AppCompatActivity) {
         }
     }
 
-    /** 恢复上次持久化的下载：根据状态决定安装、重试或忽略。 */
+    /** 从持久化状态恢复未完成的下载并处理其结果。 */
     private suspend fun resumePendingDownload() {
         val id = downloadPrefs.getLong(KEY_DOWNLOAD_ID, -1L)
         if (id < 0) return
@@ -559,24 +549,10 @@ class UpdateManager(private val activity: AppCompatActivity) {
         pendingDownloadFile = File(dir, apkFileName(pendingDownloadVersion))
 
         pendingDownloadUrls = readRetryUrls() ?: ArrayDeque()
-        when (withContext(Dispatchers.IO) { queryDownloadStatus(id) }) {
-            DownloadManager.STATUS_SUCCESSFUL -> when (
-                withContext(Dispatchers.IO) { validateDownloadedApk() }
-            ) {
-                ApkValidation.OK -> {
-                    val uri = downloadedInstallUri()
-                    clearPersistedDownload()
-                    if (uri != null) installApk(uri)
-                }
-                ApkValidation.MISSING_CHECKSUM -> abortUnverifiedInstall()
-                ApkValidation.INVALID -> retryDownloadOrFinish()
-            }
-            DownloadManager.STATUS_FAILED -> retryDownloadOrFinish()
-            else -> Unit // 仍在进行中：保持现状，等待广播回调
-        }
+        handleDownloadOutcome(id)
     }
 
-    /** 读取持久化的剩余重试地址队列。 */
+    /** 读回剩余待重试的下载源。 */
     private fun readRetryUrls(): ArrayDeque<String>? {
         val raw = downloadPrefs.getString(KEY_DOWNLOAD_RETRY_URLS, null) ?: return null
         return try {
@@ -589,17 +565,15 @@ class UpdateManager(private val activity: AppCompatActivity) {
         }
     }
 
-    /** 获取已下载 APK 的可安装 uri（通过 FileProvider 暴露）。 */
     private fun downloadedInstallUri(): Uri? =
-        pendingDownloadFile?.takeIf { it.exists() }?.let {
-            FileProvider.getUriForFile(activity, "${activity.packageName}.file-provider", it)
-        }
+        pendingDownloadFile?.takeIf { it.exists() }?.let(::fileToInstallUri)
 
     /**
-     * 校验下载的 APK（存在、非空、可解析，且包名/版本/校验和符合预期）。
-     *
-     * 采用 fail-closed：发布元数据未提供 SHA-256 时返回 [ApkValidation.MISSING_CHECKSUM]，
-     * 拒绝安装无法验证完整性的包（仅凭可伪造的包名/版本号不足以信任第三方镜像的返回）。
+     * 校验下载产物：
+     * 1. 非空且能被系统解析为 APK；
+     * 2. 包名一致；版本号（若已知）一致；
+     * 3. SHA-256 匹配（fail-closed：缺失校验和也拒绝）。
+     * 用于拦截「反代返回 200 + HTML 错误页」或残包 / 篡改包。
      */
     private fun validateDownloadedApk(): ApkValidation {
         val file = pendingDownloadFile ?: return ApkValidation.INVALID
@@ -607,13 +581,11 @@ class UpdateManager(private val activity: AppCompatActivity) {
         @Suppress("DEPRECATION")
         val info = activity.packageManager.getPackageArchiveInfo(file.absolutePath, 0)
             ?: return ApkValidation.INVALID
-        // 必须是要安装的本应用，避免镜像/劫持返回其它应用
         if (info.packageName != activity.packageName) return ApkValidation.INVALID
-        // 版本号需与发布元数据一致，避免装到过期或错误的包
         val expectedVersion = pendingDownloadVersion
         val actualVersion = info.versionName
-        if (expectedVersion.isNotBlank() && !actualVersion.isNullOrBlank() &&
-            actualVersion != expectedVersion
+        if (expectedVersion.isNotBlank() &&
+            (actualVersion.isNullOrBlank() || actualVersion != expectedVersion)
         ) {
             return ApkValidation.INVALID
         }
@@ -631,17 +603,17 @@ class UpdateManager(private val activity: AppCompatActivity) {
         }
     }
 
-    /** 更新包缺少可信校验和：中止安装、清理状态并提示手动下载。 */
+    /** 缺校验和时的终止路径：清理下载并提示手动安装。 */
     private fun abortUnverifiedInstall() {
         clearPersistedDownload()
         Toast.makeText(activity, R.string.update_unverified, Toast.LENGTH_LONG).show()
     }
 
-    /** 流式计算文件的 SHA-256，失败返回 null。 */
+    /** 计算文件 SHA-256（分块读取，避免大包占用内存）。 */
     private fun sha256OfFile(file: File): String? = try {
         val digest = MessageDigest.getInstance("SHA-256")
         file.inputStream().use { input ->
-            val buffer = ByteArray(8192)
+            val buffer = ByteArray(64 * 1024)
             while (true) {
                 val read = input.read(buffer)
                 if (read <= 0) break
@@ -653,10 +625,9 @@ class UpdateManager(private val activity: AppCompatActivity) {
         null
     }
 
-    /** 触发安装 APK；Android 8.0+ 若无“未知来源”权限则先跳转设置页申请。 */
+    /** 调起系统安装器；若无「安装未知应用」权限，先引导授权并记录待安装 uri。 */
     private fun installApk(apkUri: Uri) {
         if (!canInstallPackages()) {
-            // 暂存待安装 uri 并持久化（防止进程被杀后丢失），跳转到“安装未知应用”设置页等待授权
             pendingInstallUri = apkUri
             persistPendingInstall()
             try {
@@ -678,7 +649,6 @@ class UpdateManager(private val activity: AppCompatActivity) {
         }
         try {
             activity.startActivity(intent)
-            // 安装器已拉起：清除待安装状态，避免下次启动重复安装
             clearPendingInstall()
         } catch (_: Exception) {
             Toast.makeText(activity, R.string.update_installer_failed, Toast.LENGTH_SHORT).show()
@@ -686,7 +656,7 @@ class UpdateManager(private val activity: AppCompatActivity) {
     }
 }
 
-/** 应用被覆盖安装后，清理历史残留的更新 APK。 */
+/** 应用被替换（升级完成）后清理残留的更新安装包。 */
 class PackageReplacedReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action == Intent.ACTION_MY_PACKAGE_REPLACED) {

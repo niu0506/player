@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 
+<!-- Android 11 及以下的自动备份规则：排除数据库（进度/列表换机不迁移） -->
 <full-backup-content>
     <exclude domain="database" path="player.db" />
     <exclude domain="database" path="player.db-wal" />

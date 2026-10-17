@@ -1,4 +1,5 @@
 <resources>
+    <!-- 控制栏自有尺寸 / 颜色 / 样式：仅依赖 Media3 文档化的控制视图 ID 与图标属性 -->
     <dimen name="player_control_bottom_bar_height">60dp</dimen>
     <dimen name="player_control_bottom_bar_top_margin">10dp</dimen>
     <dimen name="player_control_time_padding">10dp</dimen>

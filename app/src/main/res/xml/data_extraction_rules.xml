@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 
+<!-- Android 12+ 备份 / 换机规则：排除数据库（进度/列表不迁移） -->
 <data-extraction-rules>
     <cloud-backup>
         <exclude domain="database" path="player.db" />

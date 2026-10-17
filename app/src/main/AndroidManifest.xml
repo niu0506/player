@@ -2,26 +2,33 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
+    <!-- 前台服务（后台播放）及媒体播放类型 -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"
         tools:ignore="ForegroundServicesPolicy" />
     
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     
+    <!-- Android 13+ 动态申请的通知权限（前台服务通知） -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     
+    <!-- Android 13+ 分区媒体读取权限 -->
     <uses-permission android:name="android.permission.READ_MEDIA_VIDEO"
         tools:ignore="PhotoAndVideoPolicy" />
     
+    <!-- Android 14+ 仅访问用户选中项的权限 -->
     <uses-permission android:name="android.permission.READ_MEDIA_VISUAL_USER_SELECTED" />
     
     <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
     
+    <!-- Android 12 及以下的存储读取权限 -->
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
         android:maxSdkVersion="32" />
     
+    <!-- 应用内更新：安装未知来源应用 -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"
         tools:ignore="RequestInstallPackagesPolicy" />
     
+    <!-- 检查更新 / 下载更新包 -->
     <uses-permission android:name="android.permission.INTERNET" />
 
     <application
@@ -36,6 +43,7 @@
         android:theme="@style/Theme.Player"
         tools:targetApi="35">
 
+        <!-- 唯一 Activity：播放器界面；支持画中画，自行处理配置变化避免旋转重建 -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
@@ -47,6 +55,7 @@
             </intent-filter>
         </activity>
 
+        <!-- 前台播放服务：媒体播放类型，作为 MediaSessionService 对外暴露 -->
         <service
             android:name=".PlayerService"
             android:exported="true"
@@ -57,6 +66,7 @@
             </intent-filter>
         </service>
 
+        <!-- 应用被升级替换后清理残留的更新安装包 -->
         <receiver
             android:name=".PackageReplacedReceiver"
             android:exported="false">
@@ -65,6 +75,7 @@
             </intent-filter>
         </receiver>
 
+        <!-- FileProvider：向系统安装器授权读取应用私有目录中的 APK -->
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.file-provider"

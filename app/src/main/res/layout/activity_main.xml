@@ -8,6 +8,7 @@
     android:orientation="vertical"
     android:background="@color/bg_dark">
 
+    <!-- 播放器卡片（全屏 / 小窗时由 FullscreenPipHelper 动态调整圆角与边距） -->
     <com.google.android.material.card.MaterialCardView
         android:id="@+id/player_card"
         android:layout_width="match_parent"
@@ -22,6 +23,7 @@
         app:cardElevation="0dp"
         app:strokeWidth="0dp">
 
+        <!-- 使用应用自有的控制栏布局与图标，避免绑定 Media3 私有资源 -->
         <androidx.media3.ui.PlayerView
             android:id="@+id/player_view"
             android:layout_width="match_parent"
@@ -46,6 +48,7 @@
             app:fullscreen_enter_icon="@drawable/player_control_fullscreen_enter"
             app:fullscreen_exit_icon="@drawable/player_control_fullscreen_exit" />
 
+        <!-- 手势反馈浮层（快进/快退、亮度、音量） -->
         <TextView
             android:id="@+id/gesture_overlay"
             android:layout_width="wrap_content"
@@ -61,6 +64,7 @@
             android:visibility="gone" />
     </com.google.android.material.card.MaterialCardView>
 
+    <!-- 顶部工具栏：标题、数量、小窗、扫描、更多（检查更新） -->
     <LinearLayout
         android:id="@+id/toolbar_layout"
         android:layout_width="match_parent"
@@ -146,6 +150,7 @@
             android:contentDescription="@string/check_update" />
     </LinearLayout>
 
+    <!-- 播放列表容器（空态与列表叠加） -->
     <FrameLayout
         android:id="@+id/playlist_container"
         android:layout_width="match_parent"

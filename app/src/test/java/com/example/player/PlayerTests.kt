@@ -1,3 +1,8 @@
+/**
+ * 纯逻辑单元测试（不依赖 Android 运行时）：
+ * 时长格式化、进度合并与末尾裁决、更新下载源顺序与完整性校验、
+ * 旧数据迁移解析、缺失记录序列化、文件夹分组键与集数自然序等。
+ */
 package com.example.player
 
 import android.net.FakeUri
@@ -8,7 +13,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 
-/** 测试 [formatTime] 的时间格式化规则。 */
+/** 时长格式化：分秒 / 时分秒、毫秒截断等。 */
 class FormatTimeTest {
 
     @Test
@@ -37,7 +42,7 @@ class FormatTimeTest {
     }
 }
 
-/** 测试 [mergeProgressMap] 的进度合并语义（正数覆盖、0 不覆盖、删除优先等）。 */
+/** 进度合并语义：0 值不覆盖、删除优先级、写删并存等。 */
 class PlaybackProgressTest {
 
     @Test
@@ -90,10 +95,9 @@ class PlaybackProgressTest {
     }
 }
 
-/** 测试进度写入决策 [decideProgressWrite] 与“已播完”判定 [isProgressFinished]。 */
+/** 进度写入裁决：末尾容差、已看完清除、0 跳过、时长未知等。 */
 class ProgressDecisionTest {
 
-    /** 测试用总时长：180 秒。 */
     private val duration = 180_000L
 
     @Test
@@ -133,7 +137,7 @@ class ProgressDecisionTest {
     }
 }
 
-/** 测试 [orderedDownloadUrls] 的下载地址排序（直连优先、镜像兜底）。 */
+/** 下载源顺序：直连优先，加速前缀仅对 GitHub 地址生效。 */
 class DownloadSourceOrderTest {
 
     private val apk =
@@ -157,9 +161,21 @@ class DownloadSourceOrderTest {
     fun `without accelerators only the direct url remains`() {
         assertEquals(listOf(apk), orderedDownloadUrls(apk, emptyList()))
     }
+
+    @Test
+    fun `non github url returns only the direct url`() {
+        val cdn = "https://cdn.jsdelivr.net/gh/niu0506/player@main/apk/player-v1.5.0-release.apk"
+        assertEquals(listOf(cdn), orderedDownloadUrls(cdn, accelerators))
+    }
+
+    @Test
+    fun `github url without https prefix is not accelerated`() {
+        val insecure = apk.replaceFirst("https://", "http://")
+        assertEquals(listOf(insecure), orderedDownloadUrls(insecure, accelerators))
+    }
 }
 
-/** 测试旧版 SharedPreferences 数据（播放列表/进度 JSON）的迁移解析。 */
+/** 旧版 SharedPreferences 数据解析与迁移。 */
 class LegacyPrefsMigrationTest {
 
     @Test
@@ -226,14 +242,9 @@ class LegacyPrefsMigrationTest {
     }
 }
 
-/**
- * 测试 [MediaListAdapter.setCurrentPlaying] 的刷新行为：
- * 仅对命中/变更的行发出通知，且能正确记录状态。
- * 由于用例在本地 JVM 运行，通过反射直接访问 Adapter 的私有字段。
- */
+/** 适配器「当前播放项」更新：越界防护、仅刷新受影响条目等。 */
 class MediaListAdapterCurrentPlayingTest {
 
-    /** 记录被通知刷新的位置，便于断言。 */
     private class RecordingObserver : RecyclerView.AdapterDataObserver() {
         val changedPositions = mutableListOf<Int>()
         override fun onItemRangeChanged(positionStart: Int, itemCount: Int, payload: Any?) {
@@ -253,7 +264,6 @@ class MediaListAdapterCurrentPlayingTest {
         attachObserver(adapter, observer)
     }
 
-    /** 通过反射把观察者挂到 Adapter 内部的 mObservable.mObservers 上。 */
     @Suppress("UNCHECKED_CAST")
     private fun attachObserver(adapter: MediaListAdapter, observer: RecordingObserver) {
         val observableField = RecyclerView.Adapter::class.java.getDeclaredField("mObservable")
@@ -275,7 +285,6 @@ class MediaListAdapterCurrentPlayingTest {
         (observersField.get(observable) as ArrayList<Any>).add(observer)
     }
 
-    /** 通过反射读取 Adapter 的私有 items 列表。 */
     @Suppress("UNCHECKED_CAST")
     private fun items(): MutableList<Any> {
         val field = MediaListAdapter::class.java.getDeclaredField("items")
@@ -283,7 +292,6 @@ class MediaListAdapterCurrentPlayingTest {
         return field.get(adapter) as MutableList<Any>
     }
 
-    /** 通过反射读取 Adapter 的私有 currentPlayingUri。 */
     private fun currentPlayingUri(): String? {
         val field = MediaListAdapter::class.java.getDeclaredField("currentPlayingUri")
         field.isAccessible = true
@@ -338,9 +346,29 @@ class MediaListAdapterCurrentPlayingTest {
         adapter.setCurrentPlaying("u0")
         assertTrue(observer.changedPositions.isEmpty())
     }
+
+    @Test
+    fun `same uri and unchanged playing state notifies nothing`() {
+        repeat(3) { items().add(item("u$it")) }
+        adapter.setCurrentPlaying("u1", true)
+        observer.changedPositions.clear()
+
+        adapter.setCurrentPlaying("u1", true)
+        assertTrue(observer.changedPositions.isEmpty())
+    }
+
+    @Test
+    fun `same uri with playing toggle notifies the row once`() {
+        repeat(3) { items().add(item("u$it")) }
+        adapter.setCurrentPlaying("u1", false)
+        observer.changedPositions.clear()
+
+        adapter.setCurrentPlaying("u1", true)
+        assertEquals(listOf(1), observer.changedPositions)
+    }
 }
 
-/** 测试缺失记录的持久化编解码 [parseMissingJson] / [encodeMissingJson]。 */
+/** 缺失文件记录的序列化与解析容错。 */
 class MissingRecordsTest {
 
     @Test
@@ -386,7 +414,7 @@ class MissingRecordsTest {
     }
 }
 
-/** 测试更新包完整性相关的纯函数 [parseSha256Digest] / [toHex]。 */
+/** SHA-256 解析与十六进制编码。 */
 class UpdateIntegrityTest {
 
     private val hex64 = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
@@ -434,7 +462,7 @@ class UpdateIntegrityTest {
     }
 }
 
-/** 测试更新包完整性判定 [verifyApkChecksum]（fail-closed 语义）。 */
+/** 安装包校验和裁决：缺失 / 匹配 / 不匹配。 */
 class ApkChecksumVerdictTest {
 
     private val hex64 = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
@@ -462,7 +490,7 @@ class ApkChecksumVerdictTest {
     }
 }
 
-/** 测试 [UpdateChecker.isNewer] 的版本号比较逻辑。 */
+/** 版本号比较规则。 */
 class UpdateCheckerTest {
 
     @Test
@@ -503,7 +531,7 @@ class UpdateCheckerTest {
     }
 }
 
-/** 测试文件夹分组键的派生规则 [folderKeyFromRelativePath] / [folderKeyFromAbsolutePath] / [folderDisplayName]。 */
+/** 文件夹分组键提取：相对路径 / 绝对路径 / 不同存储卷。 */
 class FolderKeyTest {
 
     private val root = "/storage/emulated/0"
@@ -557,15 +585,9 @@ class FolderKeyTest {
         assertEquals("", folderKeyFromAbsolutePath("第01集.mp4", root))
     }
 
-    @Test
-    fun `display name is the last segment`() {
-        assertEquals("剧A", folderDisplayName("Movies/剧A"))
-        assertEquals("剧A", folderDisplayName("剧A"))
-        assertEquals("", folderDisplayName(""))
-    }
 }
 
-/** 测试 [naturalCompare] 的数字感知排序与全序性质。 */
+/** 自然排序：集数按数值、前导零、大小写、超长数字段的确定性。 */
 class NaturalOrderTest {
 
     private val comparator = Comparator<String> { a, b -> naturalCompare(a, b) }
@@ -590,7 +612,6 @@ class NaturalOrderTest {
 
     @Test
     fun `leading zeros are resolved deterministically`() {
-        // 数值相同（"1" 与 "01"）时靠长度兜底：位数少者在前
         assertTrue(naturalCompare("1", "01") < 0)
         assertEquals(
             sign(naturalCompare("01", "1")),
@@ -651,14 +672,13 @@ class NaturalOrderTest {
                 assertEquals(sign(naturalCompare(a, b)), -sign(naturalCompare(b, a)))
             }
         }
-        // 结果与输入排列无关，并且幂等 —— 否则每次扫描都会误判“顺序变了”
         val sorted = names.sortedWith(comparator)
         assertEquals(sorted, names.reversed().sortedWith(comparator))
         assertEquals(sorted, sorted.sortedWith(comparator))
     }
 }
 
-/** 测试播放列表的「文件夹分组 + 组内自然序」重排 [sortPlaylist] / [comparePlaylistItems]。 */
+/** 播放列表排序：同目录相邻、未分组置后、排序幂等。 */
 class PlaylistSortTest {
 
     private fun item(name: String, folder: String = "") =
@@ -721,7 +741,7 @@ class PlaylistSortTest {
     }
 }
 
-/** 测试用扫描结果回填文件夹键 [backfillFolderKeys]。 */
+/** 文件夹分组键回填：仅补空、不覆盖、URI 与数量不变。 */
 class FolderBackfillTest {
 
     private fun item(uri: String, name: String, folder: String = "") =

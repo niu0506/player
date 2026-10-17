@@ -1,5 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 
+<!--
+  播放器控制栏布局（替换 Media3 默认控制视图）。
+  使用 exo_* 的文档化视图 ID，供 PlayerView 自动注入与绑定；额外加入音轨 / 字幕 / 倍速入口。
+-->
 <merge xmlns:android="http://schemas.android.com/apk/res/android">
 
   <View android:id="@id/exo_controls_background"
@@ -25,6 +29,7 @@
         android:layout_gravity="center_vertical|start"
         android:layoutDirection="ltr">
 
+      <!-- 当前时间 / 总时长 -->
       <TextView android:id="@id/exo_position"
           style="@style/PlayerControls.TimeText.Position"/>
 
@@ -42,6 +47,7 @@
         android:layout_gravity="center_vertical|end"
         android:layoutDirection="ltr">
 
+      <!-- 应用自定义入口：音轨切换 -->
       <TextView android:id="@+id/btn_audio"
           android:layout_width="wrap_content"
           android:layout_height="wrap_content"
@@ -66,6 +72,7 @@
           android:textColor="#FFFFFF"
           android:background="?attr/selectableItemBackgroundBorderless"/>
 
+      <!-- 随机播放 -->
       <ImageButton android:id="@id/exo_shuffle"
           style="@style/PlayerControls.Button.Shuffle"/>
 
@@ -133,6 +140,7 @@
 
   </LinearLayout>
 
+  <!-- 居中控制：上一项 / 快退 / 播放暂停 / 快进 / 下一项 -->
   <LinearLayout
       android:id="@id/exo_center_controls"
       android:layout_width="wrap_content"

@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 
 <paths xmlns:android="http://schemas.android.com/apk/res/android">
-    
+    <!-- 仅授权应用外部私有下载目录，用于把更新包交给系统安装器读取 -->
     <external-files-path
         name="app_download"
         path="Download/" />
