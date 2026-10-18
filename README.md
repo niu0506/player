@@ -63,13 +63,6 @@
 ./gradlew lintDebug          # 静态检查（CI 同样会执行）
 ```
 
-## 开发须知（易踩的坑）
-
-- **Room 迁移**：数据库**没有**启用 `fallbackToDestructiveMigration`。升级 `@Database(version)` 时必须补 `Migration(N, M)` 并加入 `Room.databaseBuilder(...).addMigrations(...)`，否则打开数据库直接报错（而不会静默清空用户数据）。构建后确认 `app/schemas/com.example.player.PlayerDatabase/<M>.json` 已生成**并提交**——它是后续迁移的 diff 基准。另外，实体的 `@ColumnInfo(defaultValue = "''")` 与迁移 SQL 的字面量必须同时存在且一致，否则 `TableInfo` 校验会报 `Migration didn't properly handle`。
-- **更新下载目标**：DownloadManager 的 `setDestinationUri` 只接受 `file://`，传 `content://`（MediaStore 目标）会抛 `IllegalArgumentException` 导致闪退，因此使用 `setDestinationInExternalPublicDir` 写入公共「下载」目录，勿改回 `content://`。
-- **下载完成广播**：必须用 `RECEIVER_EXPORTED` 注册，原因见上文「更新」一节。
-- **数据加载失败**：`PlayerRepository.ensureLoaded` 会在失败后按 30 秒冷却重试（避免库永久损坏时被高频进度写反复触发重建），`awaitLoaded` 返回失败结果供界面提示。
-
 ## 签名（Release）
 
 签名信息按优先级取自：
