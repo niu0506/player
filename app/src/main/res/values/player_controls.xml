@@ -45,30 +45,25 @@
         <item name="android:layout_height">@dimen/player_control_small_icon_size</item>
         <item name="android:padding">@dimen/player_control_small_icon_padding</item>
     </style>
+    <!-- contentDescription 由布局内联指定（lint 不解析样式里的该属性） -->
     <style name="PlayerControls.Button.Shuffle" parent="PlayerControls.Button.Bottom">
         <item name="android:src">@drawable/player_control_shuffle_off</item>
-        <item name="android:contentDescription">@string/player_control_shuffle</item>
     </style>
     <style name="PlayerControls.Button.Repeat" parent="PlayerControls.Button.Bottom">
         <item name="android:src">@drawable/player_control_repeat_off</item>
-        <item name="android:contentDescription">@string/player_control_repeat</item>
     </style>
     <style name="PlayerControls.Button.Fullscreen" parent="PlayerControls.Button.Bottom">
         <item name="android:src">@drawable/player_control_fullscreen_enter</item>
-        <item name="android:contentDescription">@string/player_control_fullscreen</item>
     </style>
     <style name="PlayerControls.Button.OverflowShow" parent="PlayerControls.Button.Bottom">
         <item name="android:src">@drawable/player_control_overflow_show</item>
-        <item name="android:contentDescription">@string/player_control_more</item>
     </style>
     <style name="PlayerControls.Button.OverflowHide" parent="PlayerControls.Button.Bottom">
         <item name="android:src">@drawable/player_control_overflow_hide</item>
-        <item name="android:contentDescription">@string/player_control_less</item>
     </style>
     <!-- 仅全屏时显示，位于左上角，随控制栏一起显隐 -->
     <style name="PlayerControls.Button.Back" parent="PlayerControls.Button.Bottom">
         <item name="android:src">@drawable/ic_back</item>
-        <item name="android:contentDescription">@string/player_control_back</item>
     </style>
     <style name="PlayerControls.Button.Center" parent="PlayerControls.Button">
         <item name="android:layout_width">@dimen/player_control_icon_size</item>
@@ -77,15 +72,12 @@
     </style>
     <style name="PlayerControls.Button.Previous" parent="PlayerControls.Button.Center">
         <item name="android:src">@drawable/player_control_previous</item>
-        <item name="android:contentDescription">@string/player_control_previous</item>
     </style>
     <style name="PlayerControls.Button.Next" parent="PlayerControls.Button.Center">
         <item name="android:src">@drawable/player_control_next</item>
-        <item name="android:contentDescription">@string/player_control_next</item>
     </style>
     <style name="PlayerControls.Button.PlayPause" parent="PlayerControls.Button.Center">
         <item name="android:src">@drawable/player_control_play</item>
-        <item name="android:contentDescription">@string/player_control_play_pause</item>
     </style>
     <style name="PlayerControls.Button.Seek" parent="Widget.Material3.Button.TextButton">
         <item name="android:layout_width">@dimen/player_control_icon_size</item>

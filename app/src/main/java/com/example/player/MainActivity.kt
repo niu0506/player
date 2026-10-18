@@ -126,6 +126,14 @@ class MainActivity : AppCompatActivity() {
         binding.tvEmpty.visibility = if (playlist.isEmpty()) View.VISIBLE else View.GONE
     }
 
+    /** 仅在「正在播放视频」时保持屏幕常亮；纯音频不阻止系统息屏。 */
+    private fun updateKeepScreenOn() {
+        val ctrl = controller
+        val video = ctrl?.videoSize
+        binding.playerView.keepScreenOn =
+            ctrl?.isPlaying == true && video != null && video.width > 0 && video.height > 0
+    }
+
     /** 把当前播放项 / 播放状态同步到列表高亮。 */
     private fun syncAdapterPlayingState() {
         adapter.setCurrentPlaying(
@@ -154,7 +162,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun savePlaylistNow() {
-        if (!PlayerRepository.isLoaded()) return
+        // playlistLoaded 之前 playlist 还是空的：此时落盘会用空列表覆盖已存列表，
+        // 清空用户数据（例如控制器尚未连接或连接失败就退到后台）。
+        if (!playlistLoaded || !PlayerRepository.isLoaded()) return
         PlayerRepository.savePlaylist(playlist.toList())
     }
 
@@ -191,6 +201,8 @@ class MainActivity : AppCompatActivity() {
 
         override fun onIsPlayingChanged(isPlaying: Boolean) {
             syncAdapterPlayingState()
+            updateKeepScreenOn()
+            fullscreenPip.refreshPipParams()
             if (!isPlaying) {
                 // 先落盘再刷新：仓储内存同步更新后，下一行才能读到最新进度（服务侧落盘幂等）
                 PlayerService.flushCurrentPosition()
@@ -224,6 +236,9 @@ class MainActivity : AppCompatActivity() {
         }
 
         override fun onVideoSizeChanged(videoSize: VideoSize) {
+            updateKeepScreenOn()
+            // 依据是否有视频刷新系统 PiP 参数（自动进入的开关与小窗动画锚点）
+            fullscreenPip.refreshPipParams()
             // 回调在全部版本都会触发；PiP 比例仅在 API 26+ 生效，故此处显式判版本而非标注 @RequiresApi
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && fullscreenPip.isInPipMode) {
                 fullscreenPip.updatePipAspectRatio(videoSize)
@@ -311,7 +326,6 @@ class MainActivity : AppCompatActivity() {
             RepeatModeUtil.REPEAT_TOGGLE_MODE_ONE or RepeatModeUtil.REPEAT_TOGGLE_MODE_ALL
         )
         binding.playerView.setShowShuffleButton(true)
-        binding.playerView.keepScreenOn = true
 
         binding.playerView.findViewById<View>(R.id.btn_speed)?.setOnClickListener {
             showSpeedSelection()
@@ -700,6 +714,8 @@ class MainActivity : AppCompatActivity() {
 
             syncSpeedLabel()
             syncAdapterPlayingState()
+            updateKeepScreenOn()
+            fullscreenPip.refreshPipParams()
             lifecycleScope.launch {
 
                 val loaded = PlayerRepository.awaitLoaded(this@MainActivity)
@@ -763,8 +779,11 @@ class MainActivity : AppCompatActivity() {
 
     override fun onUserLeaveHint() {
         super.onUserLeaveHint()
-        // 播放视频时按 Home 自动进入小窗
-        fullscreenPip.enterPipWhenPlayingVideo()
+        // API 31+ 由 setAutoEnterEnabled 负责按 Home / 手势自动进入小窗（且仅在有视频时开启）；
+        // 低版本没有该能力，退回在此手动进入。
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+            fullscreenPip.enterPipWhenPlayingVideo()
+        }
     }
 
     override fun onPictureInPictureModeChanged(

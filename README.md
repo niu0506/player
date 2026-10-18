@@ -30,7 +30,7 @@
   - 双击左半屏 → 快退 15s；双击右半屏 → 快进 15s
   - 横向滑动 → 快进/快退（实时预览目标进度）
   - 左半屏上下滑动 → 调节亮度；右半屏上下滑动 → 调节音量
-- **小窗（PiP）与全屏**：画中画小窗按视频真实宽高比自适应；全屏按真实比例完整显示（不放大裁剪画面，可能留黑边），系统返回键退出
+- **小窗（PiP）与全屏**：画中画小窗按视频真实宽高比自适应；全屏按真实比例完整显示（不放大裁剪画面，可能留黑边），系统返回键退出；播放视频时按 Home / 手势自动进入小窗（API 31+ 经 `setAutoEnterEnabled`，纯音频不进入）
 
 ### 更新
 
@@ -49,8 +49,8 @@
 ## 技术栈
 
 - 语言：Kotlin
-- 最低支持 / 目标版本：minSdk 24 / targetSdk 35（compileSdk 36，由 media3 1.11 的传递依赖要求）
-- 播放器：androidx.media3 1.11.0（ExoPlayer + MediaSession + MediaController）
+- 最低支持 / 目标版本：minSdk 24 / targetSdk 37（compileSdk 37，亦满足 media3 1.11 的传递依赖要求）
+- 播放器：androidx.media3 1.11.1（ExoPlayer + MediaSession + MediaController）
 - 架构：前台服务（`PlayerService`）+ 单 Activity（`MainActivity`），经 MediaController 通信；源码扁平化为单包 5 文件，UI 逻辑拆分为 `GestureController`、`FullscreenPipHelper`、`MediaStoreScanner` 等职责类（见 `PlayerUi.kt` / `PlayerRepository.kt` / `UpdateManager.kt`）；依赖版本集中在 `gradle/libs.versions.toml`
 - 控制栏：使用应用自有的尺寸、颜色、样式与图标资源；仅依赖 Media3 文档化的控制视图 ID 和图标属性，避免绑定其私有布局资源
 - 持久化：Room 数据库（播放列表、进度映射、KV 分表存储，统一「合并写」入口）；schema 导出至 `app/schemas/` 并纳入版本控制。加载失败**不是终态**：会按需重试（30 秒冷却），失败期间的写入不再被静默丢弃，界面给出提示

@@ -15,6 +15,7 @@
   <ImageButton android:id="@+id/btn_fullscreen_back"
       style="@style/PlayerControls.Button.Back"
       android:layout_gravity="top|start"
+      android:contentDescription="@string/player_control_back"
       android:visibility="gone"/>
 
   <FrameLayout android:id="@id/exo_bottom_bar"
@@ -59,10 +60,12 @@
 
       <!-- 随机播放 -->
       <ImageButton android:id="@id/exo_shuffle"
-          style="@style/PlayerControls.Button.Shuffle"/>
+          style="@style/PlayerControls.Button.Shuffle"
+          android:contentDescription="@string/player_control_shuffle"/>
 
       <ImageButton android:id="@id/exo_repeat_toggle"
-          style="@style/PlayerControls.Button.Repeat"/>
+          style="@style/PlayerControls.Button.Repeat"
+          android:contentDescription="@string/player_control_repeat"/>
 
       <TextView android:id="@+id/btn_speed"
           style="@style/PlayerControls.TextButton"
@@ -70,10 +73,12 @@
           android:textStyle="bold"/>
 
       <ImageButton android:id="@id/exo_fullscreen"
-          style="@style/PlayerControls.Button.Fullscreen"/>
+          style="@style/PlayerControls.Button.Fullscreen"
+          android:contentDescription="@string/player_control_fullscreen"/>
 
       <ImageButton android:id="@id/exo_overflow_show"
-          style="@style/PlayerControls.Button.OverflowShow"/>
+          style="@style/PlayerControls.Button.OverflowShow"
+          android:contentDescription="@string/player_control_more"/>
 
     </LinearLayout>
 
@@ -88,7 +93,8 @@
           android:layout_height="wrap_content">
 
         <ImageButton android:id="@id/exo_overflow_hide"
-            style="@style/PlayerControls.Button.OverflowHide"/>
+            style="@style/PlayerControls.Button.OverflowHide"
+            android:contentDescription="@string/player_control_less"/>
 
       </LinearLayout>
 
@@ -111,7 +117,8 @@
       android:gravity="center_vertical">
 
     <ImageButton android:id="@id/exo_minimal_fullscreen"
-        style="@style/PlayerControls.Button.Fullscreen"/>
+        style="@style/PlayerControls.Button.Fullscreen"
+        android:contentDescription="@string/player_control_fullscreen"/>
 
   </LinearLayout>
 
@@ -127,21 +134,24 @@
       android:clipToPadding="false">
 
     <ImageButton android:id="@id/exo_prev"
-        style="@style/PlayerControls.Button.Previous"/>
+        style="@style/PlayerControls.Button.Previous"
+        android:contentDescription="@string/player_control_previous"/>
 
     <Button android:id="@id/exo_rew_with_amount"
         android:singleLine="false"
         style="@style/PlayerControls.Button.Seek"/>
 
     <ImageButton android:id="@id/exo_play_pause"
-        style="@style/PlayerControls.Button.PlayPause"/>
+        style="@style/PlayerControls.Button.PlayPause"
+        android:contentDescription="@string/player_control_play_pause"/>
 
     <Button android:id="@id/exo_ffwd_with_amount"
         android:singleLine="false"
         style="@style/PlayerControls.Button.FastForward"/>
 
     <ImageButton android:id="@id/exo_next"
-        style="@style/PlayerControls.Button.Next"/>
+        style="@style/PlayerControls.Button.Next"
+        android:contentDescription="@string/player_control_next"/>
 
   </LinearLayout>
 

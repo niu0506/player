@@ -11,6 +11,7 @@ import android.app.Activity
 import android.app.PictureInPictureParams
 import android.content.Context
 import android.content.pm.ActivityInfo
+import android.graphics.Rect
 import android.media.AudioManager
 import android.os.Build
 import android.os.Handler
@@ -193,7 +194,7 @@ class FullscreenPipHelper(
         applyVisualState(pipPreparing = true)
         try {
             val ratio = aspectRatioOf(vs) ?: Rational(16, 9)
-            if (activity.enterPictureInPictureMode(buildPipParams(ratio))) return true
+            if (activity.enterPictureInPictureMode(buildPipParams(ratio, autoEnter = false))) return true
         } catch (_: Exception) {
         }
         // 进入失败：回滚全屏状态与界面样式
@@ -213,14 +214,51 @@ class FullscreenPipHelper(
             null
         }
 
-    /** 构造 PiP 参数；API 31+ 开启无缝缩放。 */
+    /**
+     * 依据当前是否有视频，刷新系统 PiP 参数：有视频时允许系统自动进入小窗
+     * （API 31+ 的按 Home / 手势），并给出进入 / 退出小窗的动画锚点。
+     * 纯音频时关闭自动进入，避免弹出空的黑色小窗。
+     */
+    fun refreshPipParams() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+        val ctrl = controllerProvider()
+        val vs = ctrl?.videoSize
+        // 与原手动行为一致：仅在「正在播放视频」时才允许系统自动进入小窗
+        val autoEnter = vs != null && hasVideo(vs) && ctrl.isPlaying
+        val ratio = vs?.let(::aspectRatioOf) ?: Rational(16, 9)
+        try {
+            activity.setPictureInPictureParams(
+                buildPipParams(ratio, autoEnter = autoEnter)
+            )
+        } catch (_: Exception) {
+        }
+    }
+
+    /**
+     * 构造 PiP 参数。
+     * @param autoEnter API 31+ 是否允许系统自动进入小窗（无视频时传 false）
+     */
     @RequiresApi(Build.VERSION_CODES.O)
-    private fun buildPipParams(ratio: Rational): PictureInPictureParams {
+    private fun buildPipParams(ratio: Rational, autoEnter: Boolean): PictureInPictureParams {
         val builder = PictureInPictureParams.Builder().setAspectRatio(ratio)
+        // 进入 / 退出小窗的动画锚点：播放器卡片在屏幕中的位置
+        sourceRectHint()?.let { builder.setSourceRectHint(it) }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             builder.setSeamlessResizeEnabled(true)
+            builder.setAutoEnterEnabled(autoEnter)
         }
         return builder.build()
+    }
+
+    /** 播放器卡片当前的屏幕矩形；尺寸未知（尚未布局）时返回 null。 */
+    private fun sourceRectHint(): Rect? {
+        val card = binding.playerCard
+        if (card.width <= 0 || card.height <= 0) return null
+        val location = IntArray(2)
+        card.getLocationOnScreen(location)
+        return Rect(
+            location[0], location[1], location[0] + card.width, location[1] + card.height
+        )
     }
 
     /** 视频尺寸变化时更新 PiP 小窗比例（仅 PiP 中生效）。 */
@@ -229,7 +267,7 @@ class FullscreenPipHelper(
         if (!isInPipMode || !hasVideo(videoSize)) return
         val ratio = aspectRatioOf(videoSize) ?: return
         try {
-            activity.setPictureInPictureParams(buildPipParams(ratio))
+            activity.setPictureInPictureParams(buildPipParams(ratio, autoEnter = true))
         } catch (_: Exception) {
         }
     }
@@ -578,7 +616,6 @@ class MediaListAdapter(
             val percent = (progress * 100 / item.duration).toInt().coerceIn(0, 100)
             holder.binding.progressRow.visibility = View.VISIBLE
             holder.binding.pbItem.progress = percent
-            holder.binding.tvProgress.visibility = View.VISIBLE
             if (isActive) {
                 holder.binding.tvProgress.text = context.getString(
                     R.string.playing_progress, formatTime(progress)
