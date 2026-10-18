@@ -63,7 +63,7 @@
             android:visibility="gone" />
     </com.google.android.material.card.MaterialCardView>
 
-    <!-- 顶部工具栏：标题、数量、小窗、扫描、更多（检查更新） -->
+    <!-- 顶部工具栏：标题、数量、小窗、扫描、检查更新 -->
     <LinearLayout
         android:id="@+id/toolbar_layout"
         android:layout_width="match_parent"
@@ -97,7 +97,7 @@
 
         <Button
             android:id="@+id/btn_pip"
-            android:layout_width="wrap_content"
+            android:layout_width="80dp"
             android:layout_height="32dp"
             android:minWidth="0dp"
             android:minHeight="0dp"
@@ -118,7 +118,7 @@
 
         <Button
             android:id="@+id/btn_scan"
-            android:layout_width="wrap_content"
+            android:layout_width="80dp"
             android:layout_height="32dp"
             android:minWidth="0dp"
             android:minHeight="0dp"
@@ -137,16 +137,23 @@
             android:textColor="@color/text_primary"
             android:textSize="12sp" />
 
-        <ImageButton
+        <Button
             android:id="@+id/btn_more"
-            android:layout_width="32dp"
+            android:layout_width="80dp"
             android:layout_height="32dp"
+            android:minWidth="0dp"
+            android:minHeight="0dp"
             android:layout_marginStart="8dp"
+            android:paddingStart="12dp"
+            android:paddingEnd="14dp"
+            android:insetTop="0dp"
+            android:insetBottom="0dp"
+            android:stateListAnimator="@null"
             android:background="@drawable/bg_pill_button"
-            android:src="@drawable/ic_more"
-            android:scaleType="centerInside"
-            app:tint="@color/text_secondary"
-            android:contentDescription="@string/check_update" />
+            android:text="@string/check_update"
+            android:textAllCaps="false"
+            android:textColor="@color/text_primary"
+            android:textSize="12sp" />
     </LinearLayout>
 
     <!-- 播放列表容器（空态与列表叠加） -->
