@@ -18,14 +18,14 @@ fun envOrProp(envKey: String, propKey: String): String? =
 android {
     namespace = "com.example.player"
 
-    compileSdk = 36
+    compileSdk = 37
     defaultConfig {
         applicationId = "com.example.player"
         minSdk = 24
-        // targetSdk 35；compileSdk 36 由 media3 1.11 的传递依赖要求
-        targetSdk = 35
-        versionCode = 49
-        versionName = "1.5.14"
+        // 目标最新的稳定版本；compileSdk 37 亦满足 media3 1.11 的传递依赖要求
+        targetSdk = 37
+        versionCode = 50
+        versionName = "1.5.15"
     }
 
     signingConfigs {
