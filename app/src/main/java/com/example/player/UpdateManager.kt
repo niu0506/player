@@ -169,6 +169,16 @@ internal fun verifyApkChecksum(expected: String?, actual: String): ApkValidation
     }
 }
 
+/**
+ * 已下载的更新包版本是否已经装到本机。
+ *
+ * 用于区分「下载失败」与「已安装完成」：用户手动安装更新后，系统会删除安装包
+ * （下载记录也可能一并消失），此时已无产物可校验。若当前安装版本已达到（或超过）
+ * 下载版本，说明安装成功，应静默清理下载状态，而不是误报「下载失败」。
+ */
+internal fun isDownloadedVersionInstalled(downloaded: String, installed: String?): Boolean =
+    installed != null && !UpdateChecker.isNewer(downloaded, installed)
+
 /** 应用内更新编排：检查、下载与校验。下载校验通过后由用户手动安装，不代调系统安装器。 */
 class UpdateManager(private val activity: AppCompatActivity) {
 
@@ -284,10 +294,16 @@ class UpdateManager(private val activity: AppCompatActivity) {
     }
 
     fun registerReceivers() {
+        // 必须用 RECEIVER_EXPORTED：DOWNLOAD_COMPLETE 由「下载」提供方
+        // (com.android.providers.downloads) 这个**另一个应用/uid** 发出，而非系统直接发出。
+        // 用 RECEIVER_NOT_EXPORTED 时系统会以
+        // 「Exported Denial: ... not specifying RECEIVER_EXPORTED」为由直接丢弃该广播，
+        // 导致下载完成后本应用收不到回调（不校验、不清理、不提示），
+        // 残留的下载状态会在系统安装更新包删除安装包后被再次校验，从而误报「下载失败」。
         ContextCompat.registerReceiver(
             activity, downloadCompleteReceiver,
             IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE),
-            ContextCompat.RECEIVER_NOT_EXPORTED
+            ContextCompat.RECEIVER_EXPORTED
         )
     }
 
@@ -310,6 +326,13 @@ class UpdateManager(private val activity: AppCompatActivity) {
                 clearPersistedDownload()
                 return@launch
             }
+            // 该更新包对应的版本已经装到本机：说明用户已手动安装成功，系统安装完成后
+            // 会删除安装包（下载记录也可能被一并清掉）。此时再校验已消失的产物只会误报
+            // 「下载失败」，应静默清理残留的下载状态。
+            if (isDownloadedVersionInstalled(pendingDownloadVersion, installedVersionName())) {
+                clearPersistedDownload()
+                return@launch
+            }
             handleDownloadOutcome(id)
         }
     }
@@ -321,20 +344,7 @@ class UpdateManager(private val activity: AppCompatActivity) {
             withContext(Dispatchers.Main) {
                 if (activity.isFinishing || activity.isDestroyed) return@withContext
 
-                val current = try {
-                    val info = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                        activity.packageManager.getPackageInfo(
-                            activity.packageName,
-                            PackageManager.PackageInfoFlags.of(0)
-                        )
-                    } else {
-                        @Suppress("DEPRECATION")
-                        activity.packageManager.getPackageInfo(activity.packageName, 0)
-                    }
-                    info.versionName?.takeIf { it.isNotBlank() }
-                } catch (_: Exception) {
-                    null
-                }
+                val current = installedVersionName()
                 when {
                     current == null || release == null -> if (manual) {
                         activity.toast(R.string.update_check_failed)
@@ -346,6 +356,22 @@ class UpdateManager(private val activity: AppCompatActivity) {
                 }
             }
         }
+    }
+
+    /** 读取当前安装版本的 versionName；读取失败返回 null。 */
+    private fun installedVersionName(): String? = try {
+        val info = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            activity.packageManager.getPackageInfo(
+                activity.packageName,
+                PackageManager.PackageInfoFlags.of(0)
+            )
+        } else {
+            @Suppress("DEPRECATION")
+            activity.packageManager.getPackageInfo(activity.packageName, 0)
+        }
+        info.versionName?.takeIf { it.isNotBlank() }
+    } catch (_: Exception) {
+        null
     }
 
     /** onResume 调用：补弹前台期间被推迟的更新提示。 */

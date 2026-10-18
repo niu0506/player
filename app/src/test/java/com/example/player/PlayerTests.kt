@@ -385,6 +385,30 @@ class ApkValidationTest {
     }
 }
 
+/** 已下载版本是否已安装（用于区分「下载失败」与「安装完成」）。 */
+class DownloadedVersionInstalledTest {
+
+    @Test
+    fun `same version counts as installed`() {
+        assertTrue(isDownloadedVersionInstalled("1.5.15", "1.5.15"))
+    }
+
+    @Test
+    fun `newer installed version counts as installed`() {
+        assertTrue(isDownloadedVersionInstalled("1.5.15", "1.5.16"))
+    }
+
+    @Test
+    fun `older installed version is not installed yet`() {
+        assertFalse(isDownloadedVersionInstalled("1.5.15", "1.5.14"))
+    }
+
+    @Test
+    fun `unknown installed version is not treated as installed`() {
+        assertFalse(isDownloadedVersionInstalled("1.5.15", null))
+    }
+}
+
 /** 版本号比较规则。 */
 class UpdateCheckerTest {
 
