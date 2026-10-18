@@ -25,6 +25,8 @@ import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
+import com.google.common.util.concurrent.Futures
+import com.google.common.util.concurrent.ListenableFuture
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 
@@ -48,6 +50,14 @@ class PlayerService : MediaSessionService() {
 
     /** 待落盘的删除集合（进度需从数据库移除的 uri）。 */
     private val removedUris = mutableSetOf<String>()
+
+    /**
+     * 刚被要求删除进度、但播放器时间线里可能还存在的 uri。
+     *
+     * 删除条目时 dropProgress 先于播放器真正移除执行；在队列重建/跨进程命令完成前，
+     * ticker 仍可能把当前项的进度缓存回来。这里在 URI 真正离开时间线前拒绝重新缓存。
+     */
+    private val pendingDropUris = mutableSetOf<String>()
 
     /** 上一次成功落盘时的缓存快照，用于跳过无变化的写入。 */
     private var lastPersistedSnapshot: Map<String, Long> = emptyMap()
@@ -95,6 +105,25 @@ class PlayerService : MediaSessionService() {
             reason: Int
         ) {
             val sameItem = oldPosition.mediaItemIndex == newPosition.mediaItemIndex
+            if (isExplicitSeekToZero(
+                    reason,
+                    sameItem,
+                    oldPosition.positionMs,
+                    newPosition.positionMs
+                )
+            ) {
+                // 用户把当前条目拖回开头：显式删除旧断点。
+                // 普通位置 0 仍走 decideProgressWrite 的 Skip，避免初始位置/队列重建误清。
+                this@PlayerService.player
+                    ?.currentMediaItem
+                    ?.localConfiguration
+                    ?.uri
+                    ?.toString()
+                    ?.let { uri ->
+                        progressCache.remove(uri)
+                        removedUris.add(uri)
+                    }
+            }
             if (reason == Player.DISCONTINUITY_REASON_SEEK && !sameItem) {
                 // 跨条目 seek：先补记旧条目的位置，再统一落盘
                 cacheOldPosition(oldPosition)
@@ -108,6 +137,13 @@ class PlayerService : MediaSessionService() {
             Log.w(TAG, "播放出错: code=${error.errorCode}", error)
             val player = this@PlayerService.player ?: return
             val errorUri = player.currentMediaItem?.localConfiguration?.uri?.toString()
+            if (error.errorCode == PlaybackException.ERROR_CODE_IO_FILE_NOT_FOUND &&
+                errorUri != null
+            ) {
+                // 在这里登记而不是在界面收集器里：界面退到后台后仍要记录缺失，
+                // 供扫描宽限期判定使用。
+                PlayerRepository.recordMissing(errorUri)
+            }
 
             consecutiveErrorCount++
             // 错误次数不小于队列长度，说明整份列表都不够跳过，视为全部失败
@@ -173,8 +209,33 @@ class PlayerService : MediaSessionService() {
             .setSeekForwardIncrementMs(15_000)
             .build()
         player.addListener(playerEventListener)
-        mediaSession = MediaSession.Builder(this, player).build()
+        mediaSession = buildMediaSession(player)
     }
+
+    /**
+     * 构建媒体会话：服务对系统导出，但只允许可信控制器连接。
+     *
+     * Media3 默认对不可信控制器也给只读命令，任何第三方应用都能读取当前媒体项/元数据；
+     * 这里直接用 [MediaSession.ControllerInfo.isTrusted] 拒绝不可信控制器。
+     * 本应用、system UID、MEDIA_CONTENT_CONTROL / STATUS_BAR_SERVICE、通知监听器仍可控制，
+     * 因此不会影响通知栏、蓝牙、Android Auto 等系统入口。
+     */
+    @OptIn(UnstableApi::class)
+    private fun buildMediaSession(player: Player): MediaSession =
+        MediaSession.Builder(this, player)
+            .setCallback(object : MediaSession.Callback {
+                override fun onConnectAsync(
+                    session: MediaSession,
+                    controller: MediaSession.ControllerInfo
+                ): ListenableFuture<MediaSession.ConnectionResult> {
+                    if (controller.isTrusted()) {
+                        return super.onConnectAsync(session, controller)
+                    }
+                    Log.w(TAG, "拒绝不可信媒体控制器: ${controller.packageName}")
+                    return Futures.immediateFuture(MediaSession.ConnectionResult.reject())
+                }
+            })
+            .build()
 
     override fun onGetSession(info: MediaSession.ControllerInfo): MediaSession? {
         return mediaSession
@@ -191,7 +252,7 @@ class PlayerService : MediaSessionService() {
 
     /** 按裁决结果缓存某个条目的播放位置（当前项与已切走的旧项共用）。 */
     private fun cachePosition(uri: String?, positionMs: Long, durationMs: Long) {
-        if (uri == null) return
+        if (uri == null || uri in pendingDropUris) return
         when (val decision = decideProgressWrite(positionMs, durationMs)) {
             ProgressWriteDecision.Clear -> {
                 progressCache.remove(uri)
@@ -227,6 +288,13 @@ class PlayerService : MediaSessionService() {
     /** 收集当前变更并落盘（无变化则直接返回，避免零空闲 IO）。 */
     private fun persistProgress() {
         val player = this.player ?: return
+        if (pendingDropUris.isNotEmpty()) {
+            // URI 已真正离开播放队列后解除抑制，避免集合无限增长
+            val present = (0 until player.mediaItemCount)
+                .mapNotNull { player.getMediaItemAt(it).localConfiguration?.uri?.toString() }
+                .toSet()
+            pendingDropUris.retainAll(present)
+        }
         cacheCurrentPosition(player)
         val removals = removedUris.toSet()
         val writes = progressCache.filter { (uri, pos) -> lastPersistedSnapshot[uri] != pos }
@@ -310,13 +378,34 @@ class PlayerService : MediaSessionService() {
             val keys = uris.toSet()
             PlayerRepository.applyProgressUpdates(emptyMap(), keys)
             val svc = instance ?: return
+            // 只有当前播放项会被 ticker 的 cacheCurrentPosition 重新缓存；
+            // 非当前项删除后不需要长期抑制，避免它被重新加入列表后进度一直不写入。
+            val currentUri = svc.player
+                ?.currentMediaItem
+                ?.localConfiguration
+                ?.uri
+                ?.toString()
             // 连快照一并移除：否则下一轮落盘会按旧快照把同一次删除再提交一遍
             for (key in keys) svc.progressCache.remove(key)
             svc.lastPersistedSnapshot -= keys
+            // 播放器真正移除该条目前，ticker 不得把它的位置重新缓存回来
+            for (key in keys) {
+                if (key == currentUri) svc.pendingDropUris.add(key)
+            }
         }
 
         /** 删除单条进度。 */
         fun dropProgress(uri: String) = dropProgress(listOf(uri))
+
+        /** 播放队列已按列表重建后，解除对这些 URI 的进度抑制。 */
+        fun clearPendingDrops(uris: Collection<String>) {
+            instance?.pendingDropUris?.removeAll(uris.toSet())
+        }
+
+        /** 队列与列表已一致时清空全部抑制项（用于条目在控制器未连接时被删除的兜底）。 */
+        fun clearAllPendingDrops() {
+            instance?.pendingDropUris?.clear()
+        }
 
         /** 立即把当前播放位置落盘（暂停 / 切后台 / 点播前调用）。 */
         fun flushCurrentPosition() {
@@ -324,3 +413,19 @@ class PlayerService : MediaSessionService() {
         }
     }
 }
+
+/**
+ * 是否是「当前条目从非零位置显式 seek 回 0」。
+ *
+ * 只有这种 seek 才代表用户想从头看并清除旧断点；普通的 positionMs == 0
+ * （初始位置、seekToDefaultPosition、队列重建）仍按 [ProgressWriteDecision.Skip] 处理。
+ */
+internal fun isExplicitSeekToZero(
+    reason: Int,
+    sameItem: Boolean,
+    oldPositionMs: Long,
+    newPositionMs: Long,
+): Boolean = reason == Player.DISCONTINUITY_REASON_SEEK &&
+    sameItem &&
+    oldPositionMs > 0L &&
+    newPositionMs == 0L

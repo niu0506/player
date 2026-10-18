@@ -126,7 +126,7 @@
                 android:id="@+id/btn_more"
                 style="@style/ToolbarActionButton"
                 android:layout_marginStart="8dp"
-                android:text="@string/check_update" />
+                android:text="@string/more" />
         </LinearLayout>
     </LinearLayout>
 

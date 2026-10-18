@@ -16,6 +16,7 @@ import android.media.AudioManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.provider.Settings
 import android.util.Rational
 import android.view.GestureDetector
 import android.view.LayoutInflater
@@ -70,6 +71,10 @@ internal fun Context.toastMessage(message: CharSequence) {
 /** 视频尺寸是否可用（宽高均已解析出来）；纯音频或尺寸未知时为 false。 */
 internal fun VideoSize?.hasVideo(): Boolean =
     this != null && width > 0 && height > 0
+
+/** 系统亮度值（0..255）转 0..1；未知时回退 0.5，避免手势第一次跳变。 */
+internal fun systemBrightnessToFraction(raw: Int?): Float =
+    raw?.coerceIn(0, 255)?.div(255f) ?: 0.5f
 
 /**
  * 全屏与画中画（PiP）辅助类：统一管理视频表面样式、系统栏显隐与方向。
@@ -291,6 +296,7 @@ class GestureController(
     private companion object {
         const val BRIGHTNESS_PREFS = "gesture_settings"
         const val KEY_BRIGHTNESS = "manual_brightness"
+        const val KEY_FOLLOW_SYSTEM = "follow_system_brightness"
     }
 
     /** 本轮手势的类型；[Gesture.IGNORED] 表示时长未知等无法处理的滑动，本轮忽略。 */
@@ -316,8 +322,13 @@ class GestureController(
     /** 安装手势检测器与触摸监听。 */
     @SuppressLint("ClickableViewAccessibility")
     fun setup() {
-        // 恢复上次的亮度设置
-        if (brightnessPrefs.contains(KEY_BRIGHTNESS)) {
+        // 仅当用户之前手动设置过亮度、且没有恢复“跟随系统”时才恢复手动值。
+        // 旧版本没有 KEY_FOLLOW_SYSTEM：有手动亮度就视为手动模式，保持原行为。
+        val followSystem = brightnessPrefs.getBoolean(
+            KEY_FOLLOW_SYSTEM,
+            !brightnessPrefs.contains(KEY_BRIGHTNESS)
+        )
+        if (!followSystem && brightnessPrefs.contains(KEY_BRIGHTNESS)) {
             applyBrightness(brightnessPrefs.getFloat(KEY_BRIGHTNESS, 0.5f), persist = false)
         }
         val detector = GestureDetector(activity, object : GestureDetector.SimpleOnGestureListener() {
@@ -452,18 +463,36 @@ class GestureController(
         gestureMode = Gesture.NONE
     }
 
-    /** 当前亮度；系统未手动设置过（<0）时按 0.5 处理。 */
+    /** 当前亮度；跟随系统（<0）时读取系统亮度，读取失败回退 0.5。 */
     private fun currentBrightness(): Float {
         val b = activity.window.attributes.screenBrightness
-        return if (b < 0f) 0.5f else b
+        if (b >= 0f) return b
+        val systemValue = runCatching {
+            Settings.System.getInt(activity.contentResolver, Settings.System.SCREEN_BRIGHTNESS)
+        }.getOrNull()
+        return systemBrightnessToFraction(systemValue)
     }
 
-    /** 应用屏幕亮度（限制在 2%~100%）；persist 为 true 时写入偏好。 */
+    /** 应用屏幕亮度（限制在 2%~100%）；persist 为 true 时写入偏好并退出手动模式。 */
     private fun applyBrightness(value: Float, persist: Boolean) {
         val lp = activity.window.attributes
         lp.screenBrightness = value.coerceIn(0.02f, 1f)
         activity.window.attributes = lp
-        if (persist) brightnessPrefs.edit {putFloat(KEY_BRIGHTNESS, lp.screenBrightness) }
+        if (persist) brightnessPrefs.edit {
+            putFloat(KEY_BRIGHTNESS, lp.screenBrightness)
+            putBoolean(KEY_FOLLOW_SYSTEM, false)
+        }
+    }
+
+    /** 恢复跟随系统亮度：清除手动值并把 window 亮度交还给系统。 */
+    fun resetBrightnessToSystem() {
+        val lp = activity.window.attributes
+        lp.screenBrightness = -1f
+        activity.window.attributes = lp
+        brightnessPrefs.edit {
+            remove(KEY_BRIGHTNESS)
+            putBoolean(KEY_FOLLOW_SYSTEM, true)
+        }
     }
 
     /** 显示手势反馈浮层，800ms 后自动隐藏。 */

@@ -10,6 +10,9 @@
     <string name="playlist_title">播放列表</string>
     
     <string name="check_update">检查更新</string>
+    <string name="more">更多</string>
+    <string name="brightness_follow_system">亮度跟随系统</string>
+    <string name="toast_brightness_follow_system">已恢复跟随系统亮度</string>
 
     <!-- 播放列表 -->
     <string name="list_item_index">%1$d</string>

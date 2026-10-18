@@ -6,7 +6,13 @@
 package com.example.player
 
 import android.net.FakeUri
+import androidx.media3.common.Player
 import androidx.recyclerview.widget.RecyclerView
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.Mutex
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -700,5 +706,166 @@ class FolderBackfillTest {
             items.map { it.uri.toString() }.toSet(),
             result.map { it.uri.toString() }.toSet()
         )
+    }
+}
+
+/** 首次加载合并：数据库顺序优先、扫描独有条目追加、按归一化 URI 去重。 */
+class PlaylistLoadMergeTest {
+
+    private fun item(uri: String) = MediaItemData(FakeUri(uri), uri)
+
+    @Test
+    fun `stored order wins and duplicates are dropped`() {
+        val stored = listOf(item("content://video/2"), item("content://video/1"))
+        val scanned = listOf(item("content://video/1"), item("content://video/2"))
+        assertEquals(
+            listOf("content://video/2", "content://video/1"),
+            mergePlaylistOnLoad(stored, scanned).map { it.uri.toString() }
+        )
+    }
+
+    @Test
+    fun `scanned only items are appended`() {
+        val stored = listOf(item("content://video/1"))
+        val scanned = listOf(item("content://video/2"))
+        assertEquals(
+            listOf("content://video/1", "content://video/2"),
+            mergePlaylistOnLoad(stored, scanned).map { it.uri.toString() }
+        )
+    }
+
+    @Test
+    fun `duplicate stored entries are collapsed`() {
+        val stored = listOf(item("content://video/1"), item("content://video/1"))
+        assertEquals(1, mergePlaylistOnLoad(stored, emptyList()).size)
+    }
+}
+
+/** 缺失记录状态迁移：首次、累加、恢复与删除优先级。 */
+class MissingRecordsMergeTest {
+
+    private val now = 1_700_000_000_000L
+
+    @Test
+    fun `first miss starts at count one`() {
+        val result = mergeMissingRecords(emptyMap(), listOf("a"), emptyList(), emptySet(), now)
+        assertEquals(mapOf("a" to MissingInfo(now, 1)), result)
+    }
+
+    @Test
+    fun `repeated miss keeps first time and increments count`() {
+        val current = mapOf("a" to MissingInfo(now - 1_000, 2))
+        val result = mergeMissingRecords(current, listOf("a"), emptyList(), emptySet(), now)
+        assertEquals(mapOf("a" to MissingInfo(now - 1_000, 3)), result)
+    }
+
+    @Test
+    fun `observed uri is removed`() {
+        val current = mapOf(
+            "a" to MissingInfo(now - 1_000, 1),
+            "b" to MissingInfo(now - 1_000, 1)
+        )
+        val result = mergeMissingRecords(current, emptyList(), listOf("a"), emptySet(), now)
+        assertEquals(mapOf("b" to MissingInfo(now - 1_000, 1)), result)
+    }
+
+    @Test
+    fun `removed uri wins over missing and observed`() {
+        val current = mapOf("a" to MissingInfo(now - 1_000, 1))
+        val result = mergeMissingRecords(current, listOf("a"), listOf("a"), setOf("a"), now)
+        assertEquals(emptyMap<String, MissingInfo>(), result)
+    }
+
+    @Test
+    fun `same uri observed and missing stays missing and increments`() {
+        val current = mapOf("a" to MissingInfo(now - 1_000, 1))
+        val result = mergeMissingRecords(current, listOf("a"), listOf("a"), emptySet(), now)
+        assertEquals(mapOf("a" to MissingInfo(now - 1_000, 2)), result)
+    }
+}
+
+/** 显式 seek 回 0 的判定：只清当前条目从非零位置回到 0 的断点。 */
+class SeekToZeroTest {
+
+    @Test
+    fun `same item seek from positive to zero clears`() {
+        assertTrue(
+            isExplicitSeekToZero(Player.DISCONTINUITY_REASON_SEEK, true, 5_000, 0)
+        )
+    }
+
+    @Test
+    fun `seek from zero does not clear`() {
+        assertFalse(
+            isExplicitSeekToZero(Player.DISCONTINUITY_REASON_SEEK, true, 0, 0)
+        )
+    }
+
+    @Test
+    fun `cross item seek does not clear`() {
+        assertFalse(
+            isExplicitSeekToZero(Player.DISCONTINUITY_REASON_SEEK, false, 5_000, 0)
+        )
+    }
+
+    @Test
+    fun `non seek discontinuity does not clear`() {
+        assertFalse(
+            isExplicitSeekToZero(Player.DISCONTINUITY_REASON_INTERNAL, true, 5_000, 0)
+        )
+    }
+}
+
+/** 落盘重试必须在锁内等待，后续写入不能越过失败重试。 */
+class OrderedRetryTest {
+
+    @Test
+    fun `retry holds the lock so later writes cannot overtake`() = runBlocking {
+        val mutex = Mutex()
+        val events = mutableListOf<String>()
+        val firstStarted = CompletableDeferred<Unit>()
+        var firstAttempts = 0
+
+        val first = launch(Dispatchers.Default) {
+            withOrderedRetry(mutex, maxAttempts = 2, retryDelayMs = 20) {
+                firstAttempts++
+                if (firstAttempts == 1) {
+                    firstStarted.complete(Unit)
+                    throw IllegalStateException("first attempt fails")
+                }
+                events += "first-success"
+            }
+        }
+        firstStarted.await()
+        val second = launch(Dispatchers.Default) {
+            withOrderedRetry(mutex, maxAttempts = 1, retryDelayMs = 0) {
+                events += "second-success"
+            }
+        }
+        first.join()
+        second.join()
+
+        assertEquals(listOf("first-success", "second-success"), events)
+    }
+}
+
+/** 系统亮度归一化：0..255 映射到 0..1，未知值回退 0.5。 */
+class BrightnessFractionTest {
+
+    @Test
+    fun `zero and max map to ends`() {
+        assertEquals(0f, systemBrightnessToFraction(0), 0.001f)
+        assertEquals(1f, systemBrightnessToFraction(255), 0.001f)
+    }
+
+    @Test
+    fun `unknown falls back to half`() {
+        assertEquals(0.5f, systemBrightnessToFraction(null), 0.001f)
+    }
+
+    @Test
+    fun `out of range is clamped`() {
+        assertEquals(0f, systemBrightnessToFraction(-10), 0.001f)
+        assertEquals(1f, systemBrightnessToFraction(999), 0.001f)
     }
 }

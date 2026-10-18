@@ -179,6 +179,54 @@ internal fun sortPlaylist(items: List<MediaItemData>): List<MediaItemData> =
     items.sortedWith(::comparePlaylistItems)
 
 /**
+ * 首次加载时合并「数据库中的列表」与「扫描到但尚未落盘的列表」。
+ *
+ * 以数据库顺序为准，扫描独有条目追加到末尾；按 [normalizeUri] 去重，
+ * 避免加载失败后手动扫描再加回数据库列表时出现重复项。
+ */
+internal fun mergePlaylistOnLoad(
+    stored: List<MediaItemData>,
+    scanned: List<MediaItemData>
+): List<MediaItemData> {
+    val result = ArrayList<MediaItemData>(stored.size + scanned.size)
+    val seen = HashSet<String>(stored.size + scanned.size)
+    for (item in stored) {
+        if (seen.add(normalizeUri(item.uri))) result.add(item)
+    }
+    for (item in scanned) {
+        if (seen.add(normalizeUri(item.uri))) result.add(item)
+    }
+    return result
+}
+
+/**
+ * 在写锁内按顺序重试：重试期间持续持有 [mutex]，后面的写入不能插到失败重试之前。
+ * 最终失败时回调 [onFinalFailure] 并返回 null；取消异常继续抛出。
+ */
+internal suspend fun <T> withOrderedRetry(
+    mutex: Mutex,
+    maxAttempts: Int,
+    retryDelayMs: Long,
+    onFinalFailure: (Exception) -> Unit = {},
+    block: suspend () -> T
+): T? = mutex.withLock {
+    repeat(maxAttempts) { attempt ->
+        try {
+            return@withLock block()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            if (attempt == maxAttempts - 1) {
+                onFinalFailure(e)
+                return@withLock null
+            }
+            delay(retryDelayMs.milliseconds)
+        }
+    }
+    null
+}
+
+/**
  * 回填缺失的文件夹分组键：仅对 [MediaItemData.folderKey] 为空的条目，
  * 按扫描结果的 uri→folder 映射补齐（已有分组不覆盖）。无变化时原样返回。
  */
@@ -581,7 +629,8 @@ object PlayerRepository {
      * 单条时长回填请走 [updatePlaylistDuration]，避免为一处变更重写整表。
      */
     fun savePlaylist(items: List<MediaItemData>) {
-        val itemsSnapshot = items.toList()
+        // 兜底去重：即使界面侧因异常路径产生重复 URI，也不让主键冲突的整表替换写出脏数据
+        val itemsSnapshot = items.distinctBy { normalizeUri(it.uri) }
         dispatchWrite(
             memPart = {
                 playlistState = itemsSnapshot
@@ -620,8 +669,13 @@ object PlayerRepository {
 
     /** 播放出错（文件不存在）时登记一次缺失，首次记录时间为当前时间。 */
     fun recordMissing(uri: String) {
-        if (missingState.containsKey(uri)) return
-        persistMissing(missingState + (uri to MissingInfo(nowWallClockMs(), 0)))
+        updateMissingState { current ->
+            if (current.containsKey(uri)) {
+                current
+            } else {
+                current + (uri to MissingInfo(nowWallClockMs(), 0))
+            }
+        }
     }
 
     /**
@@ -637,32 +691,24 @@ object PlayerRepository {
     ) {
         if (missingUris.isEmpty() && observedUris.isEmpty() && removedUris.isEmpty() && missingState.isEmpty()) return
         val now = nowWallClockMs()
-        val missingSet = missingUris.toSet()
-        val removedSet = removedUris.toSet()
-        val newState = HashMap(missingState)
-        for (uri in removedSet) newState.remove(uri)
-        for (uri in observedUris) {
-            if (uri !in missingSet) newState.remove(uri)
+        updateMissingState { current ->
+            mergeMissingRecords(current, missingUris, observedUris, removedUris, now)
         }
-        for (uri in missingUris) {
-            if (uri in removedSet) continue
-            val prev = missingState[uri]
-            newState[uri] = if (prev == null) {
-                MissingInfo(now, 1)
-            } else {
-                MissingInfo(prev.firstMissingMs, prev.missCount + 1)
-            }
-        }
-        persistMissing(newState)
     }
 
     /**
-     * 缺失记录写入：内存先行同步更新（[recordMissing] / [updateMissingRecords] 的读取依赖它立即可见），
-     * 数据库落盘走统一入口；内存变更受 [stateLock] 保护。
+     * 缺失记录的唯一写入口：在 [stateLock] 内完成读-改-写，避免扫描对账（IO 线程）
+     * 与播放错误登记（主线程）并发时互相覆盖；没有变化时不触发数据库写入。
      */
-    private fun persistMissing(state: Map<String, MissingInfo>) {
-        val snapshot = state.toMap()
-        synchronized(stateLock) { missingState = snapshot }
+    private fun updateMissingState(
+        transform: (Map<String, MissingInfo>) -> Map<String, MissingInfo>
+    ) {
+        val snapshot = synchronized(stateLock) {
+            val newState = transform(missingState)
+            if (newState == missingState) return
+            missingState = newState
+            newState
+        }
         dispatchDbWrite {
             kvDao().put(KvEntity(KEY_MISSING_URIS, encodeMissingJson(snapshot)))
         }
@@ -744,26 +790,27 @@ object PlayerRepository {
 
     private fun nowMs(): Long = System.nanoTime() / 1_000_000
 
-    /** 在写锁与事务中执行一次落盘；失败重试一次，最终失败会广播 [writeFailures]。 */
+    /**
+     * 在写锁与事务中执行一次落盘；失败重试一次，最终失败会广播 [writeFailures]。
+     *
+     * 重试必须留在锁内：否则第一次失败释放锁后的 delay 窗口里，后续排队的写入
+     * 会先成功，而这次重试再用旧数据覆盖它们，破坏按提交顺序串行落盘的承诺。
+     */
     private suspend fun persist(block: suspend PlayerDatabase.() -> Unit): Boolean {
-        repeat(PERSIST_MAX_ATTEMPTS) { attempt ->
-            val database = db
-            try {
-                if (database == null) error("数据库尚未初始化")
-                writeMutex.withLock { database.withTransaction { database.block() } }
-                return true
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                if (attempt == PERSIST_MAX_ATTEMPTS - 1) {
-                    Log.e(TAG, "数据库写入 $PERSIST_MAX_ATTEMPTS 次失败，本次变更未落盘", e)
-                    writeFailureChannel.trySend(Unit)
-                    return false
-                }
-                delay(PERSIST_RETRY_DELAY_MS.milliseconds)
+        val result = withOrderedRetry(
+            mutex = writeMutex,
+            maxAttempts = PERSIST_MAX_ATTEMPTS,
+            retryDelayMs = PERSIST_RETRY_DELAY_MS,
+            onFinalFailure = { e ->
+                Log.e(TAG, "数据库写入 $PERSIST_MAX_ATTEMPTS 次失败，本次变更未落盘", e)
+                writeFailureChannel.trySend(Unit)
             }
+        ) {
+            // 在锁内读取，避免重试期间数据库被重建/关闭后仍向旧句柄写入
+            val database = db ?: error("数据库尚未初始化")
+            database.withTransaction { database.block() }
         }
-        return false
+        return result != null
     }
 
     /** 真正打开数据库并把全量数据载入内存。 */
@@ -846,6 +893,38 @@ internal data class MissingInfo(
     val firstMissingMs: Long,
     val missCount: Int,
 )
+
+/**
+ * 缺失记录状态迁移（纯函数，便于测试）：
+ * - 删除优先级最高；
+ * - 本轮见到的 uri 视为恢复，移除记录（同一轮又标记缺失时保留缺失）；
+ * - 本轮未见到的 uri 计数 +1，首次缺失时间保持不变。
+ */
+internal fun mergeMissingRecords(
+    current: Map<String, MissingInfo>,
+    missingUris: Collection<String>,
+    observedUris: Collection<String>,
+    removedUris: Collection<String>,
+    now: Long,
+): Map<String, MissingInfo> {
+    val missingSet = missingUris.toSet()
+    val removedSet = removedUris.toSet()
+    val newState = HashMap(current)
+    for (uri in removedSet) newState.remove(uri)
+    for (uri in observedUris) {
+        if (uri !in missingSet) newState.remove(uri)
+    }
+    for (uri in missingUris) {
+        if (uri in removedSet) continue
+        val prev = current[uri]
+        newState[uri] = if (prev == null) {
+            MissingInfo(now, 1)
+        } else {
+            MissingInfo(prev.firstMissingMs, prev.missCount + 1)
+        }
+    }
+    return newState
+}
 
 /** 解析缺失记录 JSON（容错：非法或非对象值一律跳过）。 */
 internal fun parseMissingJson(json: String?): Map<String, MissingInfo> {
