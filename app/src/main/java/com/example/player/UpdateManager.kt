@@ -352,7 +352,10 @@ class UpdateManager(private val activity: AppCompatActivity) {
     fun resumePendingUpdateDialog() {
         val release = pendingUpdate ?: return
         pendingUpdate = null
-        showUpdateDialog(release)
+        // 注意：onResume() 执行期间 lifecycle 仍是 STARTED（RESUMED 要等 onResume 返回后才分发），
+        // 直接走 showUpdateDialog() 会被 canShowDialog() 拦下并再次暂存，导致补弹永远不触发。
+        // 挂到 decorView 消息队列，等 resume 真正完成后再创建弹窗。
+        activity.window.decorView.post { presentUpdateDialog(release) }
     }
 
     /** 界面可安全弹窗：未销毁且已处于前台。 */
