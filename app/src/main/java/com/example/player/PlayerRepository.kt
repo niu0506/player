@@ -102,19 +102,22 @@ internal fun folderKeyFromAbsolutePath(absolutePath: String?, storageRoot: Strin
 /** 超过此位数的数字段改用「长度 + 字典序」比较，避免 Long 溢出。 */
 private const val NATURAL_MAX_DIGITS = 18
 
-/** 比较两段纯数字：先按数值大小，数值相同时用长度和字典序保证确定性（处理前导零）。 */
+/** 数值相同（前导零）或超出安全位数时，用「长度 + 字典序」保证排序确定性。 */
+private fun compareDigitTails(x: String, y: String): Int {
+    val byLength = x.length.compareTo(y.length)
+    return if (byLength != 0) byLength else x.compareTo(y)
+}
+
+/** 比较两段纯数字：先按数值大小，数值相同时退化为长度 + 字典序（处理前导零与超长数字）。 */
 private fun compareDigitSegments(a: String, b: String): Int {
     val x = a.trimStart('0').ifEmpty { "0" }
     val y = b.trimStart('0').ifEmpty { "0" }
-    if (x.length > NATURAL_MAX_DIGITS || y.length > NATURAL_MAX_DIGITS) {
-        val byLength = x.length.compareTo(y.length)
-        return if (byLength != 0) byLength else x.compareTo(y)
+    if (x.length <= NATURAL_MAX_DIGITS && y.length <= NATURAL_MAX_DIGITS) {
+        val vx = x.toLong()
+        val vy = y.toLong()
+        if (vx != vy) return if (vx < vy) -1 else 1
     }
-    val vx = x.toLong()
-    val vy = y.toLong()
-    if (vx != vy) return if (vx < vy) -1 else 1
-    val byLength = x.length.compareTo(y.length)
-    return if (byLength != 0) byLength else x.compareTo(y)
+    return compareDigitTails(x, y)
 }
 
 /** 比较两段非数字文本：忽略大小写优先，完全相同再按大小写敏感比较，保证排序确定性。 */
@@ -173,7 +176,7 @@ internal fun comparePlaylistItems(a: MediaItemData, b: MediaItemData): Int {
 
 /** 按 [comparePlaylistItems] 对整份播放列表排序。 */
 internal fun sortPlaylist(items: List<MediaItemData>): List<MediaItemData> =
-    items.sortedWith(Comparator { a, b -> comparePlaylistItems(a, b) })
+    items.sortedWith(::comparePlaylistItems)
 
 /**
  * 回填缺失的文件夹分组键：仅对 [MediaItemData.folderKey] 为空的条目，
@@ -297,6 +300,7 @@ class MediaStoreScanner(private val context: Context) {
 
 /**
  * 判断是否拥有指定媒体读取权限。
+ * @param permission API 33+ 要检查的具体媒体权限（低版本固定检查 READ_EXTERNAL_STORAGE）
  * @param includePartial API 34+ 允许把「仅访问选中的照片/视频」也算作有权限
  */
 fun hasMediaReadAccess(context: Context, permission: String, includePartial: Boolean): Boolean {
@@ -318,7 +322,7 @@ fun hasAnyMediaReadAccess(context: Context, includePartial: Boolean): Boolean =
         hasMediaReadAccess(
             context,
             android.Manifest.permission.READ_EXTERNAL_STORAGE,
-            includePartial
+            includePartial = false
         )
     } else {
         hasMediaReadAccess(context, android.Manifest.permission.READ_MEDIA_VIDEO, includePartial) ||
@@ -466,6 +470,12 @@ object PlayerRepository {
     /** 加载失败后再次重试的最小间隔。 */
     private const val LOAD_RETRY_COOLDOWN_MS = 30_000L
 
+    /** 单次落盘的最大尝试次数（首次 + 一次重试）。 */
+    private const val PERSIST_MAX_ATTEMPTS = 2
+
+    /** 落盘重试前的等待时长。 */
+    private const val PERSIST_RETRY_DELAY_MS = 200L
+
     /** 内存中的权威播放列表。 */
     @Volatile
     private var playlistState: List<MediaItemData> = emptyList()
@@ -538,25 +548,27 @@ object PlayerRepository {
         removes: Set<String> = emptySet(),
         onPersisted: (Boolean) -> Unit = {}
     ) {
-        if (writes.isEmpty() && removes.isEmpty()) {
+        // 0 值不覆盖已有进度：内存与数据库共用同一次过滤，规则只写一遍
+        val validWrites = writes.filterValues { it > 0 }
+        if (validWrites.isEmpty() && removes.isEmpty()) {
             onPersisted(true)
             return
         }
-        val writesSnapshot = writes.toMap()
         val removesSnapshot = removes.toSet()
         dispatchWrite(
             memPart = {
-                progressState = mergeProgressMap(progressState, writesSnapshot, removesSnapshot)
+                progressState = mergeProgressMap(progressState, validWrites, removesSnapshot)
             },
             dbPart = {
                 // 单条 SQL 的绑定参数有上限，批量删除按块提交
                 for (chunk in removesSnapshot.chunked(PROGRESS_DELETE_CHUNK)) {
                     progressDao().deleteAll(chunk.toSet())
                 }
-
-                val rows = writesSnapshot.filterValues { it > 0 }
-                    .map { ProgressEntity(it.key, it.value) }
-                if (rows.isNotEmpty()) progressDao().upsertAll(rows)
+                if (validWrites.isNotEmpty()) {
+                    progressDao().upsertAll(
+                        validWrites.map { ProgressEntity(it.key, it.value) }
+                    )
+                }
             },
             onComplete = onPersisted
         )
@@ -609,9 +621,7 @@ object PlayerRepository {
     /** 播放出错（文件不存在）时登记一次缺失，首次记录时间为当前时间。 */
     fun recordMissing(uri: String) {
         if (missingState.containsKey(uri)) return
-        val newState = missingState + (uri to MissingInfo(nowWallClockMs(), 0))
-        missingState = newState
-        persistMissing(newState)
+        persistMissing(missingState + (uri to MissingInfo(nowWallClockMs(), 0)))
     }
 
     /**
@@ -643,15 +653,19 @@ object PlayerRepository {
                 MissingInfo(prev.firstMissingMs, prev.missCount + 1)
             }
         }
-        missingState = newState
         persistMissing(newState)
     }
 
+    /**
+     * 缺失记录写入：内存先行同步更新（[recordMissing] / [updateMissingRecords] 的读取依赖它立即可见），
+     * 数据库落盘走统一入口；内存变更受 [stateLock] 保护。
+     */
     private fun persistMissing(state: Map<String, MissingInfo>) {
-        dispatchWrite(
-            memPart = {},
-            dbPart = { kvDao().put(KvEntity(KEY_MISSING_URIS, encodeMissingJson(state))) }
-        )
+        val snapshot = state.toMap()
+        synchronized(stateLock) { missingState = snapshot }
+        dispatchDbWrite {
+            kvDao().put(KvEntity(KEY_MISSING_URIS, encodeMissingJson(snapshot)))
+        }
     }
 
     private fun nowWallClockMs(): Long = System.currentTimeMillis()
@@ -697,6 +711,10 @@ object PlayerRepository {
         }
     }
 
+    /** 仅落库的写入：内存状态已由调用方先行更新（如缺失记录）。 */
+    private fun dispatchDbWrite(dbPart: suspend PlayerDatabase.() -> Unit) =
+        dispatchWrite(memPart = {}, dbPart = dbPart)
+
     /** 加载失败后按冷却时间重启加载；返回是否已成功加载。 */
     private suspend fun reloadAfterFailure(): Boolean {
         val job = synchronized(loadLock) {
@@ -726,9 +744,9 @@ object PlayerRepository {
 
     private fun nowMs(): Long = System.nanoTime() / 1_000_000
 
-    /** 在写锁与事务中执行一次落盘，最多重试 3 次；最终失败会广播 [writeFailures]。 */
+    /** 在写锁与事务中执行一次落盘；失败重试一次，最终失败会广播 [writeFailures]。 */
     private suspend fun persist(block: suspend PlayerDatabase.() -> Unit): Boolean {
-        repeat(3) { attempt ->
+        repeat(PERSIST_MAX_ATTEMPTS) { attempt ->
             val database = db
             try {
                 if (database == null) error("数据库尚未初始化")
@@ -737,13 +755,12 @@ object PlayerRepository {
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                if (attempt < 2) {
-                    delay(200.milliseconds)
-                } else {
-                    Log.e(TAG, "数据库写入三次失败，本次变更未落盘", e)
+                if (attempt == PERSIST_MAX_ATTEMPTS - 1) {
+                    Log.e(TAG, "数据库写入 $PERSIST_MAX_ATTEMPTS 次失败，本次变更未落盘", e)
                     writeFailureChannel.trySend(Unit)
                     return false
                 }
+                delay(PERSIST_RETRY_DELAY_MS.milliseconds)
             }
         }
         return false
@@ -756,13 +773,19 @@ object PlayerRepository {
             .addMigrations(PlayerDatabase.MIGRATION_1_2)
             .build()
         db = database
-        playlistState = database.playlistDao().getAll().map {
+        val playlist = database.playlistDao().getAll().map {
             MediaItemData(it.uri.toUri(), it.name, it.duration, it.folder)
         }
-        progressState = database.progressDao().getAll().associate { it.uri to it.positionMs }
-        lastItemState = database.kvDao().get(KEY_LAST_ITEM)
-        missingState = parseMissingJson(database.kvDao().get(KEY_MISSING_URIS))
+        val progress = database.progressDao().getAll().associate { it.uri to it.positionMs }
+        val lastItem = database.kvDao().get(KEY_LAST_ITEM)
+        val missing = parseMissingJson(database.kvDao().get(KEY_MISSING_URIS))
 
+        synchronized(stateLock) {
+            playlistState = playlist
+            progressState = progress
+            lastItemState = lastItem
+            missingState = missing
+        }
         loadSucceeded = true
     }
 }

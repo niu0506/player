@@ -131,9 +131,7 @@ class MainActivity : AppCompatActivity() {
     /** 仅在「正在播放视频」时保持屏幕常亮；纯音频不阻止系统息屏。 */
     private fun updateKeepScreenOn() {
         val ctrl = controller
-        val video = ctrl?.videoSize
-        binding.playerView.keepScreenOn =
-            ctrl?.isPlaying == true && video != null && video.width > 0 && video.height > 0
+        binding.playerView.keepScreenOn = ctrl?.isPlaying == true && ctrl.videoSize.hasVideo()
     }
 
     /** 把当前播放项 / 播放状态同步到列表高亮。 */
@@ -239,12 +237,8 @@ class MainActivity : AppCompatActivity() {
 
         override fun onVideoSizeChanged(videoSize: VideoSize) {
             updateKeepScreenOn()
-            // 依据是否有视频刷新系统 PiP 参数（自动进入的开关与小窗动画锚点）
+            // 依据是否有视频刷新系统 PiP 参数（比例、自动进入开关与动画锚点）
             fullscreenPip.refreshPipParams()
-            // 回调在全部版本都会触发；PiP 比例仅在 API 26+ 生效，故此处显式判版本而非标注 @RequiresApi
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && fullscreenPip.isInPipMode) {
-                fullscreenPip.updatePipAspectRatio(videoSize)
-            }
         }
     }
 
@@ -519,11 +513,9 @@ class MainActivity : AppCompatActivity() {
         } else null
         val videoPrefix = MediaStore.Video.Media.EXTERNAL_CONTENT_URI.toString()
         val audioPrefix = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI.toString()
-        var removed = 0
 
         val missingNow = mutableSetOf<String>()
         val observedNow = mutableSetOf<String>()
-        val removedNow = mutableSetOf<String>()
         val removedUris = mutableSetOf<String>()
         val survivors = ArrayList<MediaItemData>(playlist.size)
         val now = System.currentTimeMillis()
@@ -546,15 +538,13 @@ class MainActivity : AppCompatActivity() {
             }
             missingNow.add(uriStr)
             val prev = PlayerRepository.getMissingInfo(uriStr)
-            val missingBefore = prev != null && prev.missCount >= 1
-            val oldEnough = prev != null &&
+            // 兜底判定：上一轮已缺失（count>=1）且超过宽限期，才允许在精确查询无法确认时删除
+            val graceExpired = prev != null && prev.missCount >= 1 &&
                 now - prev.firstMissingMs >= PlayerRepository.MISSING_DELETE_GRACE_MS
             // 权威扫描未见该条时再做一次单条精确查询：确认媒体库中已无此行即立即清理，
             // 让外部删除的文件即时消失；查询失败/仍有行则退回多次缺失 + 宽限期兜底。
-            if ((missingBefore && oldEnough) || isConfirmedDeleted(item.uri)) {
+            if (graceExpired || isConfirmedDeleted(item.uri)) {
                 removedUris.add(uriStr)
-                removedNow.add(uriStr)
-                removed++
             } else {
                 survivors.add(item)
             }
@@ -565,11 +555,11 @@ class MainActivity : AppCompatActivity() {
             // 进度一次批量删除；播放队列由本轮扫描末尾的 rebuildQueueIfNeeded 统一重建
             PlayerService.dropProgress(removedUris)
         }
-        PlayerRepository.updateMissingRecords(missingNow, observedNow, removedNow)
-        if (removed > 0) {
+        PlayerRepository.updateMissingRecords(missingNow, observedNow, removedUris)
+        if (removedUris.isNotEmpty()) {
             syncAdapterPlayingState()
         }
-        return removed
+        return removedUris.size
     }
 
     /**
@@ -606,7 +596,8 @@ class MainActivity : AppCompatActivity() {
                 if (isFileGone && event.uri != null) {
                     PlayerRepository.recordMissing(event.uri)
                 }
-                val name = event.uri?.let { playlist.getOrNull(indexOfUri(it)) }?.name ?: "未知文件"
+                val name = event.uri?.let { playlist.getOrNull(indexOfUri(it)) }?.name
+                    ?: getString(R.string.unknown_file)
                 val message = when {
                     event.exhausted -> getString(R.string.toast_playback_error_all_failed)
                     isFileGone -> getString(
@@ -640,11 +631,13 @@ class MainActivity : AppCompatActivity() {
                 }
             },
             onDelete = { uri ->
-                val item = playlist.getOrNull(indexOfUri(uri)) ?: return@MediaListAdapter
+                val index = indexOfUri(uri)
+                val item = playlist.getOrNull(index) ?: return@MediaListAdapter
                 AlertDialog.Builder(this)
                     .setTitle(R.string.delete_dialog_title)
                     .setMessage(getString(R.string.delete_dialog_message, item.name))
                     .setPositiveButton(R.string.delete) { _, _ ->
+                        // 弹窗期间列表可能已变化，按 uri 重新定位一次
                         indexOfUri(uri).takeIf { it >= 0 }?.let { removeItemFromPlaylist(it) }
                     }
                     .setNegativeButton(R.string.cancel, null)

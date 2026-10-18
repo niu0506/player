@@ -13,6 +13,9 @@ import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 
+/** SHA-256("abc")：更新校验相关测试共用的已知向量。 */
+private const val SHA256_ABC = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+
 /** 时长格式化：分秒 / 时分秒、毫秒截断等。 */
 class FormatTimeTest {
 
@@ -159,6 +162,13 @@ class MediaListAdapterCurrentPlayingTest {
         attachObserver(adapter, observer)
     }
 
+    /**
+     * 把观察者挂到 adapter 上。
+     *
+     * 不能用 `registerAdapterDataObserver`：它最终写入框架类 `android.database.Observable.mObservers`，
+     * 而单元测试运行在桩化的 android.jar 上（`isReturnDefaultValues = true`），框架构造器为空，
+     * `mObservers` 恒为 null，notify 时直接 NPE。这里显式初始化该字段再挂上观察者。
+     */
     @Suppress("UNCHECKED_CAST")
     private fun attachObserver(adapter: MediaListAdapter, observer: RecordingObserver) {
         val observableField = RecyclerView.Adapter::class.java.getDeclaredField("mObservable")
@@ -180,19 +190,6 @@ class MediaListAdapterCurrentPlayingTest {
         (observersField.get(observable) as ArrayList<Any>).add(observer)
     }
 
-    @Suppress("UNCHECKED_CAST")
-    private fun items(): MutableList<Any> {
-        val field = MediaListAdapter::class.java.getDeclaredField("items")
-        field.isAccessible = true
-        return field.get(adapter) as MutableList<Any>
-    }
-
-    private fun currentPlayingUri(): String? {
-        val field = MediaListAdapter::class.java.getDeclaredField("currentPlayingUri")
-        field.isAccessible = true
-        return field.get(adapter) as String?
-    }
-
     @Test
     fun `uri beyond empty items notifies nothing`() {
         adapter.setCurrentPlaying("u0", true)
@@ -209,7 +206,7 @@ class MediaListAdapterCurrentPlayingTest {
 
     @Test
     fun `known uri and old uri both notify`() {
-        repeat(3) { items().add(item("u$it")) }
+        repeat(3) { adapter.items.add(item("u$it")) }
         adapter.setCurrentPlaying("u1")
         assertEquals(listOf(1), observer.changedPositions)
 
@@ -219,23 +216,22 @@ class MediaListAdapterCurrentPlayingTest {
 
     @Test
     fun `state is recorded even when uri is not in items yet`() {
-
         adapter.setCurrentPlaying("u5", true)
-        assertEquals("u5", currentPlayingUri())
+        assertEquals("u5", adapter.currentPlayingUri)
         assertTrue(observer.changedPositions.isEmpty())
 
-        repeat(6) { items().add(item("u$it")) }
+        repeat(6) { adapter.items.add(item("u$it")) }
         adapter.setCurrentPlaying("u2", true)
         assertEquals(listOf(5, 2), observer.changedPositions)
     }
 
     @Test
     fun `stale old uri is suppressed after list shrinks`() {
-        repeat(2) { items().add(item("u$it")) }
+        repeat(2) { adapter.items.add(item("u$it")) }
         adapter.setCurrentPlaying("u1")
         assertEquals(listOf(1), observer.changedPositions)
 
-        items().clear()
+        adapter.items.clear()
         observer.changedPositions.clear()
 
         adapter.setCurrentPlaying("u0")
@@ -244,7 +240,7 @@ class MediaListAdapterCurrentPlayingTest {
 
     @Test
     fun `same uri and unchanged playing state notifies nothing`() {
-        repeat(3) { items().add(item("u$it")) }
+        repeat(3) { adapter.items.add(item("u$it")) }
         adapter.setCurrentPlaying("u1", true)
         observer.changedPositions.clear()
 
@@ -254,7 +250,7 @@ class MediaListAdapterCurrentPlayingTest {
 
     @Test
     fun `same uri with playing toggle notifies the row once`() {
-        repeat(3) { items().add(item("u$it")) }
+        repeat(3) { adapter.items.add(item("u$it")) }
         adapter.setCurrentPlaying("u1", false)
         observer.changedPositions.clear()
 
@@ -312,7 +308,7 @@ class MissingRecordsTest {
 /** SHA-256 解析与十六进制编码。 */
 class UpdateIntegrityTest {
 
-    private val hex64 = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    private val hex64 = SHA256_ABC
 
     @Test
     fun `null blank and garbage digests return null`() {
@@ -360,7 +356,7 @@ class UpdateIntegrityTest {
 /** 安装包校验结论：缺失 / 匹配 / 不匹配。 */
 class ApkValidationTest {
 
-    private val hex64 = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    private val hex64 = SHA256_ABC
 
     @Test
     fun `missing expected checksum is rejected`() {

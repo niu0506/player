@@ -148,6 +148,14 @@ internal fun toHex(bytes: ByteArray): String {
 
 private const val HEX_DIGITS = "0123456789abcdef"
 
+/** 执行一段「失败即忽略」的清理动作（删除旧包 / 注销广播等收尾操作）。 */
+private inline fun ignoreFailure(block: () -> Unit) {
+    try {
+        block()
+    } catch (_: Exception) {
+    }
+}
+
 /** 安装包校验结论。 */
 internal enum class ApkValidation {
     OK,
@@ -183,15 +191,15 @@ internal fun isDownloadedVersionInstalled(downloaded: String, installed: String?
 class UpdateManager(private val activity: AppCompatActivity) {
 
     companion object {
-        const val APK_MIME = "application/vnd.android.package-archive"
         private const val TAG = "UpdateManager"
         private const val DOWNLOAD_PREFS = "update_download"
         private const val KEY_DOWNLOAD_ID = "downloadId"
         private const val KEY_DOWNLOAD_VERSION = "downloadVersion"
         private const val KEY_DOWNLOAD_SHA256 = "downloadSha256"
 
-        const val APK_NAME_PREFIX = "player-v"
-        const val APK_NAME_SUFFIX = "-release.apk"
+        private const val APK_MIME = "application/vnd.android.package-archive"
+        private const val APK_NAME_PREFIX = "player-v"
+        private const val APK_NAME_SUFFIX = "-release.apk"
 
         /**
          * 应用替换（升级）成功后清理残留的更新包：公共「下载」目录（MediaStore）
@@ -199,13 +207,12 @@ class UpdateManager(private val activity: AppCompatActivity) {
          */
         fun cleanupUpdateApks(context: Context) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                try {
+                ignoreFailure {
                     context.contentResolver.delete(
                         MediaStore.Downloads.EXTERNAL_CONTENT_URI,
                         "${MediaStore.MediaColumns.DISPLAY_NAME} LIKE ?",
                         arrayOf("$APK_NAME_PREFIX%$APK_NAME_SUFFIX")
                     )
-                } catch (_: Exception) {
                 }
             }
             context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
@@ -232,10 +239,8 @@ class UpdateManager(private val activity: AppCompatActivity) {
     /** 当前下载对应的期望 SHA-256。 */
     private var pendingDownloadSha256: String? = null
 
-    /** 下载流程阶段：同时防止重复入队与重复处理完成回调。 */
-    private var downloadState = DownloadState.IDLE
-
-    private enum class DownloadState { IDLE, STARTING, COMPLETING }
+    /** 下载流程忙标志：同时防止重复入队与重复处理完成回调。 */
+    private var downloadBusy = false
 
     /** 因界面非前台而暂存的更新提示。 */
     private var pendingUpdate: UpdateChecker.Release? = null
@@ -274,8 +279,8 @@ class UpdateManager(private val activity: AppCompatActivity) {
         when (withContext(Dispatchers.IO) { queryDownloadStatus(id) }) {
             DownloadManager.STATUS_FAILED -> failDownload(context)
             DownloadManager.STATUS_SUCCESSFUL -> {
-                if (downloadState == DownloadState.COMPLETING) return
-                downloadState = DownloadState.COMPLETING
+                if (downloadBusy) return
+                downloadBusy = true
                 try {
                     when (withContext(Dispatchers.IO) { validateDownloadedApk(id) }) {
                         ApkValidation.OK -> {
@@ -286,7 +291,7 @@ class UpdateManager(private val activity: AppCompatActivity) {
                         ApkValidation.INVALID -> failDownload(context)
                     }
                 } finally {
-                    downloadState = DownloadState.IDLE
+                    downloadBusy = false
                 }
             }
             else -> Unit
@@ -308,10 +313,7 @@ class UpdateManager(private val activity: AppCompatActivity) {
     }
 
     fun unregisterReceivers() {
-        try {
-            activity.unregisterReceiver(downloadCompleteReceiver)
-        } catch (_: Exception) {
-        }
+        ignoreFailure { activity.unregisterReceiver(downloadCompleteReceiver) }
     }
 
     /** onStart 调用：恢复上次未完成的下载并处理其结果。 */
@@ -352,7 +354,7 @@ class UpdateManager(private val activity: AppCompatActivity) {
                     !UpdateChecker.isNewer(release.version, current) -> if (manual) {
                         activity.toast(R.string.update_up_to_date, current)
                     }
-                    else -> showUpdateDialog(release)
+                    else -> postUpdateDialog(release)
                 }
             }
         }
@@ -378,10 +380,7 @@ class UpdateManager(private val activity: AppCompatActivity) {
     fun resumePendingUpdateDialog() {
         val release = pendingUpdate ?: return
         pendingUpdate = null
-        // 注意：onResume() 执行期间 lifecycle 仍是 STARTED（RESUMED 要等 onResume 返回后才分发），
-        // 直接走 showUpdateDialog() 会被 canShowDialog() 拦下并再次暂存，导致补弹永远不触发。
-        // 挂到 decorView 消息队列，等 resume 真正完成后再创建弹窗。
-        activity.window.decorView.post { presentUpdateDialog(release) }
+        postUpdateDialog(release)
     }
 
     /** 界面可安全弹窗：未销毁且已处于前台。 */
@@ -389,19 +388,18 @@ class UpdateManager(private val activity: AppCompatActivity) {
         !activity.isFinishing && !activity.isDestroyed &&
             activity.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)
 
-    /** 显示更新弹窗；界面未处于前台则暂存，待 onResume 补弹。弹窗失败不应导致应用崩溃。 */
-    private fun showUpdateDialog(release: UpdateChecker.Release) {
-        if (!canShowDialog()) {
-            pendingUpdate = release
-            return
-        }
-        // 检查是异步返回的，弹窗可能在当前输入事件 / 界面遍历尚未结束时就被创建，
-        // 从而刚显示即被系统移除（表现为「一闪即逝」）。延后到下一轮主线程消息再弹，
-        // 让当前批次的事件与布局先处理完；重建后重新校验界面状态。
+    /**
+     * 把「创建更新弹窗」推迟到主线程下一轮消息，必须延后而不是立即创建：
+     * - 检查是异步返回的，弹窗可能在当前输入事件 / 界面遍历尚未结束时就被创建，
+     *   从而刚显示即被系统移除（表现为「一闪即逝」）；
+     * - `onResume()` 执行期间 lifecycle 仍是 STARTED（RESUMED 要等 onResume 返回后才分发），
+     *   立即创建会被 [canShowDialog] 拦下并再次暂存，导致补弹永远不触发。
+     */
+    private fun postUpdateDialog(release: UpdateChecker.Release) {
         activity.window.decorView.post { presentUpdateDialog(release) }
     }
 
-    /** 在主线程下一轮消息中创建并弹出更新提示；重复调用不会叠加弹窗。 */
+    /** 在主线程下一轮消息中创建并弹出更新提示；不在前台则暂存，重复调用不会叠加弹窗。 */
     private fun presentUpdateDialog(release: UpdateChecker.Release) {
         if (!canShowDialog()) {
             pendingUpdate = release
@@ -433,11 +431,11 @@ class UpdateManager(private val activity: AppCompatActivity) {
 
     /** 开始下载：记录版本 / 校验和，写入公共「下载」目录。 */
     private fun downloadApk(release: UpdateChecker.Release) {
-        if (downloadState != DownloadState.IDLE) {
+        if (downloadBusy) {
             activity.toast(R.string.update_download_in_progress)
             return
         }
-        downloadState = DownloadState.STARTING
+        downloadBusy = true
         activity.lifecycleScope.launch {
             try {
                 if (withContext(Dispatchers.IO) { hasActiveDownload() }) {
@@ -452,8 +450,7 @@ class UpdateManager(private val activity: AppCompatActivity) {
                 Log.w(TAG, "发起更新下载失败", e)
                 failDownload()
             } finally {
-                // 完成回调可能已把状态推进到 COMPLETING，此时不要回退
-                if (downloadState == DownloadState.STARTING) downloadState = DownloadState.IDLE
+                downloadBusy = false
             }
         }
     }
@@ -468,22 +465,20 @@ class UpdateManager(private val activity: AppCompatActivity) {
      */
     private fun deleteExistingDownloadFile(fileName: String) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            try {
+            ignoreFailure {
                 activity.contentResolver.delete(
                     MediaStore.Downloads.EXTERNAL_CONTENT_URI,
                     "${MediaStore.MediaColumns.DISPLAY_NAME} = ?",
                     arrayOf(fileName)
                 )
-            } catch (_: Exception) {
             }
         } else {
-            try {
+            ignoreFailure {
                 @Suppress("DEPRECATION")
                 File(
                     Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
                     fileName
                 ).delete()
-            } catch (_: Exception) {
             }
         }
     }

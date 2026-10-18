@@ -34,6 +34,7 @@
 
     <!-- 提示信息 -->
     <string name="toast_deleted">已删除</string>
+    <string name="unknown_file">未知文件</string>
     <string name="toast_permission_granted">权限已授予，请点击扫描</string>
     <string name="toast_scan_failed">扫描失败，请稍后重试</string>
     

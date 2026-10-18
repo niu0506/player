@@ -32,6 +32,10 @@ class PlayerService : MediaSessionService() {
 
     private var mediaSession: MediaSession? = null
 
+    /** 会话托管的播放器；未创建或已销毁时为 null。 */
+    private val player: Player?
+        get() = mediaSession?.player
+
     private val mainHandler = Handler(Looper.getMainLooper())
 
     private var destroyed = false
@@ -80,7 +84,7 @@ class PlayerService : MediaSessionService() {
 
         override fun onPlaybackStateChanged(playbackState: Int) {
             if (playbackState != Player.STATE_ENDED) return
-            val player = mediaSession?.player ?: return
+            val player = this@PlayerService.player ?: return
             // 顺序播放到末尾后主动暂停，避免停在 ENDED 状态
             if (player.repeatMode == Player.REPEAT_MODE_OFF) player.pause()
         }
@@ -90,19 +94,19 @@ class PlayerService : MediaSessionService() {
             newPosition: Player.PositionInfo,
             reason: Int
         ) {
-            if (reason != Player.DISCONTINUITY_REASON_SEEK &&
-                oldPosition.mediaItemIndex == newPosition.mediaItemIndex
-            ) return
-            // 跨条目 seek 时先记录旧位置，再统一落盘
-            if (reason == Player.DISCONTINUITY_REASON_SEEK && oldPosition.mediaItemIndex != newPosition.mediaItemIndex) {
+            val sameItem = oldPosition.mediaItemIndex == newPosition.mediaItemIndex
+            if (reason == Player.DISCONTINUITY_REASON_SEEK && !sameItem) {
+                // 跨条目 seek：先补记旧条目的位置，再统一落盘
                 cacheOldPosition(oldPosition)
+            } else if (reason != Player.DISCONTINUITY_REASON_SEEK && sameItem) {
+                return
             }
             persistProgress()
         }
 
         override fun onPlayerError(error: PlaybackException) {
             Log.w(TAG, "播放出错: code=${error.errorCode}", error)
-            val player = mediaSession?.player ?: return
+            val player = this@PlayerService.player ?: return
             val errorUri = player.currentMediaItem?.localConfiguration?.uri?.toString()
 
             consecutiveErrorCount++
@@ -129,7 +133,7 @@ class PlayerService : MediaSessionService() {
     /** 周期落盘任务：播放中或仍有待删除项时，每次执行后重新排期。 */
     private val progressTicker = Runnable {
         tickerScheduled = false
-        if (mediaSession?.player?.isPlaying == true || removedUris.isNotEmpty()) {
+        if (player?.isPlaying == true || removedUris.isNotEmpty()) {
             persistProgress()
             scheduleProgressTicker()
         }
@@ -178,16 +182,17 @@ class PlayerService : MediaSessionService() {
 
     override fun onTaskRemoved(rootIntent: Intent?) {
         persistProgress()
-        val player = mediaSession?.player
         // 从最近任务划掉且未在播放时结束服务
+        val player = this.player
         if (player == null || !player.playWhenReady) {
             stopSelf()
         }
     }
 
-    /** 按裁决结果把变更写入进度缓存 / 删除集合。 */
-    private fun applyToProgressCache(decision: ProgressWriteDecision, uri: String) {
-        when (decision) {
+    /** 按裁决结果缓存某个条目的播放位置（当前项与已切走的旧项共用）。 */
+    private fun cachePosition(uri: String?, positionMs: Long, durationMs: Long) {
+        if (uri == null) return
+        when (val decision = decideProgressWrite(positionMs, durationMs)) {
             ProgressWriteDecision.Clear -> {
                 progressCache.remove(uri)
                 removedUris.add(uri)
@@ -199,25 +204,29 @@ class PlayerService : MediaSessionService() {
 
     /** 缓存当前播放位置。 */
     private fun cacheCurrentPosition(player: Player) {
-        val item = player.currentMediaItem ?: return
-        val uri = item.localConfiguration?.uri?.toString() ?: return
-        applyToProgressCache(decideProgressWrite(player.currentPosition, player.duration), uri)
+        cachePosition(
+            player.currentMediaItem?.localConfiguration?.uri?.toString(),
+            player.currentPosition,
+            player.duration
+        )
     }
 
     /** 缓存某个旧条目的位置（已切走后仍能补记其进度）。 */
     private fun cacheOldPosition(oldPosition: Player.PositionInfo) {
-        val player = mediaSession?.player ?: return
+        val player = this.player ?: return
         if (oldPosition.mediaItemIndex !in 0 until player.currentTimeline.windowCount) return
         val window = Timeline.Window()
         player.currentTimeline.getWindow(oldPosition.mediaItemIndex, window)
-        val uri = window.mediaItem.localConfiguration?.uri?.toString() ?: return
-
-        applyToProgressCache(decideProgressWrite(oldPosition.positionMs, window.durationMs), uri)
+        cachePosition(
+            window.mediaItem.localConfiguration?.uri?.toString(),
+            oldPosition.positionMs,
+            window.durationMs
+        )
     }
 
     /** 收集当前变更并落盘（无变化则直接返回，避免零空闲 IO）。 */
     private fun persistProgress() {
-        val player = mediaSession?.player ?: return
+        val player = this.player ?: return
         cacheCurrentPosition(player)
         val removals = removedUris.toSet()
         val writes = progressCache.filter { (uri, pos) -> lastPersistedSnapshot[uri] != pos }
@@ -295,15 +304,15 @@ class PlayerService : MediaSessionService() {
             instance?.consecutiveErrorCount = 0
         }
 
-        /** 批量删除进度：仓库一次写入，服务缓存一并清理（扫描清理已消失文件时用）。 */
+        /** 批量删除进度：仓库立即删一次，服务侧缓存与快照同步清理（扫描清理已消失文件时用）。 */
         fun dropProgress(uris: Collection<String>) {
             if (uris.isEmpty()) return
             val keys = uris.toSet()
             PlayerRepository.applyProgressUpdates(emptyMap(), keys)
             val svc = instance ?: return
+            // 连快照一并移除：否则下一轮落盘会按旧快照把同一次删除再提交一遍
             for (key in keys) svc.progressCache.remove(key)
-            svc.removedUris.addAll(keys)
-            svc.scheduleProgressTicker()
+            svc.lastPersistedSnapshot -= keys
         }
 
         /** 删除单条进度。 */

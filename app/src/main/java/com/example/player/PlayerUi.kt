@@ -46,8 +46,6 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlin.math.abs
@@ -68,6 +66,10 @@ internal fun Context.toastLong(@StringRes resId: Int, vararg args: Any?) {
 internal fun Context.toastMessage(message: CharSequence) {
     Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
 }
+
+/** 视频尺寸是否可用（宽高均已解析出来）；纯音频或尺寸未知时为 false。 */
+internal fun VideoSize?.hasVideo(): Boolean =
+    this != null && width > 0 && height > 0
 
 /**
  * 全屏与画中画（PiP）辅助类：统一管理视频表面样式、系统栏显隐与方向。
@@ -172,7 +174,7 @@ class FullscreenPipHelper(
     /** 仅在正在播放视频时自动进入 PiP（Home 键触发），失败不提示。 */
     fun enterPipWhenPlayingVideo(): Boolean {
         val ctrl = controllerProvider() ?: return false
-        return !(!ctrl.isPlaying || !hasVideo(ctrl.videoSize)) && enterPipMode(showError = false)
+        return !(!ctrl.isPlaying || !ctrl.videoSize.hasVideo()) && enterPipMode(showError = false)
     }
 
     /**
@@ -185,7 +187,7 @@ class FullscreenPipHelper(
             return false
         }
         val vs = controllerProvider()?.videoSize
-        if (vs == null || !hasVideo(vs)) {
+        if (vs == null || !vs.hasVideo()) {
             if (showError) activity.toast(R.string.toast_pip_no_video)
             return false
         }
@@ -202,9 +204,6 @@ class FullscreenPipHelper(
         if (showError) activity.toast(R.string.toast_pip_failed)
         return false
     }
-
-    private fun hasVideo(videoSize: VideoSize): Boolean =
-        videoSize.width > 0 && videoSize.height > 0
 
     /** 视频尺寸转系统比例；非法尺寸返回 null。 */
     private fun aspectRatioOf(videoSize: VideoSize): Rational? =
@@ -224,7 +223,7 @@ class FullscreenPipHelper(
         val ctrl = controllerProvider()
         val vs = ctrl?.videoSize
         // 与原手动行为一致：仅在「正在播放视频」时才允许系统自动进入小窗
-        val autoEnter = vs != null && hasVideo(vs) && ctrl.isPlaying
+        val autoEnter = vs.hasVideo() && ctrl?.isPlaying == true
         val ratio = vs?.let(::aspectRatioOf) ?: Rational(16, 9)
         try {
             activity.setPictureInPictureParams(
@@ -261,17 +260,6 @@ class FullscreenPipHelper(
         )
     }
 
-    /** 视频尺寸变化时更新 PiP 小窗比例（仅 PiP 中生效）。 */
-    @RequiresApi(Build.VERSION_CODES.O)
-    fun updatePipAspectRatio(videoSize: VideoSize) {
-        if (!isInPipMode || !hasVideo(videoSize)) return
-        val ratio = aspectRatioOf(videoSize) ?: return
-        try {
-            activity.setPictureInPictureParams(buildPipParams(ratio, autoEnter = true))
-        } catch (_: Exception) {
-        }
-    }
-
     /** Activity onStop：若仍在 PiP 则暂停并退出 PiP 标记。 */
     fun onStopped() {
         if (isInPipMode) {
@@ -301,16 +289,12 @@ class GestureController(
     private val controllerProvider: () -> MediaController?
 ) {
     private companion object {
-        const val GESTURE_NONE = 0
-        const val GESTURE_SEEK = 1
-        const val GESTURE_BRIGHTNESS = 2
-        const val GESTURE_VOLUME = 3
-
-        /** 时长未知等无法处理的滑动：本轮手势忽略。 */
-        const val GESTURE_IGNORED = 4
         const val BRIGHTNESS_PREFS = "gesture_settings"
         const val KEY_BRIGHTNESS = "manual_brightness"
     }
+
+    /** 本轮手势的类型；[Gesture.IGNORED] 表示时长未知等无法处理的滑动，本轮忽略。 */
+    private enum class Gesture { NONE, SEEK, BRIGHTNESS, VOLUME, IGNORED }
 
     private val handler = Handler(Looper.getMainLooper())
 
@@ -320,7 +304,7 @@ class GestureController(
     }
     private val hideOverlayRunnable = Runnable { overlay.visibility = View.GONE }
 
-    private var gestureMode = GESTURE_NONE
+    private var gestureMode = Gesture.NONE
     private var seekStartPosition = 0L
     private var seekTargetPosition = 0L
     private var brightnessStart = 0f
@@ -374,27 +358,27 @@ class GestureController(
                 val ctrl = controllerProvider() ?: return false
 
                 // 首次滑动：按主轴方向与起点位置判定本次手势类型
-                if (gestureMode == GESTURE_NONE) {
+                if (gestureMode == Gesture.NONE) {
                     if (playerView.isControllerFullyVisible) {
                         playerView.hideController()
                     }
                     gestureMode = if (abs(e2.x - start.x) > abs(e2.y - start.y)) {
                         seekStartPosition = ctrl.currentPosition
                         seekTargetPosition = seekStartPosition
-                        GESTURE_SEEK
+                        Gesture.SEEK
                     } else if (start.x < playerView.width / 2f) {
                         brightnessStart = currentBrightness()
-                        GESTURE_BRIGHTNESS
+                        Gesture.BRIGHTNESS
                     } else {
                         volumeStart = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
-                        GESTURE_VOLUME
+                        Gesture.VOLUME
                     }
                 }
                 when (gestureMode) {
-                    GESTURE_SEEK -> {
+                    Gesture.SEEK -> {
                         val duration = ctrl.duration
                         if (duration == C.TIME_UNSET || duration <= 0) {
-                            gestureMode = GESTURE_IGNORED
+                            gestureMode = Gesture.IGNORED
                             return true
                         }
                         // 每秒对应的像素：让整屏滑动约等于 1.2 倍时长
@@ -415,7 +399,7 @@ class GestureController(
                             )
                         )
                     }
-                    GESTURE_BRIGHTNESS -> {
+                    Gesture.BRIGHTNESS -> {
                         val delta = (start.y - e2.y) / playerView.height.coerceAtLeast(1)
                         applyBrightness(brightnessStart + delta, persist = false)
                         showGestureOverlay(
@@ -424,7 +408,7 @@ class GestureController(
                             )
                         )
                     }
-                    GESTURE_VOLUME -> {
+                    Gesture.VOLUME -> {
                         val maxVolume =
                             audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
                         val delta =
@@ -434,6 +418,7 @@ class GestureController(
                         val pct = if (maxVolume > 0) target * 100 / maxVolume else 0
                         showGestureOverlay(activity.getString(R.string.gesture_volume, pct))
                     }
+                    Gesture.NONE, Gesture.IGNORED -> Unit
                 }
                 return true
             }
@@ -460,10 +445,11 @@ class GestureController(
     /** 手势结束：seek 落到目标位置，亮度才持久化。 */
     private fun endGesture() {
         when (gestureMode) {
-            GESTURE_SEEK -> controllerProvider()?.seekTo(seekTargetPosition)
-            GESTURE_BRIGHTNESS -> applyBrightness(currentBrightness(), persist = true)
+            Gesture.SEEK -> controllerProvider()?.seekTo(seekTargetPosition)
+            Gesture.BRIGHTNESS -> applyBrightness(currentBrightness(), persist = true)
+            Gesture.NONE, Gesture.VOLUME, Gesture.IGNORED -> Unit
         }
-        gestureMode = GESTURE_NONE
+        gestureMode = Gesture.NONE
     }
 
     /** 当前亮度；系统未手动设置过（<0）时按 0.5 处理。 */
@@ -472,8 +458,8 @@ class GestureController(
         return if (b < 0f) 0.5f else b
     }
 
-    /** 应用屏幕亮度（限制在 2%~100%），可选持久化。 */
-    private fun applyBrightness(value: Float, persist: Boolean = true) {
+    /** 应用屏幕亮度（限制在 2%~100%）；persist 为 true 时写入偏好。 */
+    private fun applyBrightness(value: Float, persist: Boolean) {
         val lp = activity.window.attributes
         lp.screenBrightness = value.coerceIn(0.02f, 1f)
         activity.window.attributes = lp
@@ -508,11 +494,15 @@ class MediaListAdapter(
     /** 局部刷新 payload：仅更新进度，不重绑整个条目。 */
     private val progressPayload = Any()
 
-    private val items = mutableListOf<MediaItemData>()
+    /** 当前列表；internal 便于单元测试直接注入（生产代码只经 [submitList] 更新）。 */
+    internal val items = mutableListOf<MediaItemData>()
 
-    private var currentPlayingUri: String? = null
+    /** 当前播放项 uri；internal 便于单元测试断言。 */
+    internal var currentPlayingUri: String? = null
+        private set
+
     private var isPlaying = false
-    private var diffScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    private val diffScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
     private var diffJob: Job? = null
 
     /** 提交新列表：取消上一次差分任务，后台计算后回主线程分发更新。 */
@@ -632,19 +622,6 @@ class MediaListAdapter(
     }
 
     override fun getItemCount() = items.size
-
-    override fun onAttachedToRecyclerView(recyclerView: RecyclerView) {
-        super.onAttachedToRecyclerView(recyclerView)
-        // 重新挂载时重建差分作用域（之前可能已被取消）
-        if (!diffScope.isActive) {
-            diffScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
-        }
-    }
-
-    override fun onDetachedFromRecyclerView(recyclerView: RecyclerView) {
-        super.onDetachedFromRecyclerView(recyclerView)
-        diffScope.cancel()
-    }
 
     inner class VH(val binding: ItemMediaBinding) : RecyclerView.ViewHolder(binding.root) {
 
