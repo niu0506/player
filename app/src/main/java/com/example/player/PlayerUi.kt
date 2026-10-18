@@ -20,6 +20,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
+import android.text.format.DateFormat
 import android.util.Rational
 import android.view.GestureDetector
 import android.view.LayoutInflater
@@ -46,7 +47,6 @@ import androidx.recyclerview.widget.DiffUtil
 import androidx.recyclerview.widget.RecyclerView
 import com.example.player.databinding.ActivityMainBinding
 import com.example.player.databinding.ItemMediaBinding
-import java.text.DateFormat
 import java.util.Date
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
