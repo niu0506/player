@@ -24,8 +24,8 @@ android {
         minSdk = 24
         // targetSdk 35；compileSdk 36 由 media3 1.11 的传递依赖要求
         targetSdk = 35
-        versionCode = 48
-        versionName = "1.5.13"
+        versionCode = 49
+        versionName = "1.5.14"
     }
 
     signingConfigs {
