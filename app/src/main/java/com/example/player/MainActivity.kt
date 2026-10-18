@@ -4,7 +4,7 @@
  * 包含：
  * - [PlayerApp]：应用启动时触发仓库加载；
  * - [MainActivity]：维护播放列表 UI、连接 [PlayerService] 的 MediaController、
- *   扫描媒体库并与已存列表对账（含已删除文件的宽限期清理）、断点续播与更新流程编排。
+ *   扫描媒体库并与已存列表对账（含已删除文件的清理）、断点续播与更新流程编排。
  *
  * 界面逻辑拆分为 [GestureController]、[FullscreenPipHelper]、[MediaListAdapter]（见 PlayerUi.kt）。
  */
@@ -14,11 +14,13 @@ import android.app.Application
 import android.content.ComponentName
 import android.content.res.Configuration
 import android.database.ContentObserver
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.provider.BaseColumns
 import android.provider.MediaStore
 import android.view.View
 import android.widget.TextView
@@ -497,8 +499,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 清理扫描中已不存在的条目：需连续两轮未见且超过宽限期才真正删除，
-     * 避免部分授权（Android 14+）或瞬时不可用导致误删。返回删除数量。
+     * 清理扫描中已不存在的条目：拥有对应类型完整权限时，对权威扫描未列出的条目做一次
+     * 单条精确查询确认，确认已被外部删除即刻清理；无法确认（查询失败）时退回
+     * 「连续两轮未见且超过宽限期」的保守判定，避免部分授权或瞬时不可用导致误删。返回删除数量。
      */
     private fun pruneDeletedMedia(
         scannedVideos: List<MediaItemData>?,
@@ -546,7 +549,9 @@ class MainActivity : AppCompatActivity() {
             val missingBefore = prev != null && prev.missCount >= 1
             val oldEnough = prev != null &&
                 now - prev.firstMissingMs >= PlayerRepository.MISSING_DELETE_GRACE_MS
-            if (missingBefore && oldEnough) {
+            // 权威扫描未见该条时再做一次单条精确查询：确认媒体库中已无此行即立即清理，
+            // 让外部删除的文件即时消失；查询失败/仍有行则退回多次缺失 + 宽限期兜底。
+            if ((missingBefore && oldEnough) || isConfirmedDeleted(item.uri)) {
                 removedUris.add(uriStr)
                 removedNow.add(uriStr)
                 removed++
@@ -565,6 +570,17 @@ class MainActivity : AppCompatActivity() {
             syncAdapterPlayingState()
         }
         return removed
+    }
+
+    /**
+     * 对单条媒体 URI 做一次精确查询：查不到任何行即确认该文件已从媒体库删除。
+     * 查询返回 null（媒体库暂不可用）或抛异常时返回 false，交回保守判定，避免误删。
+     */
+    private fun isConfirmedDeleted(uri: Uri): Boolean = try {
+        contentResolver.query(uri, arrayOf(BaseColumns._ID), null, null, null)
+            ?.use { !it.moveToFirst() } ?: false
+    } catch (_: Exception) {
+        false
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
