@@ -13,8 +13,8 @@
     <dimen name="player_control_icon_padding">10dp</dimen>
     <dimen name="player_control_small_icon_padding">12dp</dimen>
     <dimen name="player_control_time_text_size">14sp</dimen>
-    <dimen name="player_control_seek_text_size">9sp</dimen>
-    <dimen name="player_control_seek_padding_bottom">4dp</dimen>
+    <!-- 全屏顶部信息条左侧留白：避让控制栏左上角的返回键 -->
+    <dimen name="fullscreen_info_start_padding">52dp</dimen>
 
     <color name="player_control_overlay">#99000000</color>
     <color name="player_control_bar">#CC000000</color>
@@ -78,25 +78,6 @@
     </style>
     <style name="PlayerControls.Button.PlayPause" parent="PlayerControls.Button.Center">
         <item name="android:src">@drawable/player_control_play</item>
-    </style>
-    <style name="PlayerControls.Button.Seek" parent="Widget.Material3.Button.TextButton">
-        <item name="android:layout_width">@dimen/player_control_icon_size</item>
-        <item name="android:layout_height">@dimen/player_control_icon_size</item>
-        <item name="android:background">@drawable/player_control_rewind</item>
-        <item name="android:foreground">?android:attr/selectableItemBackgroundBorderless</item>
-        <item name="android:gravity">center|bottom</item>
-        <item name="android:paddingLeft">0dp</item>
-        <item name="android:paddingRight">0dp</item>
-        <item name="android:paddingBottom">@dimen/player_control_seek_padding_bottom</item>
-        <item name="android:textStyle">bold</item>
-        <item name="android:textSize">@dimen/player_control_seek_text_size</item>
-        <item name="android:textColor">@color/player_control_text</item>
-        <item name="android:insetBottom">0dp</item>
-        <item name="android:contentDescription">@string/player_control_seek</item>
-    </style>
-    <style name="PlayerControls.Button.FastForward" parent="PlayerControls.Button.Seek">
-        <item name="android:background">@drawable/player_control_fastforward</item>
-        <item name="android:contentDescription">@string/player_control_fast_forward</item>
     </style>
     <style name="PlayerControls.TimeText">
         <item name="android:layout_width">wrap_content</item>

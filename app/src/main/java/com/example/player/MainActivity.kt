@@ -214,6 +214,8 @@ class MainActivity : AppCompatActivity() {
         override fun onMediaItemTransition(mediaItem: M3MediaItem?, reason: Int) {
 
             syncAdapterPlayingState()
+            // 全屏顶部信息条里的文件名跟随当前条目变化
+            fullscreenPip.refreshInfoBarContent()
 
             // 单曲循环回绕不恢复断点，其余切歌按需续播
             if (reason != Player.MEDIA_ITEM_TRANSITION_REASON_REPEAT) {
@@ -831,6 +833,8 @@ class MainActivity : AppCompatActivity() {
 
     override fun onStart() {
         super.onStart()
+        // 全屏状态可能跨后台保留：恢复顶部信息显示与刷新
+        fullscreenPip.onStarted()
         updateManager.registerReceivers()
         updateManager.resumePendingDownload()
         // 监听视频 / 音频媒体库变化

@@ -122,7 +122,7 @@
 
   </LinearLayout>
 
-  <!-- 居中控制：上一项 / 快退 / 播放暂停 / 快进 / 下一项 -->
+  <!-- 居中控制：上一项 / 播放暂停 / 下一项（快进快退 15s 改由双击手势完成，不再显示按钮） -->
   <LinearLayout
       android:id="@id/exo_center_controls"
       android:layout_width="wrap_content"
@@ -137,17 +137,9 @@
         style="@style/PlayerControls.Button.Previous"
         android:contentDescription="@string/player_control_previous"/>
 
-    <Button android:id="@id/exo_rew_with_amount"
-        android:singleLine="false"
-        style="@style/PlayerControls.Button.Seek"/>
-
     <ImageButton android:id="@id/exo_play_pause"
         style="@style/PlayerControls.Button.PlayPause"
         android:contentDescription="@string/player_control_play_pause"/>
-
-    <Button android:id="@id/exo_ffwd_with_amount"
-        android:singleLine="false"
-        style="@style/PlayerControls.Button.FastForward"/>
 
     <ImageButton android:id="@id/exo_next"
         style="@style/PlayerControls.Button.Next"

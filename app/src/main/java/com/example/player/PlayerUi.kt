@@ -10,9 +10,12 @@ import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.PictureInPictureParams
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ActivityInfo
 import android.graphics.Rect
 import android.media.AudioManager
+import android.os.BatteryManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -43,6 +46,8 @@ import androidx.recyclerview.widget.DiffUtil
 import androidx.recyclerview.widget.RecyclerView
 import com.example.player.databinding.ActivityMainBinding
 import com.example.player.databinding.ItemMediaBinding
+import java.text.DateFormat
+import java.util.Date
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -87,11 +92,26 @@ class FullscreenPipHelper(
     private val binding: ActivityMainBinding,
     private val controllerProvider: () -> MediaController?
 ) {
+    private companion object {
+        /** 全屏顶部时钟 / 电量的刷新间隔。 */
+        const val INFO_TICK_MS = 1000L
+    }
+
     var isFullscreen = false
         private set
 
     var isInPipMode = false
         private set
+
+    /** 全屏顶部信息（文件名 / 系统时间 / 电量）的定时刷新。 */
+    private val infoHandler = Handler(Looper.getMainLooper())
+    private var infoTickerRunning = false
+    private val infoTick = object : Runnable {
+        override fun run() {
+            refreshInfoBarContent()
+            infoHandler.postDelayed(this, INFO_TICK_MS)
+        }
+    }
 
     /** 系统 PiP 模式切换回调：退出 PiP 且非全屏时恢复系统栏。 */
     fun onPipModeChanged(isInPictureInPictureMode: Boolean) {
@@ -115,11 +135,58 @@ class FullscreenPipHelper(
             if (visible) View.VISIBLE else View.GONE
     }
 
+    /** 顶部信息条显隐：仅全屏可见；可见时启动刷新定时器，隐藏时停止。 */
+    private fun applyInfoBar(visible: Boolean) {
+        binding.fullscreenInfoBar.visibility = if (visible) View.VISIBLE else View.GONE
+        if (visible) {
+            refreshInfoBarContent()
+            if (!infoTickerRunning) {
+                infoTickerRunning = true
+                infoHandler.postDelayed(infoTick, INFO_TICK_MS)
+            }
+        } else if (infoTickerRunning) {
+            infoTickerRunning = false
+            infoHandler.removeCallbacks(infoTick)
+        }
+    }
+
+    /**
+     * 刷新顶部信息：文件名取当前媒体标题，时间取系统时钟，电量为百分比。
+     * 媒体切换或进入全屏时主动调用；全屏期间由定时器每秒刷新。
+     */
+    fun refreshInfoBarContent() {
+        binding.tvFullscreenName.text = currentItemTitle().orEmpty()
+        binding.tvFullscreenClock.text = DateFormat.getTimeFormat(activity).format(Date())
+        val percent = batteryPercent()
+        binding.tvFullscreenBattery.text = if (percent != null) {
+            activity.getString(R.string.fullscreen_battery_percent, percent)
+        } else {
+            ""
+        }
+    }
+
+    /** 当前媒体标题；无播放项或标题为空时返回 null。 */
+    private fun currentItemTitle(): String? {
+        val title = controllerProvider()?.currentMediaItem?.mediaMetadata?.title?.toString()
+        return title?.takeIf { it.isNotBlank() }
+    }
+
+    /** 读取当前电量百分比；读不到返回 null。 */
+    private fun batteryPercent(): Int? {
+        val intent = activity.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+            ?: return null
+        val level = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
+        val scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, -1)
+        if (level < 0 || scale <= 0) return null
+        return level * 100 / scale
+    }
+
     /** 根据当前（普通 / 全屏 / PiP）状态统一套用界面样式。 */
     private fun applyVisualState(pipPreparing: Boolean = false) {
         val pipLike = isInPipMode || pipPreparing
         setChromeVisible(!pipLike && !isFullscreen)
         setFullscreenBackVisible(isFullscreen && !pipLike)
+        applyInfoBar(isFullscreen && !pipLike)
         binding.playerView.useController = !pipLike
         when {
             // PiP（或进入前的过渡态）：按真实比例缩放铺满小窗
@@ -265,12 +332,19 @@ class FullscreenPipHelper(
         )
     }
 
-    /** Activity onStop：若仍在 PiP 则暂停并退出 PiP 标记。 */
+    /** Activity onStart：恢复顶部信息显示与刷新（全屏状态可能跨后台保留）。 */
+    fun onStarted() {
+        applyInfoBar(isFullscreen && !isInPipMode)
+    }
+
+    /** Activity onStop：若仍在 PiP 则暂停并退出 PiP 标记，同时停止顶部信息刷新。 */
     fun onStopped() {
         if (isInPipMode) {
             controllerProvider()?.pause()
             isInPipMode = false
         }
+        infoTickerRunning = false
+        infoHandler.removeCallbacks(infoTick)
     }
 }
 
@@ -279,7 +353,7 @@ class FullscreenPipHelper(
  *
  * 手势：
  * - 单击 → 显隐控制栏；
- * - 双击左半屏 → 快退 15s；双击右半屏 → 快进 15s；
+ * - 双击左 1/3 屏 → 快退 15s；双击中间 1/3 屏 → 播放 / 暂停；双击右 1/3 屏 → 快进 15s；
  * - 横向滑动（滑动结束时才 seek）→ 快进/快退，浮层实时预览目标进度；
  * - 左半屏上下滑动 → 亮度；右半屏上下滑动 → 音量。
  *
@@ -345,18 +419,31 @@ class GestureController(
                 return true
             }
 
-            // 双击：左快退 / 右快进 15s
+            // 双击：左 1/3 快退 15s / 中间 1/3 播放暂停 / 右 1/3 快进 15s
             override fun onDoubleTap(e: MotionEvent): Boolean {
                 val ctrl = controllerProvider() ?: return true
-                if (e.x < playerView.width / 2f) {
-                    if (ctrl.isCommandAvailable(Player.COMMAND_SEEK_BACK)) {
-                        ctrl.seekBack()
-                        showGestureOverlay(activity.getString(R.string.gesture_seek_back))
+                val third = playerView.width / 3f
+                when {
+                    e.x < third -> {
+                        if (ctrl.isCommandAvailable(Player.COMMAND_SEEK_BACK)) {
+                            ctrl.seekBack()
+                            showGestureOverlay(activity.getString(R.string.gesture_seek_back))
+                        }
                     }
-                } else {
-                    if (ctrl.isCommandAvailable(Player.COMMAND_SEEK_FORWARD)) {
-                        ctrl.seekForward()
-                        showGestureOverlay(activity.getString(R.string.gesture_seek_forward))
+                    e.x > third * 2 -> {
+                        if (ctrl.isCommandAvailable(Player.COMMAND_SEEK_FORWARD)) {
+                            ctrl.seekForward()
+                            showGestureOverlay(activity.getString(R.string.gesture_seek_forward))
+                        }
+                    }
+                    else -> {
+                        if (ctrl.playWhenReady) {
+                            ctrl.pause()
+                            showGestureOverlay(activity.getString(R.string.gesture_paused))
+                        } else {
+                            ctrl.play()
+                            showGestureOverlay(activity.getString(R.string.gesture_playing))
+                        }
                     }
                 }
                 return true

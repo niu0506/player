@@ -37,8 +37,6 @@
             app:pause_icon="@drawable/player_control_pause"
             app:previous_icon="@drawable/player_control_previous"
             app:next_icon="@drawable/player_control_next"
-            app:rewind_icon="@drawable/player_control_rewind"
-            app:fastforward_icon="@drawable/player_control_fastforward"
             app:repeat_off_icon="@drawable/player_control_repeat_off"
             app:repeat_one_icon="@drawable/player_control_repeat_one"
             app:repeat_all_icon="@drawable/player_control_repeat_all"
@@ -46,6 +44,60 @@
             app:shuffle_on_icon="@drawable/player_control_shuffle_on"
             app:fullscreen_enter_icon="@drawable/player_control_fullscreen_enter"
             app:fullscreen_exit_icon="@drawable/player_control_fullscreen_exit" />
+
+        <!-- 全屏顶部信息：文件名 / 系统时间 / 电量（仅全屏显示，由 FullscreenPipHelper 控制显隐） -->
+        <LinearLayout
+            android:id="@+id/fullscreen_info_bar"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_gravity="top"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:paddingStart="@dimen/fullscreen_info_start_padding"
+            android:paddingEnd="16dp"
+            android:paddingTop="8dp"
+            android:paddingBottom="8dp"
+            android:visibility="gone">
+
+            <TextView
+                android:id="@+id/tv_fullscreen_name"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:singleLine="true"
+                android:ellipsize="end"
+                android:textColor="@color/text_primary"
+                android:textSize="13sp"
+                android:shadowColor="#99000000"
+                android:shadowDx="0"
+                android:shadowDy="1"
+                android:shadowRadius="3" />
+
+            <TextView
+                android:id="@+id/tv_fullscreen_clock"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="12dp"
+                android:textColor="@color/text_primary"
+                android:textSize="13sp"
+                android:shadowColor="#99000000"
+                android:shadowDx="0"
+                android:shadowDy="1"
+                android:shadowRadius="3" />
+
+            <TextView
+                android:id="@+id/tv_fullscreen_battery"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="10dp"
+                android:textColor="@color/text_primary"
+                android:textSize="13sp"
+                android:shadowColor="#99000000"
+                android:shadowDx="0"
+                android:shadowDy="1"
+                android:shadowRadius="3" />
+
+        </LinearLayout>
 
         <!-- 手势反馈浮层（快进/快退、亮度、音量） -->
         <TextView
