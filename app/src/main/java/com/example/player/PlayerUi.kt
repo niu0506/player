@@ -1,7 +1,7 @@
 /**
  * 界面组件集合（与业务无关的纯 UI 逻辑）：
  * - [FullscreenPipHelper]：全屏 / 画中画切换与系统栏、视频表面样式管理；
- * - [GestureController]：播放器手势（单击显隐控制栏、双击快退快进、横滑快进快退、上下滑调亮度 / 音量）；
+ * - [GestureController]：播放器手势（单击显隐控制栏、双击左/中/右区域快退/播放暂停/快进、横滑快进快退、上下滑调亮度 / 音量）；
  * - [MediaListAdapter]：播放列表 RecyclerView 适配器（DiffUtil 后台差分刷新）。
  */
 package com.example.player
@@ -163,7 +163,7 @@ class FullscreenPipHelper(
 
     /**
      * 刷新顶部信息：文件名取当前媒体标题，时间取系统时钟，电量为百分比。
-     * 媒体切换时主动调用；全屏显示期间由定时器每秒刷新。
+     * 媒体切换或进入全屏时主动调用；全屏期间由定时器每秒刷新。
      */
     fun refreshInfoBarContent() {
         binding.tvFullscreenName.text = currentItemTitle().orEmpty()
@@ -197,6 +197,7 @@ class FullscreenPipHelper(
         val pipLike = isInPipMode || pipPreparing
         setChromeVisible(!pipLike && !isFullscreen)
         setFullscreenBackVisible(isFullscreen && !pipLike)
+        applyInfoBar(isFullscreen && !pipLike)
         binding.playerView.useController = !pipLike
         applyInfoBar(isFullscreen && !pipLike && binding.playerView.isControllerFullyVisible)
         when {
@@ -369,7 +370,7 @@ class FullscreenPipHelper(
  *
  * 手势：
  * - 单击 → 显隐控制栏；
- * - 双击左半屏 → 快退 15s；双击右半屏 → 快进 15s；
+ * - 双击左 1/3 屏 → 快退 15s；双击中间 1/3 屏 → 播放 / 暂停；双击右 1/3 屏 → 快进 15s；
  * - 横向滑动（滑动结束时才 seek）→ 快进/快退，浮层实时预览目标进度；
  * - 左半屏上下滑动 → 亮度；右半屏上下滑动 → 音量。
  *
@@ -435,18 +436,31 @@ class GestureController(
                 return true
             }
 
-            // 双击：左快退 / 右快进 15s
+            // 双击：左 1/3 快退 15s / 中间 1/3 播放暂停 / 右 1/3 快进 15s
             override fun onDoubleTap(e: MotionEvent): Boolean {
                 val ctrl = controllerProvider() ?: return true
-                if (e.x < playerView.width / 2f) {
-                    if (ctrl.isCommandAvailable(Player.COMMAND_SEEK_BACK)) {
-                        ctrl.seekBack()
-                        showGestureOverlay(activity.getString(R.string.gesture_seek_back))
+                val third = playerView.width / 3f
+                when {
+                    e.x < third -> {
+                        if (ctrl.isCommandAvailable(Player.COMMAND_SEEK_BACK)) {
+                            ctrl.seekBack()
+                            showGestureOverlay(activity.getString(R.string.gesture_seek_back))
+                        }
                     }
-                } else {
-                    if (ctrl.isCommandAvailable(Player.COMMAND_SEEK_FORWARD)) {
-                        ctrl.seekForward()
-                        showGestureOverlay(activity.getString(R.string.gesture_seek_forward))
+                    e.x > third * 2 -> {
+                        if (ctrl.isCommandAvailable(Player.COMMAND_SEEK_FORWARD)) {
+                            ctrl.seekForward()
+                            showGestureOverlay(activity.getString(R.string.gesture_seek_forward))
+                        }
+                    }
+                    else -> {
+                        if (ctrl.playWhenReady) {
+                            ctrl.pause()
+                            showGestureOverlay(activity.getString(R.string.gesture_paused))
+                        } else {
+                            ctrl.play()
+                            showGestureOverlay(activity.getString(R.string.gesture_playing))
+                        }
                     }
                 }
                 return true

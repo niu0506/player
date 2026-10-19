@@ -37,8 +37,6 @@
             app:pause_icon="@drawable/player_control_pause"
             app:previous_icon="@drawable/player_control_previous"
             app:next_icon="@drawable/player_control_next"
-            app:rewind_icon="@drawable/player_control_rewind"
-            app:fastforward_icon="@drawable/player_control_fastforward"
             app:repeat_off_icon="@drawable/player_control_repeat_off"
             app:repeat_one_icon="@drawable/player_control_repeat_one"
             app:repeat_all_icon="@drawable/player_control_repeat_all"
