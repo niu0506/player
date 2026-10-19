@@ -1,5 +1,5 @@
 /**
- * 单元测试用的 Uri 替身：仅实现比较与 toString，避免测试依赖 Android 运行时。
+ * 单元测试用的 Uri 替身：仅 equals/hashCode/toString 有实际语义，避免测试依赖 Android 运行时。
  * 放在 android.net 包下以便替换真实 [android.net.Uri]。
  */
 package android.net

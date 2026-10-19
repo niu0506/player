@@ -112,7 +112,7 @@ class UpdateChecker {
         private const val CONNECT_TIMEOUT_MS = 10_000
         private const val READ_TIMEOUT_MS = 20_000
 
-        /** 逐段比较版本号，判断 remote 是否比 current 新（非数字段按 0 处理）。 */
+        /** 逐段比较版本号，判断 remote 是否比 current 新（忽略 - / + 后缀，非数字段按 0 处理）。 */
         fun isNewer(remote: String, current: String): Boolean {
 
             fun normalized(value: String) = value.substringBefore('-').substringBefore('+')
@@ -461,7 +461,7 @@ class UpdateManager(private val activity: AppCompatActivity) {
     /**
      * 入队前删除公共「下载」目录中的同名旧包，避免 DownloadManager 因目标文件已存在
      * （ERROR_FILE_ALREADY_EXISTS）判定下载失败。删除失败（非本应用所有 / 无权限）时静默忽略，
-     * 与 [cleanupUpdateApks] 采用同一套 MediaStore 删除方式。
+     * API 29+ 与 [cleanupUpdateApks] 一样经 MediaStore 删除。
      */
     private fun deleteExistingDownloadFile(fileName: String) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {

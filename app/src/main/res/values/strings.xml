@@ -109,4 +109,7 @@
     <string name="player_control_play_pause">播放或暂停</string>
     <string name="player_control_seek">快退</string>
     <string name="player_control_fast_forward">快进</string>
+
+    <!-- 全屏顶部信息 -->
+    <string name="fullscreen_battery_percent">%1$d%%</string>
 </resources>

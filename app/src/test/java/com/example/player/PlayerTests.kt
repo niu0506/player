@@ -1,5 +1,5 @@
 /**
- * 纯逻辑单元测试（不依赖 Android 运行时）：
+ * 本地 JVM 单元测试（不依赖设备环境）：
  * 时长格式化、进度合并与末尾裁决、安装包完整性校验、
  * 缺失记录序列化、文件夹分组键与集数自然序等。
  */
@@ -146,7 +146,7 @@ class ProgressDecisionTest {
     }
 }
 
-/** 适配器「当前播放项」更新：越界防护、仅刷新受影响条目等。 */
+/** 适配器「当前播放项」更新：越界防护、仅刷新受影响条目。 */
 class MediaListAdapterCurrentPlayingTest {
 
     private class RecordingObserver : RecyclerView.AdapterDataObserver() {

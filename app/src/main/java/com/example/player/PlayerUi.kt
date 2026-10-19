@@ -10,13 +10,17 @@ import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.PictureInPictureParams
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ActivityInfo
 import android.graphics.Rect
 import android.media.AudioManager
+import android.os.BatteryManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
+import android.text.format.DateFormat
 import android.util.Rational
 import android.view.GestureDetector
 import android.view.LayoutInflater
@@ -43,6 +47,7 @@ import androidx.recyclerview.widget.DiffUtil
 import androidx.recyclerview.widget.RecyclerView
 import com.example.player.databinding.ActivityMainBinding
 import com.example.player.databinding.ItemMediaBinding
+import java.util.Date
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -87,11 +92,37 @@ class FullscreenPipHelper(
     private val binding: ActivityMainBinding,
     private val controllerProvider: () -> MediaController?
 ) {
+    private companion object {
+        /** 全屏顶部时钟 / 电量的刷新间隔。 */
+        const val INFO_TICK_MS = 1000L
+    }
+
     var isFullscreen = false
         private set
 
     var isInPipMode = false
         private set
+
+    /** 全屏顶部信息（文件名 / 系统时间 / 电量）的定时刷新。 */
+    private val infoHandler = Handler(Looper.getMainLooper())
+    private var infoTickerRunning = false
+    private val infoTick = object : Runnable {
+        override fun run() {
+            refreshInfoBarContent()
+            infoHandler.postDelayed(this, INFO_TICK_MS)
+        }
+    }
+
+    init {
+        // 信息条跟随控制栏：控制栏 3 秒后自动隐藏时，顶部信息一并隐藏；点按唤出时再显示。
+        binding.playerView.setControllerVisibilityListener(
+            PlayerView.ControllerVisibilityListener { visibility ->
+                if (isFullscreen && !isInPipMode) {
+                    applyInfoBar(visibility == View.VISIBLE)
+                }
+            }
+        )
+    }
 
     /** 系统 PiP 模式切换回调：退出 PiP 且非全屏时恢复系统栏。 */
     fun onPipModeChanged(isInPictureInPictureMode: Boolean) {
@@ -115,12 +146,59 @@ class FullscreenPipHelper(
             if (visible) View.VISIBLE else View.GONE
     }
 
+    /** 顶部信息条显隐：全屏且控制栏可见时显示，并启动时钟 / 电量刷新。 */
+    private fun applyInfoBar(visible: Boolean) {
+        binding.fullscreenInfoBar.visibility = if (visible) View.VISIBLE else View.GONE
+        if (visible) {
+            refreshInfoBarContent()
+            if (!infoTickerRunning) {
+                infoTickerRunning = true
+                infoHandler.postDelayed(infoTick, INFO_TICK_MS)
+            }
+        } else if (infoTickerRunning) {
+            infoTickerRunning = false
+            infoHandler.removeCallbacks(infoTick)
+        }
+    }
+
+    /**
+     * 刷新顶部信息：文件名取当前媒体标题，时间取系统时钟，电量为百分比。
+     * 媒体切换时主动调用；全屏显示期间由定时器每秒刷新。
+     */
+    fun refreshInfoBarContent() {
+        binding.tvFullscreenName.text = currentItemTitle().orEmpty()
+        binding.tvFullscreenClock.text = DateFormat.getTimeFormat(activity).format(Date())
+        val percent = batteryPercent()
+        binding.tvFullscreenBattery.text = if (percent != null) {
+            activity.getString(R.string.fullscreen_battery_percent, percent)
+        } else {
+            ""
+        }
+    }
+
+    /** 当前媒体标题；无播放项或标题为空时返回 null。 */
+    private fun currentItemTitle(): String? {
+        val title = controllerProvider()?.currentMediaItem?.mediaMetadata?.title?.toString()
+        return title?.takeIf { it.isNotBlank() }
+    }
+
+    /** 读取当前电量百分比；读不到返回 null。 */
+    private fun batteryPercent(): Int? {
+        val intent = activity.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+            ?: return null
+        val level = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
+        val scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, -1)
+        if (level < 0 || scale <= 0) return null
+        return level * 100 / scale
+    }
+
     /** 根据当前（普通 / 全屏 / PiP）状态统一套用界面样式。 */
     private fun applyVisualState(pipPreparing: Boolean = false) {
         val pipLike = isInPipMode || pipPreparing
         setChromeVisible(!pipLike && !isFullscreen)
         setFullscreenBackVisible(isFullscreen && !pipLike)
         binding.playerView.useController = !pipLike
+        applyInfoBar(isFullscreen && !pipLike && binding.playerView.isControllerFullyVisible)
         when {
             // PiP（或进入前的过渡态）：按真实比例缩放铺满小窗
             pipLike -> applyEdgeToEdgeSurface(AspectRatioFrameLayout.RESIZE_MODE_ZOOM)
@@ -219,7 +297,7 @@ class FullscreenPipHelper(
         }
 
     /**
-     * 依据当前是否有视频，刷新系统 PiP 参数：有视频时允许系统自动进入小窗
+     * 依据视频与播放状态刷新系统 PiP 参数：有视频且正在播放时允许自动进入小窗
      * （API 31+ 的按 Home / 手势），并给出进入 / 退出小窗的动画锚点。
      * 纯音频时关闭自动进入，避免弹出空的黑色小窗。
      */
@@ -265,12 +343,24 @@ class FullscreenPipHelper(
         )
     }
 
-    /** Activity onStop：若仍在 PiP 则暂停并退出 PiP 标记。 */
+    /** Activity onStart：恢复全屏沉浸状态与顶部信息显示（全屏状态可能跨后台保留）。 */
+    fun onStarted() {
+        if (isFullscreen && !isInPipMode) {
+            hideSystemBars()
+        }
+        applyInfoBar(
+            isFullscreen && !isInPipMode && binding.playerView.isControllerFullyVisible
+        )
+    }
+
+    /** Activity onStop：若仍在 PiP 则暂停并清除 PiP 标记，同时停止顶部信息刷新。 */
     fun onStopped() {
         if (isInPipMode) {
             controllerProvider()?.pause()
             isInPipMode = false
         }
+        infoTickerRunning = false
+        infoHandler.removeCallbacks(infoTick)
     }
 }
 
@@ -392,7 +482,7 @@ class GestureController(
                             gestureMode = Gesture.IGNORED
                             return true
                         }
-                        // 每秒对应的像素：让整屏滑动约等于 1.2 倍时长
+                        // 每像素对应的毫秒：让整屏滑动约等于 1.2 倍时长
                         val msPerPx = max(300f, duration / playerView.width * 1.2f)
                         val target = (seekStartPosition + (e2.x - start.x) * msPerPx)
                             .toLong().coerceIn(0L, duration)
@@ -473,7 +563,7 @@ class GestureController(
         return systemBrightnessToFraction(systemValue)
     }
 
-    /** 应用屏幕亮度（限制在 2%~100%）；persist 为 true 时写入偏好并退出手动模式。 */
+    /** 应用屏幕亮度（限制在 2%~100%）；persist 为 true 时写入偏好并标记为手动模式。 */
     private fun applyBrightness(value: Float, persist: Boolean) {
         val lp = activity.window.attributes
         lp.screenBrightness = value.coerceIn(0.02f, 1f)
@@ -508,7 +598,7 @@ class GestureController(
  * 播放列表适配器。
  *
  * 使用 DiffUtil 在后台线程计算差量，避免主线程卡顿；
- * 对「仅进度变化」「仅时长变化」通过 payload 做局部刷新。
+ * 仅进度变化通过 payload 局部刷新，其余变化走默认重绑。
  *
  * @param onClick 点击条目回调（传入 uri）
  * @param onDelete 点击删除回调（传入 uri）
@@ -626,7 +716,7 @@ class MediaListAdapter(
             if (item.duration > 0) formatTime(item.duration) else ""
     }
 
-    /** 绑定进度条与进度文案：播放中显示「播放中 x」，否则显示「x / 总时长」。 */
+    /** 绑定进度行：有进度时显示「播放中 x」或「x / 总时长」，无进度则隐藏。 */
     private fun bindProgress(holder: VH, item: MediaItemData) {
         val context = holder.itemView.context
         val isActive = item.uri.toString() == currentPlayingUri && isPlaying

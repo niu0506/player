@@ -4,7 +4,7 @@
  * 基于 Media3 的 [MediaSessionService] 托管一个 ExoPlayer：
  * 1. 提供媒体会话（通知栏与外部控制器通过它操控播放）；
  * 2. 负责播放进度的采集与持久化（每 5 秒一次快照，暂停 / seek / 内存吃紧 / 销毁时立即落盘）；
- * 3. 播放出错时自动跳到下一个可播放项，并对外广播 [com.example.player.PlayerService.Companion.PlaybackErrorEvent]。
+ * 3. 播放出错时自动跳到下一项，并对外广播 [com.example.player.PlayerService.Companion.PlaybackErrorEvent]。
  *
  * 注意：倍速等播放参数由本服务的播放器持有，界面重建后需从会话重新读取以保持同步。
  */
@@ -54,7 +54,7 @@ class PlayerService : MediaSessionService() {
     /**
      * 刚被要求删除进度、但播放器时间线里可能还存在的 uri。
      *
-     * 删除条目时 dropProgress 先于播放器真正移除执行；在队列重建/跨进程命令完成前，
+     * 删除条目时 dropProgress 先于播放器真正移除执行；在队列重建/会话命令完成前，
      * ticker 仍可能把当前项的进度缓存回来。这里在 URI 真正离开时间线前拒绝重新缓存。
      */
     private val pendingDropUris = mutableSetOf<String>()
@@ -62,7 +62,7 @@ class PlayerService : MediaSessionService() {
     /** 上一次成功落盘时的缓存快照，用于跳过无变化的写入。 */
     private var lastPersistedSnapshot: Map<String, Long> = emptyMap()
 
-    /** 当前正在播放的 uri，用于自动切歌时清除上一首的进度。 */
+    /** 当前媒体项的 uri，用于自动切歌时清除上一首的进度。 */
     private var lastPlayedUri: String? = null
 
     private val playerEventListener = object : Player.Listener {
@@ -84,7 +84,7 @@ class PlayerService : MediaSessionService() {
 
         override fun onIsPlayingChanged(isPlaying: Boolean) {
             if (!isPlaying) {
-                // 暂停：立即落盘，同时停止周期性 ticker
+                // 暂停：立即落盘，ticker 不再续排
                 persistProgress()
             } else {
                 consecutiveErrorCount = 0
@@ -146,7 +146,7 @@ class PlayerService : MediaSessionService() {
             }
 
             consecutiveErrorCount++
-            // 错误次数不小于队列长度，说明整份列表都不够跳过，视为全部失败
+            // 队列非空且错误次数不小于队列长度，视为整份列表都播放失败
             val exhausted = player.mediaItemCount in 1..consecutiveErrorCount
             val hasNext = !exhausted && player.hasNextMediaItem()
 
@@ -228,7 +228,7 @@ class PlayerService : MediaSessionService() {
                     session: MediaSession,
                     controller: MediaSession.ControllerInfo
                 ): ListenableFuture<MediaSession.ConnectionResult> {
-                    if (controller.isTrusted()) {
+                    if (controller.isTrusted) {
                         return super.onConnectAsync(session, controller)
                     }
                     Log.w(TAG, "拒绝不可信媒体控制器: ${controller.packageName}")
@@ -243,7 +243,7 @@ class PlayerService : MediaSessionService() {
 
     override fun onTaskRemoved(rootIntent: Intent?) {
         persistProgress()
-        // 从最近任务划掉且未在播放时结束服务
+        // 从最近任务划掉且没有播放意图（playWhenReady=false）时结束服务
         val player = this.player
         if (player == null || !player.playWhenReady) {
             stopSelf()
@@ -285,7 +285,7 @@ class PlayerService : MediaSessionService() {
         )
     }
 
-    /** 收集当前变更并落盘（无变化则直接返回，避免零空闲 IO）。 */
+    /** 收集当前变更并落盘（无变化则跳过写库）。 */
     private fun persistProgress() {
         val player = this.player ?: return
         if (pendingDropUris.isNotEmpty()) {
@@ -302,7 +302,7 @@ class PlayerService : MediaSessionService() {
         writeToDisk(writes, removals)
     }
 
-    /** 提交一次数据库写入；成功更新快照，失败则把删除项放回并重新排期重试。 */
+    /** 提交一次数据库写入；成功更新快照，失败则保留待写数据并重新排期。 */
     private fun writeToDisk(writes: Map<String, Long>, removals: Set<String>) {
         val snapshot = progressCache.toMap()
         PlayerRepository.applyProgressUpdates(writes, removals) { persisted ->

@@ -15,13 +15,15 @@
     <dimen name="player_control_time_text_size">14sp</dimen>
     <dimen name="player_control_seek_text_size">9sp</dimen>
     <dimen name="player_control_seek_padding_bottom">4dp</dimen>
+    <!-- 全屏顶部信息条左侧留白：避让控制栏左上角的返回键 -->
+    <dimen name="fullscreen_info_start_padding">52dp</dimen>
 
     <color name="player_control_overlay">#99000000</color>
     <color name="player_control_bar">#CC000000</color>
     <color name="player_control_text">#FFFFFFFF</color>
     <color name="player_control_muted_text">#B3FFFFFF</color>
 
-    <!-- 点号命名的隐式父样式：PlayerControls.* 均继承它，不能删除 -->
+    <!-- 点号命名的隐式父样式：未显式指定 parent 的 PlayerControls.* 依赖它，不能删除 -->
     <style name="PlayerControls" />
     <style name="PlayerControls.Button">
         <item name="android:background">?android:attr/selectableItemBackgroundBorderless</item>

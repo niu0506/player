@@ -177,8 +177,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun savePlaylistNow() {
-        // playlistLoaded 之前 playlist 还是空的：此时落盘会用空列表覆盖已存列表，
-        // 清空用户数据（例如控制器尚未连接或连接失败就退到后台）。
+        // playlistLoaded 之前尚未合并已存列表：此时落盘会用不完整的列表覆盖仓库，
+        // 造成用户数据丢失（例如控制器尚未连接或连接失败就退到后台）。
         if (!playlistLoaded || !PlayerRepository.isLoaded()) return
         PlayerRepository.savePlaylist(playlist.toList())
     }
@@ -214,6 +214,8 @@ class MainActivity : AppCompatActivity() {
         override fun onMediaItemTransition(mediaItem: M3MediaItem?, reason: Int) {
 
             syncAdapterPlayingState()
+            // 全屏顶部信息条里的文件名跟随当前条目变化
+            fullscreenPip.refreshInfoBarContent()
 
             // 单曲循环回绕不恢复断点，其余切歌按需续播
             if (reason != Player.MEDIA_ITEM_TRANSITION_REASON_REPEAT) {
@@ -259,7 +261,7 @@ class MainActivity : AppCompatActivity() {
 
         override fun onVideoSizeChanged(videoSize: VideoSize) {
             updateKeepScreenOn()
-            // 依据是否有视频刷新系统 PiP 参数（比例、自动进入开关与动画锚点）
+            // 依据视频与播放状态刷新系统 PiP 参数（比例、自动进入开关与动画锚点）
             fullscreenPip.refreshPipParams()
         }
     }
@@ -330,7 +332,7 @@ class MainActivity : AppCompatActivity() {
         seekToResume(controller?.currentMediaItemIndex ?: return, defaultIfMissing = false)
     }
 
-    /** 冷启动时恢复上次播放的条目与位置。 */
+    /** 恢复上次播放的条目与位置（仅在播放器空闲时）。 */
     private fun restoreLastPlayed() {
         val ctrl = controller ?: return
         if (ctrl.playWhenReady || ctrl.isPlaying) return
@@ -604,8 +606,8 @@ class MainActivity : AppCompatActivity() {
         val observedNow = mutableSetOf<String>()
         val removedUris = mutableSetOf<String>()
         val now = System.currentTimeMillis()
-        for (item in playlistSnapshot) {
-            val uriStr = item.uri.toString()
+        for ((uri) in playlistSnapshot) {
+            val uriStr = uri.toString()
             val keys = when {
                 uriStr.startsWith(videoPrefix) -> videoKeys
                 uriStr.startsWith(audioPrefix) -> audioKeys
@@ -613,7 +615,7 @@ class MainActivity : AppCompatActivity() {
             }
             if (keys == null) continue
             observedNow.add(uriStr)
-            val key = normalizeUri(item.uri)
+            val key = normalizeUri(uri)
             if (key in keys) continue
             missingNow.add(uriStr)
             val prev = PlayerRepository.getMissingInfo(uriStr)
@@ -622,7 +624,7 @@ class MainActivity : AppCompatActivity() {
                 now - prev.firstMissingMs >= PlayerRepository.MISSING_DELETE_GRACE_MS
             // 权威扫描未见该条时再做一次单条精确查询：确认媒体库中已无此行即立即清理，
             // 让外部删除的文件即时消失；卷未全部挂载或查询失败/仍有行则退回宽限期兜底。
-            val confirmed = canConfirmImmediately && isConfirmedDeleted(item.uri)
+            val confirmed = canConfirmImmediately && isConfirmedDeleted(uri)
             if (graceExpired || confirmed) {
                 removedUris.add(uriStr)
             }
@@ -756,7 +758,7 @@ class MainActivity : AppCompatActivity() {
         gestures = GestureController(this, binding.playerView, binding.gestureOverlay) { controller }
         fullscreenPip = FullscreenPipHelper(this, binding) { controller }
 
-        // 列表适配器：点击续播、长按删除、实时读取进度
+        // 列表适配器：点击续播、删除按钮移除、实时读取进度
         adapter = MediaListAdapter(
             onClick = { uri ->
                 val index = indexOfUri(uri)
@@ -785,7 +787,7 @@ class MainActivity : AppCompatActivity() {
         )
         binding.recyclerPlaylist.adapter = adapter
         binding.recyclerPlaylist.layoutManager = LinearLayoutManager(this)
-        // 关闭条目位移动画，避免 DiffUtil 刷新时列表闪烁
+        // 关闭条目变更动画，避免 DiffUtil 刷新时列表闪烁
         (binding.recyclerPlaylist.itemAnimator as? SimpleItemAnimator)?.supportsChangeAnimations =
             false
 
@@ -831,6 +833,8 @@ class MainActivity : AppCompatActivity() {
 
     override fun onStart() {
         super.onStart()
+        // 全屏状态可能跨后台保留：恢复沉浸式系统栏与顶部信息
+        fullscreenPip.onStarted()
         updateManager.registerReceivers()
         updateManager.resumePendingDownload()
         // 监听视频 / 音频媒体库变化
@@ -867,7 +871,7 @@ class MainActivity : AppCompatActivity() {
                 if (!isCurrentController(future, ctrl)) return@launch
                 when {
 
-                    // 数据加载失败：提示并等待自动重试
+                    // 数据加载失败：提示（后续写入会触发冷却重试）
                     !loaded -> toastLong(R.string.toast_repository_load_failed)
 
                     // 首次进入：把已存列表载入内存
@@ -890,7 +894,7 @@ class MainActivity : AppCompatActivity() {
                 startScan(silent = true).join()
 
                 if (!isCurrentController(future, ctrl)) return@launch
-                // 扫描可能追加/删除/重排条目，完成后统一重建队列并刷新
+                // 扫描可能删除/重排条目，完成后统一重建队列并刷新
                 rebuildQueueAndClearPending(ctrl)
                 restoreLastPlayed()
                 refreshPlaylist()
@@ -929,8 +933,8 @@ class MainActivity : AppCompatActivity() {
 
     override fun onUserLeaveHint() {
         super.onUserLeaveHint()
-        // API 31+ 由 setAutoEnterEnabled 负责按 Home / 手势自动进入小窗（且仅在有视频时开启）；
-        // 低版本没有该能力，退回在此手动进入。
+        // API 31+ 由 setAutoEnterEnabled 自动进入小窗（仅播放视频时开启）；
+        // 低版本在 onUserLeaveHint 中进入。
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
             fullscreenPip.enterPipWhenPlayingVideo()
         }

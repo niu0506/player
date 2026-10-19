@@ -8,7 +8,7 @@
  * 4. 提供播放进度写入裁决（末尾容差）与「合并写」语义。
  *
  * 设计要点：内存状态始终为权威读取源（[PlayerRepository.getPlaylist] 等），
- * 数据库写入经 [PlayerRepository.dispatchWrite] 串行化，失败会按冷却时间重试并对外广播。
+ * 数据库写入经 [PlayerRepository.dispatchWrite] 串行化，写入失败会重试并对外广播；加载失败时，写入路径按冷却时间重试。
  */
 package com.example.player
 
@@ -102,13 +102,13 @@ internal fun folderKeyFromAbsolutePath(absolutePath: String?, storageRoot: Strin
 /** 超过此位数的数字段改用「长度 + 字典序」比较，避免 Long 溢出。 */
 private const val NATURAL_MAX_DIGITS = 18
 
-/** 数值相同（前导零）或超出安全位数时，用「长度 + 字典序」保证排序确定性。 */
+/** 超出安全位数时用「长度 + 字典序」比较，避免 Long 溢出。 */
 private fun compareDigitTails(x: String, y: String): Int {
     val byLength = x.length.compareTo(y.length)
     return if (byLength != 0) byLength else x.compareTo(y)
 }
 
-/** 比较两段纯数字：先按数值大小，数值相同时退化为长度 + 字典序（处理前导零与超长数字）。 */
+/** 比较两段纯数字：先按数值大小；超出安全位数时退化为长度 + 字典序。 */
 private fun compareDigitSegments(a: String, b: String): Int {
     val x = a.trimStart('0').ifEmpty { "0" }
     val y = b.trimStart('0').ifEmpty { "0" }
@@ -179,9 +179,9 @@ internal fun sortPlaylist(items: List<MediaItemData>): List<MediaItemData> =
     items.sortedWith(::comparePlaylistItems)
 
 /**
- * 首次加载时合并「数据库中的列表」与「扫描到但尚未落盘的列表」。
+ * 首次加载时合并「数据库中的列表」与「内存中尚未落盘的列表」。
  *
- * 以数据库顺序为准，扫描独有条目追加到末尾；按 [normalizeUri] 去重，
+ * 以数据库顺序为准，内存独有条目追加到末尾；按 [normalizeUri] 去重，
  * 避免加载失败后手动扫描再加回数据库列表时出现重复项。
  */
 internal fun mergePlaylistOnLoad(
@@ -292,7 +292,7 @@ class MediaStoreScanner(private val context: Context) {
             null
         }
 
-    /** 执行一次查询；任何异常或 cursor 为空都返回 null，交由调用方按「扫描失败」处理。 */
+    /** 执行一次查询；异常或 cursor 为 null 时返回 null，交由调用方按「扫描失败」处理。 */
     @Suppress("InlinedApi") // DURATION 常量 API 29+，但为编译期内联字符串，低版本可安全使用
     private fun query(contentUri: Uri): List<MediaItemData>? {
         val items = mutableListOf<MediaItemData>()
@@ -471,7 +471,7 @@ abstract class PlayerDatabase : RoomDatabase() {
 
 /**
  * 全局单例仓库：内存状态为权威读取源，所有写操作经 [dispatchWrite] 串行落盘。
- * 加载失败不是终态，会按 [LOAD_RETRY_COOLDOWN_MS] 冷却重试。
+ * 加载失败不是终态：后续 [ensureLoaded] 会重新加载，写入路径按 [LOAD_RETRY_COOLDOWN_MS] 冷却重试。
  */
 object PlayerRepository {
     private const val TAG = "PlayerRepository"
@@ -483,7 +483,7 @@ object PlayerRepository {
     /** KV 表里存放「缺失文件记录」的键。 */
     private const val KEY_MISSING_URIS = "missingUris"
 
-    /** 文件消失后需等待此时长才允许从列表中删除，避免外部瞬时不可用导致误删。 */
+    /** 无法即时确认时，文件消失后需等待此时长才允许删除，避免瞬时不可用导致误删。 */
     internal const val MISSING_DELETE_GRACE_MS = 24 * 60 * 60 * 1000L
 
     /** KV 表里存放「上次播放项」的键。 */
