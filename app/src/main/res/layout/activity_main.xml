@@ -22,7 +22,8 @@
         app:cardElevation="0dp"
         app:strokeWidth="0dp">
 
-        <!-- 使用应用自有的控制栏布局与图标，避免绑定 Media3 私有资源 -->
+        <!-- 使用应用自有的控制栏布局与图标，避免绑定 Media3 私有资源。
+             TextureView 换取圆角裁剪 / PiP 过渡；HDR 或功耗优先时改为 surface_view，并同步去掉卡片圆角。 -->
         <androidx.media3.ui.PlayerView
             android:id="@+id/player_view"
             android:layout_width="match_parent"
@@ -105,8 +106,10 @@
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:layout_gravity="center"
-            android:paddingHorizontal="20dp"
-            android:paddingVertical="10dp"
+            android:paddingStart="20dp"
+            android:paddingEnd="20dp"
+            android:paddingTop="10dp"
+            android:paddingBottom="10dp"
             android:background="@drawable/bg_gesture_overlay"
             android:gravity="center"
             android:textColor="@color/text_primary"
@@ -131,7 +134,8 @@
             android:layout_height="wrap_content"
             android:orientation="horizontal"
             android:gravity="center_vertical"
-            android:paddingHorizontal="16dp">
+            android:paddingStart="16dp"
+            android:paddingEnd="16dp">
 
             <TextView
                 android:id="@+id/tv_playlist_info"
@@ -148,8 +152,10 @@
                 android:id="@+id/tv_count"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:paddingHorizontal="10dp"
-                android:paddingVertical="3dp"
+                android:paddingStart="10dp"
+                android:paddingEnd="10dp"
+                android:paddingTop="3dp"
+                android:paddingBottom="3dp"
                 android:background="@drawable/bg_pill_button"
                 android:textColor="@color/text_secondary"
                 android:textSize="11sp" />
@@ -160,7 +166,8 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:orientation="horizontal"
-            android:paddingHorizontal="16dp"
+            android:paddingStart="16dp"
+            android:paddingEnd="16dp"
             android:paddingTop="10dp">
 
             <Button
@@ -193,7 +200,8 @@
             android:id="@+id/recycler_playlist"
             android:layout_width="match_parent"
             android:layout_height="match_parent"
-            android:paddingHorizontal="12dp"
+            android:paddingStart="12dp"
+            android:paddingEnd="12dp"
             android:paddingTop="4dp"
             android:paddingBottom="20dp"
             android:clipToPadding="false"

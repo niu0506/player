@@ -6,11 +6,15 @@ media3 = "1.11.1"
 appcompat = "1.8.0"
 recyclerview = "1.4.0"
 activity = "1.13.0"
+core-ktx = "1.18.0"
+lifecycle = "2.8.0"
 material = "1.14.0"
 room = "2.8.5"
 kotlinx-coroutines = "1.11.0"
 junit = "4.13.2"
 json = "20260814"
+# Media3 的 ListenableFuture API 由这个接口 jar 提供；显式声明避免依赖传递解析
+listenablefuture = "9999.0-empty-to-avoid-conflict-with-guava"
 
 [libraries]
 media3-exoplayer = { module = "androidx.media3:media3-exoplayer", version.ref = "media3" }
@@ -19,12 +23,15 @@ media3-session = { module = "androidx.media3:media3-session", version.ref = "med
 appcompat = { module = "androidx.appcompat:appcompat", version.ref = "appcompat" }
 recyclerview = { module = "androidx.recyclerview:recyclerview", version.ref = "recyclerview" }
 activity-ktx = { module = "androidx.activity:activity-ktx", version.ref = "activity" }
+core-ktx = { module = "androidx.core:core-ktx", version.ref = "core-ktx" }
+lifecycle-runtime-ktx = { module = "androidx.lifecycle:lifecycle-runtime-ktx", version.ref = "lifecycle" }
 material = { module = "com.google.android.material:material", version.ref = "material" }
 room-runtime = { module = "androidx.room:room-runtime", version.ref = "room" }
 room-compiler = { module = "androidx.room:room-compiler", version.ref = "room" }
 coroutines-android = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-android", version.ref = "kotlinx-coroutines" }
 junit = { module = "junit:junit", version.ref = "junit" }
 json = { module = "org.json:json", version.ref = "json" }
+listenablefuture = { module = "com.google.guava:listenablefuture", version.ref = "listenablefuture" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

@@ -1,9 +1,9 @@
 /**
  * 本地 JVM 单元测试（不依赖设备环境）：
- * 时长格式化、进度合并与末尾裁决、安装包完整性校验、
+ * 扫描对账与元数据合并、进度状态机、安装包完整性校验、
  * 缺失记录序列化、文件夹分组键与集数自然序等。
  */
-package com.example.player
+package io.github.niu0506.player
 
 import android.net.FakeUri
 import androidx.media3.common.Player
@@ -662,49 +662,77 @@ class PlaylistSortTest {
     }
 }
 
-/** 文件夹分组键回填：仅补空、不覆盖、URI 与数量不变。 */
-class FolderBackfillTest {
+/** 扫描元数据合并：文件名 / 时长 / 文件夹刷新，缺失字段不覆盖。 */
+class ScannedMetadataMergeTest {
 
-    private fun item(uri: String, name: String, folder: String = "") =
-        MediaItemData(FakeUri(uri), name, 0L, folder)
-
-    private fun key(uri: String): String = normalizeUri(FakeUri(uri))
+    private fun item(
+        uri: String,
+        name: String,
+        duration: Long = 0L,
+        folder: String = "",
+    ) = MediaItemData(FakeUri(uri), name, duration, folder)
 
     @Test
-    fun `missing folder keys are filled from the scan result`() {
-        val items = listOf(item("content://video/1", "第1集.mp4"), item("content://video/2", "第2集.mp4"))
-        val map = mapOf(key("content://video/1") to "Movies/剧A", key("content://video/2") to "Movies/剧A")
-        assertEquals(listOf("Movies/剧A", "Movies/剧A"), backfillFolderKeys(items, map).map { it.folderKey })
+    fun `existing item metadata is refreshed from scan`() {
+        val items = listOf(item("content://video/1", "旧名.mp4", 10_000, "旧目录"))
+        val scanned = listOf(item("content://video/1", "新名.mp4", 20_000, "新目录"))
+
+        val result = mergeScannedMetadata(items, scanned)
+
+        assertEquals("新名.mp4", result.single().name)
+        assertEquals(20_000L, result.single().duration)
+        assertEquals("新目录", result.single().folderKey)
     }
 
     @Test
-    fun `existing folder keys are not overwritten`() {
-        val items = listOf(item("content://video/1", "第1集.mp4", "Movies/旧目录"))
-        val map = mapOf(key("content://video/1") to "Movies/新目录")
-        assertEquals(listOf("Movies/旧目录"), backfillFolderKeys(items, map).map { it.folderKey })
+    fun `blank name and zero duration keep existing values`() {
+        val items = listOf(item("content://video/1", "旧名.mp4", 10_000, "目录"))
+        val scanned = listOf(item("content://video/1", "  ", 0, "目录"))
+
+        val result = mergeScannedMetadata(items, scanned)
+
+        assertEquals("旧名.mp4", result.single().name)
+        assertEquals(10_000L, result.single().duration)
     }
 
     @Test
-    fun `items without a scan mapping stay ungrouped`() {
-        val items = listOf(item("content://video/9", "第9集.mp4"))
-        val map = mapOf(key("content://video/1") to "Movies/剧A")
-        assertEquals(listOf(""), backfillFolderKeys(items, map).map { it.folderKey })
+    fun `moving to root clears the folder key`() {
+        val items = listOf(item("content://video/1", "剧.mp4", 10_000, "Movies/剧A"))
+        val scanned = listOf(item("content://video/1", "剧.mp4", 10_000, ""))
+
+        assertEquals("", mergeScannedMetadata(items, scanned).single().folderKey)
     }
 
     @Test
-    fun `empty mapping returns the original list`() {
+    fun `items not present in scan keep their metadata`() {
+        val items = listOf(item("content://video/9", "第9集.mp4", 10_000, "Movies/剧A"))
+        val scanned = listOf(item("content://video/1", "第1集.mp4", 10_000, "Movies/剧A"))
+
+        val result = mergeScannedMetadata(items, scanned)
+
+        assertEquals(items, result)
+        assertTrue(result === items)
+    }
+
+    @Test
+    fun `empty scan returns the original list`() {
         val items = listOf(item("content://video/1", "第1集.mp4"))
-        assertTrue(backfillFolderKeys(items, emptyMap()) === items)
+        assertTrue(mergeScannedMetadata(items, emptyList()) === items)
     }
 
     @Test
     fun `uri set and size are preserved`() {
-        val items = listOf(item("content://video/1", "第1集.mp4"), item("content://video/2", "第2集.mp4"))
-        val result = backfillFolderKeys(items, mapOf(key("content://video/1") to "Movies/剧A"))
+        val items = listOf(
+            item("content://video/1", "第1集.mp4"),
+            item("content://video/2", "第2集.mp4"),
+        )
+        val scanned = listOf(item("content://video/1", "第1集（重命名）.mp4", 10_000, "Movies"))
+        val result = mergeScannedMetadata(items, scanned)
+
         assertEquals(items.size, result.size)
         assertEquals(
             items.map { it.uri.toString() }.toSet(),
-            result.map { it.uri.toString() }.toSet()
+            result.map { it.uri.toString() }.toSet(),
         )
     }
 }
@@ -867,5 +895,403 @@ class BrightnessFractionTest {
     fun `out of range is clamped`() {
         assertEquals(0f, systemBrightnessToFraction(-10), 0.001f)
         assertEquals(1f, systemBrightnessToFraction(999), 0.001f)
+    }
+}
+
+/** 扫描对账纯函数：新增、删除、元数据刷新、静默模式与排序。 */
+class ScanReconcileTest {
+
+    private fun item(
+        uri: String,
+        name: String,
+        duration: Long = 10_000L,
+        folder: String = "",
+    ) = MediaItemData(FakeUri(uri), name, duration, folder)
+
+    @Test
+    fun `manual scan appends new items that are long enough`() {
+        val current = listOf(item("content://video/1", "第1集.mp4", 10_000, "剧A"))
+        val scanned = listOf(
+            item("content://video/1", "第1集.mp4", 10_000, "剧A"),
+            item("content://video/2", "第2集.mp4", 10_000, "剧A"),
+        )
+
+        val result = reconcilePlaylist(current, scanned, null, emptySet(), silent = false)
+
+        assertEquals(1, result.addedCount)
+        assertEquals(0, result.removedCount)
+        assertEquals(2, result.playlist.size)
+        assertTrue(result.playlist.any { it.name == "第2集.mp4" })
+    }
+
+    @Test
+    fun `short clips are not imported`() {
+        val scanned = listOf(item("content://video/short", "提示音.mp4", 4_999))
+
+        val result = reconcilePlaylist(emptyList(), scanned, null, emptySet(), silent = false)
+
+        assertEquals(0, result.addedCount)
+        assertTrue(result.playlist.isEmpty())
+    }
+
+    @Test
+    fun `silent scan never appends files`() {
+        val current = listOf(item("content://video/1", "第1集.mp4"))
+        val scanned = listOf(
+            item("content://video/1", "第1集.mp4"),
+            item("content://video/2", "第2集.mp4"),
+        )
+
+        val result = reconcilePlaylist(current, scanned, null, emptySet(), silent = true)
+
+        assertEquals(0, result.addedCount)
+        assertEquals(1, result.playlist.size)
+        assertEquals("content://video/1", result.playlist.single().uri.toString())
+    }
+
+    @Test
+    fun `removed uris are pruned and counted`() {
+        val current = listOf(
+            item("content://video/1", "第1集.mp4"),
+            item("content://video/2", "第2集.mp4"),
+        )
+        val scanned = listOf(item("content://video/2", "第2集.mp4"))
+
+        val result = reconcilePlaylist(
+            current,
+            scanned,
+            null,
+            removedUris = setOf("content://video/1"),
+            silent = true,
+        )
+
+        assertEquals(1, result.removedCount)
+        assertEquals(listOf("content://video/2"), result.playlist.map { it.uri.toString() })
+    }
+
+    @Test
+    fun `duplicate scan entries are added once`() {
+        val scanned = listOf(
+            item("content://video/1", "第1集.mp4"),
+            item("content://video/1", "第1集.mp4"),
+        )
+
+        val result = reconcilePlaylist(emptyList(), scanned, null, emptySet(), silent = false)
+
+        assertEquals(1, result.addedCount)
+        assertEquals(1, result.playlist.size)
+    }
+
+    @Test
+    fun `existing metadata is refreshed without reporting a reorder`() {
+        val current = listOf(item("content://video/1", "旧名.mp4", 10_000, "剧A"))
+        val scanned = listOf(item("content://video/1", "新名.mp4", 20_000, "剧A"))
+
+        val result = reconcilePlaylist(current, scanned, null, emptySet(), silent = true)
+
+        assertEquals("新名.mp4", result.playlist.single().name)
+        assertEquals(20_000L, result.playlist.single().duration)
+        assertFalse(result.orderChanged)
+        assertEquals(0, result.addedCount)
+    }
+
+    @Test
+    fun `folder changes reorder grouped items before ungrouped ones`() {
+        val current = listOf(
+            item("content://video/1", "Z.mp4", 10_000, ""),
+            item("content://video/2", "A.mp4", 10_000, ""),
+        )
+        val scanned = listOf(
+            item("content://video/1", "Z.mp4", 10_000, "Movies"),
+            item("content://video/2", "A.mp4", 10_000, "Movies"),
+        )
+
+        val result = reconcilePlaylist(current, scanned, null, emptySet(), silent = true)
+
+        assertEquals(listOf("A.mp4", "Z.mp4"), result.playlist.map { it.name })
+        assertTrue(result.orderChanged)
+    }
+
+    @Test
+    fun `items missing from scan keep their old metadata`() {
+        val current = listOf(item("content://video/9", "离线.mp4", 10_000, "剧A"))
+        val scanned = listOf(item("content://video/1", "在线.mp4", 10_000, "剧A"))
+
+        val result = reconcilePlaylist(current, scanned, null, emptySet(), silent = true)
+
+        assertEquals("离线.mp4", result.playlist.single().name)
+        assertEquals("剧A", result.playlist.single().folderKey)
+    }
+}
+
+/** 缺失文件删除裁决：权限、卷状态、确认查询与 24 小时宽限期。 */
+class PruneDecisionTest {
+
+    private val videoPrefix = "content://media/external/video/media/"
+    private val audioPrefix = "content://media/external/audio/media/"
+    private val graceMs = 24 * 60 * 60 * 1000L
+
+    private fun item(uri: String) = MediaItemData(FakeUri(uri), uri)
+
+    private fun key(uri: String): String = normalizeUri(FakeUri(uri))
+
+    @Test
+    fun `confirmed deletion removes the item immediately`() {
+        val uri = "${videoPrefix}1"
+        var confirmations = 0
+
+        val result = decidePruneCandidates(
+            playlistSnapshot = listOf(item(uri)),
+            videoKeys = emptySet(),
+            audioKeys = null,
+            videoPrefix = videoPrefix,
+            audioPrefix = audioPrefix,
+            canConfirmImmediately = true,
+            missingInfo = { null },
+            confirmedDeleted = { confirmations++; true },
+            now = 1_000,
+            graceMs = graceMs,
+        )
+
+        assertTrue(result.removedUris.contains(uri))
+        assertTrue(result.missingUris.contains(uri))
+        assertTrue(result.observedUris.contains(uri))
+        assertEquals(1, confirmations)
+    }
+
+    @Test
+    fun `unconfirmed first miss is kept and recorded`() {
+        val uri = "${videoPrefix}1"
+
+        val result = decidePruneCandidates(
+            playlistSnapshot = listOf(item(uri)),
+            videoKeys = emptySet(),
+            audioKeys = null,
+            videoPrefix = videoPrefix,
+            audioPrefix = audioPrefix,
+            canConfirmImmediately = false,
+            missingInfo = { null },
+            confirmedDeleted = { error("卷不可用时不应做单条确认") },
+            now = 1_000,
+            graceMs = graceMs,
+        )
+
+        assertTrue(result.removedUris.isEmpty())
+        assertTrue(result.missingUris.contains(uri))
+        assertTrue(result.observedUris.contains(uri))
+    }
+
+    @Test
+    fun `grace expiry removes an item after repeated misses`() {
+        val uri = "${videoPrefix}1"
+        val now = 10 * graceMs
+        val missing = mapOf(uri to MissingInfo(now - graceMs - 1, 1))
+
+        val result = decidePruneCandidates(
+            playlistSnapshot = listOf(item(uri)),
+            videoKeys = emptySet(),
+            audioKeys = null,
+            videoPrefix = videoPrefix,
+            audioPrefix = audioPrefix,
+            canConfirmImmediately = false,
+            missingInfo = { missing[it] },
+            confirmedDeleted = { error("卷不可用时不应做单条确认") },
+            now = now,
+            graceMs = graceMs,
+        )
+
+        assertTrue(result.removedUris.contains(uri))
+    }
+
+    @Test
+    fun `grace not expired still keeps the item`() {
+        val uri = "${videoPrefix}1"
+        val now = 10 * graceMs
+        val missing = mapOf(uri to MissingInfo(now - graceMs + 1, 3))
+
+        val result = decidePruneCandidates(
+            playlistSnapshot = listOf(item(uri)),
+            videoKeys = emptySet(),
+            audioKeys = null,
+            videoPrefix = videoPrefix,
+            audioPrefix = audioPrefix,
+            canConfirmImmediately = false,
+            missingInfo = { missing[it] },
+            confirmedDeleted = { false },
+            now = now,
+            graceMs = graceMs,
+        )
+
+        assertTrue(result.removedUris.isEmpty())
+    }
+
+    @Test
+    fun `video is skipped when only partial visual permission is granted`() {
+        val videoUri = "${videoPrefix}1"
+
+        val result = decidePruneCandidates(
+            playlistSnapshot = listOf(item(videoUri)),
+            videoKeys = null,
+            audioKeys = emptySet(),
+            videoPrefix = videoPrefix,
+            audioPrefix = audioPrefix,
+            canConfirmImmediately = true,
+            missingInfo = { null },
+            confirmedDeleted = { error("部分授权时不应查询视频") },
+            now = 1_000,
+            graceMs = graceMs,
+        )
+
+        assertTrue(result.removedUris.isEmpty())
+        assertTrue(result.missingUris.isEmpty())
+        assertTrue(result.observedUris.isEmpty())
+    }
+
+    @Test
+    fun `audio-only permission still checks audio entries`() {
+        val videoUri = "${videoPrefix}1"
+        val audioUri = "${audioPrefix}2"
+
+        val result = decidePruneCandidates(
+            playlistSnapshot = listOf(item(videoUri), item(audioUri)),
+            videoKeys = null,
+            audioKeys = emptySet(),
+            videoPrefix = videoPrefix,
+            audioPrefix = audioPrefix,
+            canConfirmImmediately = false,
+            missingInfo = { null },
+            confirmedDeleted = { false },
+            now = 1_000,
+            graceMs = graceMs,
+        )
+
+        assertTrue(result.missingUris.contains(audioUri))
+        assertFalse(result.missingUris.contains(videoUri))
+        assertTrue(result.observedUris.contains(audioUri))
+        assertFalse(result.observedUris.contains(videoUri))
+    }
+
+    @Test
+    fun `unrelated uris are ignored`() {
+        val uri = "file:///sdcard/movie.mp4"
+
+        val result = decidePruneCandidates(
+            playlistSnapshot = listOf(item(uri)),
+            videoKeys = emptySet(),
+            audioKeys = emptySet(),
+            videoPrefix = videoPrefix,
+            audioPrefix = audioPrefix,
+            canConfirmImmediately = true,
+            missingInfo = { null },
+            confirmedDeleted = { error("非 MediaStore 条目不应查询") },
+            now = 1_000,
+            graceMs = graceMs,
+        )
+
+        assertTrue(result.missingUris.isEmpty())
+        assertTrue(result.observedUris.isEmpty())
+        assertTrue(result.removedUris.isEmpty())
+    }
+}
+
+/** 进度缓存状态机：末尾裁决、删除抑制、快照与失败重试。 */
+class ProgressCacheTest {
+
+    private fun newCache(uri: String = "u", position: Long = 10_000, duration: Long = 60_000) =
+        ProgressCache().apply { cache(uri, position, duration) }
+
+    @Test
+    fun `stored position becomes a write`() {
+        val progress = newCache()
+
+        assertEquals(mapOf("u" to 10_000L), progress.writes())
+    }
+
+    @Test
+    fun `position inside the tail is cleared instead of written`() {
+        val progress = newCache(position = 59_000)
+
+        assertTrue(progress.writes().isEmpty())
+        assertEquals(setOf("u"), progress.pendingRemovals())
+    }
+
+    @Test
+    fun `zero position is skipped`() {
+        val progress = newCache(position = 0)
+
+        assertTrue(progress.writes().isEmpty())
+        assertTrue(progress.pendingRemovals().isEmpty())
+    }
+
+    @Test
+    fun `dropped current item is not recached until it leaves the queue`() {
+        val progress = newCache()
+        progress.drop(listOf("u"), currentUri = "u")
+
+        progress.cache("u", 20_000, 60_000)
+        assertTrue(progress.writes().isEmpty())
+        assertTrue(progress.hasPendingDrops())
+
+        progress.retainPending(emptySet())
+        progress.cache("u", 30_000, 60_000)
+        assertEquals(mapOf("u" to 30_000L), progress.writes())
+    }
+
+    @Test
+    fun `dropping a non current item does not suppress it`() {
+        val progress = newCache()
+        progress.drop(listOf("u"), currentUri = "other")
+
+        progress.cache("u", 20_000, 60_000)
+        assertEquals(mapOf("u" to 20_000L), progress.writes())
+    }
+
+    @Test
+    fun `writes skip positions already persisted`() {
+        val progress = newCache()
+        progress.markPersisted(progress.snapshot(), emptySet())
+
+        assertTrue(progress.writes().isEmpty())
+
+        progress.cache("u", 20_000, 60_000)
+        assertEquals(mapOf("u" to 20_000L), progress.writes())
+    }
+
+    @Test
+    fun `successful persist clears submitted removals`() {
+        val progress = newCache(position = 59_000)
+
+        progress.markPersisted(progress.snapshot(), progress.pendingRemovals())
+
+        assertTrue(progress.pendingRemovals().isEmpty())
+    }
+
+    @Test
+    fun `failed persist keeps removals for a retry`() {
+        val progress = newCache(position = 59_000)
+
+        progress.markFailed(progress.pendingRemovals())
+
+        assertEquals(setOf("u"), progress.pendingRemovals())
+    }
+
+    @Test
+    fun `drop removes cached value and snapshot entry`() {
+        val progress = newCache()
+        progress.markPersisted(progress.snapshot(), emptySet())
+        progress.drop(listOf("u"), currentUri = null)
+
+        progress.cache("u", 20_000, 60_000)
+        assertEquals(mapOf("u" to 20_000L), progress.writes())
+    }
+
+    @Test
+    fun `clearAllPendingDrops releases all suppression`() {
+        val progress = newCache()
+        progress.drop(listOf("u"), currentUri = "u")
+        progress.clearAllPendingDrops()
+
+        progress.cache("u", 20_000, 60_000)
+        assertEquals(mapOf("u" to 20_000L), progress.writes())
     }
 }

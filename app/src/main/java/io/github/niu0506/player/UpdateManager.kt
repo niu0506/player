@@ -7,7 +7,7 @@
  * 安装：本应用**不**调起系统安装器；校验通过后提示用户在系统「下载」目录中手动安装
  *      （或点系统下载完成通知自行安装）。
  */
-package com.example.player
+package io.github.niu0506.player
 
 import android.app.DownloadManager
 import android.content.BroadcastReceiver

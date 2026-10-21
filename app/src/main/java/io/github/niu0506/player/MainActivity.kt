@@ -8,12 +8,13 @@
  *
  * 界面逻辑拆分为 [GestureController]、[FullscreenPipHelper]、[MediaListAdapter]（见 PlayerUi.kt）。
  */
-package com.example.player
+package io.github.niu0506.player
 
 import android.app.Application
 import android.content.ComponentName
 import android.content.res.Configuration
 import android.database.ContentObserver
+import android.graphics.Color
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -27,6 +28,8 @@ import android.provider.MediaStore
 import android.view.View
 import android.widget.TextView
 import androidx.activity.OnBackPressedCallback
+import androidx.activity.SystemBarStyle
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.OptIn
 import androidx.annotation.StringRes
@@ -50,7 +53,7 @@ import androidx.media3.session.SessionToken
 import androidx.media3.ui.TrackSelectionDialogBuilder
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.SimpleItemAnimator
-import com.example.player.databinding.ActivityMainBinding
+import io.github.niu0506.player.databinding.ActivityMainBinding
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
@@ -120,11 +123,7 @@ class MainActivity : AppCompatActivity() {
         PlayerService.dropProgress(uri)
         playlist.removeAt(index)
         val ctrl = controller
-        if (ctrl != null) {
-            ctrl.removeMediaItem(index)
-            // 同进程下 removeMediaItem 已在主线程完成，可立即解除进度抑制
-            PlayerService.clearPendingDrops(listOf(uri))
-        }
+        ctrl?.removeMediaItem(index)
         syncAdapterPlayingState()
         refreshPlaylist()
         savePlaylist()
@@ -188,9 +187,6 @@ class MainActivity : AppCompatActivity() {
         mainHandler.removeCallbacks(savePlaylistRunnable)
         savePlaylistNow()
     }
-
-    /** 现有条目的统一身份键集合：与扫描去重、目录回填同口径（[normalizeUri]）。 */
-    private fun existingUriKeys(): Set<String> = playlist.map { normalizeUri(it.uri) }.toSet()
 
     /** 按统一的身份键（[normalizeUri]）定位列表条目；找不到返回 -1。 */
     private fun indexOfUri(uri: String): Int {
@@ -275,12 +271,15 @@ class MainActivity : AppCompatActivity() {
             )
             .build()
 
-    /** 播放队列是否与当前列表完全一致（URI 与顺序）。 */
+    /** 播放队列是否与当前列表一致（URI、标题与顺序）；扫描刷新文件名后需重建队列。 */
     private fun queueMatchesPlaylist(ctrl: MediaController): Boolean {
         if (ctrl.mediaItemCount != playlist.size) return false
         for (i in playlist.indices) {
-            val queueUri = ctrl.getMediaItemAt(i).localConfiguration?.uri?.toString() ?: return false
+            val queueItem = ctrl.getMediaItemAt(i)
+            val queueUri = queueItem.localConfiguration?.uri?.toString() ?: return false
             if (queueUri != playlist[i].uri.toString()) return false
+            val queueTitle = queueItem.mediaMetadata.title?.toString()
+            if (queueTitle != null && queueTitle != playlist[i].name) return false
         }
         return true
     }
@@ -481,9 +480,6 @@ class MainActivity : AppCompatActivity() {
         manualScanJob = null
     }
 
-    /** 一次对账中需要应用的删除结果；计算在 IO 线程完成。 */
-    private data class PruneResult(val removedUris: Set<String> = emptySet())
-
     /**
      * 在 IO 线程查询媒体库并完成对账计算，只把结果应用回主线程。
      *
@@ -504,14 +500,14 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 用扫描结果对账：清理已删除文件、追加新文件、回填目录并重排。
+     * 用扫描结果对账：清理已删除文件、追加新文件、刷新元数据并重排。
      * @param silent 后台静默扫描（不弹提示，也不主动追加新文件）
      */
     private fun reconcileScanResult(
         scannedVideos: List<MediaItemData>?,
         scannedAudios: List<MediaItemData>?,
         silent: Boolean,
-        prune: PruneResult
+        prune: PruneCandidates
     ) {
         if (scannedVideos == null && scannedAudios == null) {
             if (!silent) {
@@ -519,35 +515,29 @@ class MainActivity : AppCompatActivity() {
             }
             return
         }
-        val removedCount = applyPruneResult(prune.removedUris)
-        val newItems = if (silent) emptyList() else {
-            val scanned = mutableListOf<MediaItemData>()
-            scannedVideos?.let(scanned::addAll)
-            scannedAudios?.let(scanned::addAll)
-            val existingKeys = existingUriKeys()
-            scanned.filter {
-                it.duration >= 5000 && normalizeUri(it.uri) !in existingKeys
-            }
-        }
-
-        val before = playlist.toList()
-        playlist.addAll(newItems)
-        val appended = playlist.toList()
-        val ordered = sortPlaylist(backfillFolderKeys(appended, buildFolderMap(scannedVideos, scannedAudios)))
-        val orderReorganized = ordered != appended
-
-        if (ordered == before && removedCount == 0) {
+        // 即使本轮没有条目被移除，也清理一次服务侧缓存（用户可能已手动删过条目）。
+        PlayerService.dropProgress(prune.removedUris)
+        val result = reconcilePlaylist(
+            current = playlist,
+            scannedVideos = scannedVideos,
+            scannedAudios = scannedAudios,
+            removedUris = prune.removedUris,
+            silent = silent,
+        )
+        val changed = result.playlist != playlist
+        if (!changed && result.removedCount == 0) {
             if (!silent) {
                 toast(R.string.toast_no_new_media)
             }
             return
         }
         playlist.clear()
-        playlist.addAll(ordered)
+        playlist.addAll(result.playlist)
+        if (result.removedCount > 0) syncAdapterPlayingState()
         refreshPlaylist()
         savePlaylist()
         controller?.let { ctrl ->
-            if (playlist.isEmpty() && removedCount > 0) {
+            if (playlist.isEmpty() && result.removedCount > 0) {
                 // 列表被清空：rebuildQueueIfNeeded 对空列表直接返回，这里显式清空队列
                 ctrl.clearMediaItems()
                 if (queueMatchesPlaylist(ctrl)) PlayerService.clearAllPendingDrops()
@@ -557,23 +547,16 @@ class MainActivity : AppCompatActivity() {
         }
         if (!silent) {
             val parts = mutableListOf<String>()
-            if (removedCount > 0) parts.add(getString(R.string.toast_scan_removed, removedCount))
-            if (newItems.isNotEmpty()) parts.add(getString(R.string.toast_scan_added, newItems.size))
-            if (orderReorganized) parts.add(getString(R.string.toast_scan_reordered))
+            if (result.removedCount > 0) {
+                parts.add(getString(R.string.toast_scan_removed, result.removedCount))
+            }
+            if (result.addedCount > 0) {
+                parts.add(getString(R.string.toast_scan_added, result.addedCount))
+            }
+            if (result.orderChanged) parts.add(getString(R.string.toast_scan_reordered))
+            if (parts.isEmpty()) parts.add(getString(R.string.toast_scan_updated))
             toastMessage(parts.joinToString("，"))
         }
-    }
-
-    /** 用扫描结果构建「归一化 URI → 分组键」映射，供回填使用。 */
-    private fun buildFolderMap(
-        scannedVideos: List<MediaItemData>?,
-        scannedAudios: List<MediaItemData>?
-    ): Map<String, String> {
-        val map = mutableMapOf<String, String>()
-        for ((uri, _, _, folderKey) in scannedVideos.orEmpty() + scannedAudios.orEmpty()) {
-            if (folderKey.isNotEmpty()) map[normalizeUri(uri)] = folderKey
-        }
-        return map
     }
 
     /**
@@ -585,8 +568,10 @@ class MainActivity : AppCompatActivity() {
         playlistSnapshot: List<MediaItemData>,
         scannedVideos: List<MediaItemData>?,
         scannedAudios: List<MediaItemData>?
-    ): PruneResult {
-        if (scannedVideos == null && scannedAudios == null) return PruneResult()
+    ): PruneCandidates {
+        if (scannedVideos == null && scannedAudios == null) {
+            return PruneCandidates(emptySet(), emptySet(), emptySet())
+        }
         val videoKeys = if (scannedVideos != null &&
             hasMediaReadAccess(this, android.Manifest.permission.READ_MEDIA_VIDEO, includePartial = false)
         ) {
@@ -597,54 +582,26 @@ class MainActivity : AppCompatActivity() {
         ) {
             scannedAudios.map { normalizeUri(it.uri) }.toSet()
         } else null
-        val videoPrefix = MediaStore.Video.Media.EXTERNAL_CONTENT_URI.toString()
-        val audioPrefix = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI.toString()
-        // 有可移除卷未挂载时，MediaStore 可能把该卷条目报成“查不到”，不能据此立即删除
-        val canConfirmImmediately = externalVolumesFullyMounted()
-
-        val missingNow = mutableSetOf<String>()
-        val observedNow = mutableSetOf<String>()
-        val removedUris = mutableSetOf<String>()
-        val now = System.currentTimeMillis()
-        for ((uri) in playlistSnapshot) {
-            val uriStr = uri.toString()
-            val keys = when {
-                uriStr.startsWith(videoPrefix) -> videoKeys
-                uriStr.startsWith(audioPrefix) -> audioKeys
-                else -> null
-            }
-            if (keys == null) continue
-            observedNow.add(uriStr)
-            val key = normalizeUri(uri)
-            if (key in keys) continue
-            missingNow.add(uriStr)
-            val prev = PlayerRepository.getMissingInfo(uriStr)
-            // 兜底判定：上一轮已缺失（count>=1）且超过宽限期，才允许在精确查询无法确认时删除
-            val graceExpired = prev != null && prev.missCount >= 1 &&
-                now - prev.firstMissingMs >= PlayerRepository.MISSING_DELETE_GRACE_MS
-            // 权威扫描未见该条时再做一次单条精确查询：确认媒体库中已无此行即立即清理，
-            // 让外部删除的文件即时消失；卷未全部挂载或查询失败/仍有行则退回宽限期兜底。
-            val confirmed = canConfirmImmediately && isConfirmedDeleted(uri)
-            if (graceExpired || confirmed) {
-                removedUris.add(uriStr)
-            }
-        }
+        val candidates = decidePruneCandidates(
+            playlistSnapshot = playlistSnapshot,
+            videoKeys = videoKeys,
+            audioKeys = audioKeys,
+            videoPrefix = MediaStore.Video.Media.EXTERNAL_CONTENT_URI.toString(),
+            audioPrefix = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI.toString(),
+            // 有可移除卷未挂载时，MediaStore 可能把该卷条目报成“查不到”，不能据此立即删除
+            canConfirmImmediately = externalVolumesFullyMounted(),
+            missingInfo = PlayerRepository::getMissingInfo,
+            confirmedDeleted = ::isConfirmedDeleted,
+            now = System.currentTimeMillis(),
+            graceMs = PlayerRepository.MISSING_DELETE_GRACE_MS,
+        )
         // 缺失记录更新是线程安全的；内部没有变化时不会触发数据库写入
-        PlayerRepository.updateMissingRecords(missingNow, observedNow, removedUris)
-        return PruneResult(removedUris)
-    }
-
-    /** 在主线程应用对账删除结果，返回实际从列表移除的数量。 */
-    private fun applyPruneResult(removedUris: Set<String>): Int {
-        if (removedUris.isEmpty()) return 0
-        val before = playlist.size
-        playlist.removeAll { it.uri.toString() in removedUris }
-        val removedCount = before - playlist.size
-        // 进度一次批量删除；播放队列由本轮扫描末尾的 rebuildQueueIfNeeded 统一重建。
-        // 即使 removedCount == 0 也调用：用户可能已手动删条目，但服务侧缓存仍需清理。
-        PlayerService.dropProgress(removedUris)
-        if (removedCount > 0) syncAdapterPlayingState()
-        return removedCount
+        PlayerRepository.updateMissingRecords(
+            candidates.missingUris,
+            candidates.observedUris,
+            candidates.removedUris,
+        )
+        return candidates
     }
 
     /**
@@ -711,6 +668,12 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // 深色界面固定用浅色系统栏图标；Android 15+ 强制 edge-to-edge，
+        // 普通界面的 insets 由 FullscreenPipHelper 统一消费。
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.dark(Color.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.dark(Color.TRANSPARENT),
+        )
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
         // 只在界面可见（STARTED）时收集提示事件：进入后台后不再对着不可见界面弹 Toast。

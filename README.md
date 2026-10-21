@@ -8,8 +8,8 @@
 
 ### 播放
 
-- **媒体库扫描与对账**：基于 MediaStore 扫描视频/音频（手动「扫描」导入 ≥5 秒的媒体）；监听媒体库变化并防抖对账，启动/回前台静默刷新。拥有对应类型完整权限时，对缺失条目再做一次单条复核，确认删除即清理；查询失败或可移除卷未挂载时，退回「连续两轮缺失 + 24 小时宽限期」，避免误删
-- **按文件夹分组连播**：记录每个文件的目录（API 29+ 取 `RELATIVE_PATH`，更低版本取父目录），按「文件夹 + 组内自然序」排序（`第2集` 先于 `第10集`），分集连续相邻、自动连播不串剧；扫描时回填目录并重排，进度按 URI 记录，不受重排影响。**建议每部剧放在独立文件夹**；读不到目录的条目排在末尾
+- **媒体库扫描与对账**：基于 MediaStore 扫描视频/音频（手动「扫描」导入 ≥5 秒的媒体）；监听媒体库变化并防抖对账，启动/回前台静默刷新。拥有对应类型完整权限时，对缺失条目再做一次单条复核，确认删除即清理；查询失败或可移除卷未挂载时，退回「连续两轮缺失 + 24 小时宽限期」，避免误删。手动扫描会刷新已存在条目的文件名、时长与文件夹；静默扫描只清理/刷新，不主动追加新文件
+- **按文件夹分组连播**：记录每个文件的目录（API 29+ 取 `RELATIVE_PATH`，更低版本取父目录），按「文件夹 + 组内自然序」排序（`第2集` 先于 `第10集`），同文件夹的分集连续相邻。播完当前文件夹最后一项后会继续播放下一文件夹（跨剧连续播放，不会在剧末自动停止）；扫描时刷新文件名 / 时长 / 目录并重排，进度按 URI 记录，不受重排影响。**建议每部剧放在独立文件夹**；读不到目录的条目排在末尾
 - **播放控制**：播放/暂停、拖动进度、随机播放、循环模式（顺序/单曲/列表）；快退/快进 15s 由双击手势完成，控制栏不再显示对应按钮；播放视频时保持屏幕常亮；列表可删除条目并同步清除进度；播放出错自动跳到下一项，无下一项或整份列表均失败时停止
 - **音轨 / 字幕**：多音轨视频可切换音轨，内嵌字幕可切换
 - **变速播放**：0.5x ~ 3.0x 共 7 档；倍速由 Service 侧播放器持有，controller 重连后按钮文案会重新同步
@@ -36,8 +36,15 @@
 
 ### 系统适配
 
+- **Android 15+（API 35）**：targetSdk 37 强制 edge-to-edge；普通界面消费 `systemBars` / `displayCutout` insets，全屏 / PiP 时让画面铺满窗口
 - **Android 14+（API 34）**：支持 Selected Photos Access；部分授权时跳过对应类型的删除对账，避免误删未授权文件
 - **Android 13+（API 33）**：动态申请通知权限（前台服务通知）与媒体读取权限
+
+### 已知限制
+
+- 扫描使用 `MediaStore` 的 `EXTERNAL_CONTENT_URI`，只覆盖主存储卷；SD 卡 / OTG 上的媒体暂不导入
+- 播放器表面使用 `TextureView`（圆角卡片与 PiP 过渡需要），功耗与 HDR 表现不如 `SurfaceView`；以 HDR 优先时可改为 `surface_view` 并放弃圆角裁剪
+- 字幕只支持视频内嵌轨道，外部 `.srt` / `.ass` 尚未加载
 
 ## 技术栈
 
@@ -61,7 +68,7 @@
 
 ## 开发须知（易踩的坑）
 
-- **Room 迁移**：数据库未启用 `fallbackToDestructiveMigration`。升级 `@Database(version)` 时必须补 `Migration(N, M)` 并加入 `addMigrations(...)`，否则打开数据库会直接报错。实体的 `@ColumnInfo(defaultValue = "''")` 要与迁移 SQL 字面量一致，否则 `TableInfo` 校验会报 `Migration didn't properly handle`。构建后提交 `app/schemas/com.example.player.PlayerDatabase/<M>.json`，它是后续迁移的 diff 基准
+- **Room 迁移**：数据库未启用 `fallbackToDestructiveMigration`。升级 `@Database(version)` 时必须补 `Migration(N, M)` 并加入 `addMigrations(...)`，否则打开数据库会直接报错。实体的 `@ColumnInfo(defaultValue = "''")` 要与迁移 SQL 字面量一致，否则 `TableInfo` 校验会报 `Migration didn't properly handle`。构建后提交 `app/schemas/io.github.niu0506.player.PlayerDatabase/<M>.json`，它是后续迁移的 diff 基准
 - **更新下载目标**：DownloadManager 的 `setDestinationUri` 只接受 `file://`，传 `content://`（MediaStore 目标）会抛 `IllegalArgumentException` 导致闪退；因此使用 `setDestinationInExternalPublicDir` 写入公共「下载」目录，勿改回 `content://`
 
 ## 签名（Release）
@@ -71,15 +78,15 @@
 1. 环境变量：`KEYSTORE_FILE` / `KEYSTORE_PASSWORD` / `KEY_ALIAS` / `KEY_PASSWORD`（CI 经 Secrets 注入）
 2. 本地文件 `keystore.properties`（已加入 `.gitignore`，不会提交）
 
-两者都没有时，release 构建自动回退为无签名产物（`*-unsigned.apk`），构建不会失败。
+两者都没有时，普通本地构建会回退为无签名产物（`*-unsigned.apk`），构建不会失败；但 CI 的 `v*` tag 构建强制要求签名 Secrets，缺少会直接失败，避免把未签名包发布给用户。
 
 ## CI 与发布
 
-`.github/workflows/build.yml`：push 到 `main`、打 `v*` tag 或提 PR 时执行**单元测试 → lint → 构建 Release APK**（前两步失败即中止；无签名 Secrets 时输出无签名包）；`v*` tag 额外触发 Release job。
+`.github/workflows/build.yml`：push 到 `main`、打 `v*` tag 或提 PR 时执行**单元测试 → lint → 构建 Release APK**（前两步失败即中止）。`v*` tag 额外要求：tag 与 `versionName` 一致、签名 Secrets 齐全，并用 `apksigner` 验证产物签名，随后触发 Release job；普通分支 / PR 无 Secrets 时才允许输出无签名包。
 
 发布新版本：
 
-1. 递增 `app/build.gradle.kts` 的 `versionCode` 与 `versionName`；
+1. 递增 `app/build.gradle.kts` 的 `versionCode` 与 `versionName`（`versionCode` 必须大于上一版，否则 Android 会拒绝覆盖安装）；
 2. 更新仓库根 `version.json` 的 `notes`（供 CI 生成 Release 说明；版本号以 `build.gradle.kts` 为唯一来源）；
 3. 提交并推送 `main`，再推送与 `versionName` 同名的 `v<版本>` tag；
 4. CI 构建签名 Release APK（资产名 `player-v<版本>-release.apk`，同时生成同名 `.sha256`）并创建 GitHub Release，正文附 SHA-256；应用内更新直接取资产 `digest`，缺失则 fail-closed。
@@ -88,21 +95,23 @@
 
 将构建出的 `app-debug.apk` 传输到设备后直接安装，或使用 Android Studio 运行到设备/模拟器。首次使用需授予媒体访问权限。应用内更新只负责下载并校验更新包，安装由用户在系统「下载」目录手动完成。
 
+> **包名迁移（1.6.0）**：从 1.6.0 起包名为 `io.github.niu0506.player`。旧版（`com.example.player`）无法覆盖安装或通过应用内更新升级到 1.6.0+，需要卸载旧版后安装新包；旧版的播放列表与进度不会迁移。
+
 ## 目录结构
 
 ```
-app/src/main/java/com/example/player/     # 单包，共 5 个文件
+app/src/main/java/io/github/niu0506/player/     # 单包，共 5 个文件
 ├── MainActivity.kt      # UI 入口（含 PlayerApp 初始化）、播放列表、进度恢复与更新流程编排
 ├── PlayerRepository.kt  # 数据模型 + 媒体库扫描 + Room 数据库与统一写入入口
 ├── PlayerService.kt     # 前台服务、后台播放、进度持久化、不可信控制器拦截
 ├── PlayerUi.kt          # 手势、全屏/画中画、播放列表适配器（DiffUtil 后台差分）
 └── UpdateManager.kt     # 更新检查/下载/校验，及升级后清理包（PackageReplacedReceiver）
 
-app/src/test/java/com/example/player/PlayerTests.kt    # 纯逻辑单测（进度合并与末尾裁决、排序、校验、格式化等）
-app/schemas/com.example.player.PlayerDatabase/         # Room 导出 schema（须提交，作为迁移 diff 基准）
+app/src/test/java/io/github/niu0506/player/PlayerTests.kt    # 纯逻辑单测（扫描对账、进度状态机、排序、校验、格式化等）
+app/schemas/io.github.niu0506.player.PlayerDatabase/         # Room 导出 schema（须提交，作为迁移 diff 基准）
 app/src/main/res/values/strings.xml                    # 全部用户可见文案（均经资源引用）
 ```
 
 ## License
 
-未指定。
+MIT，见 [LICENSE](LICENSE)。

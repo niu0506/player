@@ -16,16 +16,16 @@ fun envOrProp(envKey: String, propKey: String): String? =
     System.getenv(envKey) ?: keystoreProperties.getProperty(propKey)
 
 android {
-    namespace = "com.example.player"
+    namespace = "io.github.niu0506.player"
 
     compileSdk = 37
     defaultConfig {
-        applicationId = "com.example.player"
+        applicationId = "io.github.niu0506.player"
         minSdk = 24
         // 目标最新的稳定版本；compileSdk 37 亦满足 media3 1.11 的传递依赖要求
         targetSdk = 37
-        versionCode = 58
-        versionName = "1.5.23"
+        versionCode = 59
+        versionName = "1.6.0"
     }
 
     signingConfigs {
@@ -79,10 +79,12 @@ dependencies {
     implementation(libs.appcompat)
     implementation(libs.recyclerview)
     implementation(libs.activity.ktx)
+    implementation(libs.core.ktx)
+    implementation(libs.lifecycle.runtime.ktx)
     implementation(libs.material)
     implementation(libs.coroutines.android)
+    implementation(libs.listenablefuture)
     testImplementation(libs.junit)
-
     testImplementation(libs.json)
 
     implementation(libs.room.runtime)

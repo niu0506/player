@@ -4,11 +4,11 @@
  * 基于 Media3 的 [MediaSessionService] 托管一个 ExoPlayer：
  * 1. 提供媒体会话（通知栏与外部控制器通过它操控播放）；
  * 2. 负责播放进度的采集与持久化（每 5 秒一次快照，暂停 / seek / 内存吃紧 / 销毁时立即落盘）；
- * 3. 播放出错时自动跳到下一项，并对外广播 [com.example.player.PlayerService.Companion.PlaybackErrorEvent]。
+ * 3. 播放出错时自动跳到下一项，并对外广播 [io.github.niu0506.player.PlayerService.Companion.PlaybackErrorEvent]。
  *
  * 注意：倍速等播放参数由本服务的播放器持有，界面重建后需从会话重新读取以保持同步。
  */
-package com.example.player
+package io.github.niu0506.player
 
 import android.content.Intent
 import android.os.Handler
@@ -45,22 +45,8 @@ class PlayerService : MediaSessionService() {
     /** 连续播放错误次数：用于判断是否整份列表都播放失败。 */
     private var consecutiveErrorCount = 0
 
-    /** 待落盘的进度缓存（uri → 毫秒），尚未写入数据库。 */
-    private val progressCache = mutableMapOf<String, Long>()
-
-    /** 待落盘的删除集合（进度需从数据库移除的 uri）。 */
-    private val removedUris = mutableSetOf<String>()
-
-    /**
-     * 刚被要求删除进度、但播放器时间线里可能还存在的 uri。
-     *
-     * 删除条目时 dropProgress 先于播放器真正移除执行；在队列重建/会话命令完成前，
-     * ticker 仍可能把当前项的进度缓存回来。这里在 URI 真正离开时间线前拒绝重新缓存。
-     */
-    private val pendingDropUris = mutableSetOf<String>()
-
-    /** 上一次成功落盘时的缓存快照，用于跳过无变化的写入。 */
-    private var lastPersistedSnapshot: Map<String, Long> = emptyMap()
+    /** 待落盘的进度缓存；把时间线事件与写库裁决收在一个可单测的状态对象里。 */
+    private val progress = ProgressCache()
 
     /** 当前媒体项的 uri，用于自动切歌时清除上一首的进度。 */
     private var lastPlayedUri: String? = null
@@ -70,11 +56,7 @@ class PlayerService : MediaSessionService() {
             if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO) {
                 // 自动连播到下一首：上一首视为自然播完，清除其断点
 
-                val prevUri = lastPlayedUri
-                if (prevUri != null) {
-                    progressCache.remove(prevUri)
-                    removedUris.add(prevUri)
-                }
+                lastPlayedUri?.let(progress::clear)
 
             }
             lastPlayedUri = mediaItem?.localConfiguration?.uri?.toString()
@@ -119,10 +101,7 @@ class PlayerService : MediaSessionService() {
                     ?.localConfiguration
                     ?.uri
                     ?.toString()
-                    ?.let { uri ->
-                        progressCache.remove(uri)
-                        removedUris.add(uri)
-                    }
+                    ?.let(progress::clear)
             }
             if (reason == Player.DISCONTINUITY_REASON_SEEK && !sameItem) {
                 // 跨条目 seek：先补记旧条目的位置，再统一落盘
@@ -169,7 +148,7 @@ class PlayerService : MediaSessionService() {
     /** 周期落盘任务：播放中或仍有待删除项时，每次执行后重新排期。 */
     private val progressTicker = Runnable {
         tickerScheduled = false
-        if (player?.isPlaying == true || removedUris.isNotEmpty()) {
+        if (player?.isPlaying == true || progress.hasPendingRemovals()) {
             persistProgress()
             scheduleProgressTicker()
         }
@@ -252,15 +231,7 @@ class PlayerService : MediaSessionService() {
 
     /** 按裁决结果缓存某个条目的播放位置（当前项与已切走的旧项共用）。 */
     private fun cachePosition(uri: String?, positionMs: Long, durationMs: Long) {
-        if (uri == null || uri in pendingDropUris) return
-        when (val decision = decideProgressWrite(positionMs, durationMs)) {
-            ProgressWriteDecision.Clear -> {
-                progressCache.remove(uri)
-                removedUris.add(uri)
-            }
-            is ProgressWriteDecision.Store -> progressCache[uri] = decision.positionMs
-            ProgressWriteDecision.Skip -> Unit
-        }
+        progress.cache(uri, positionMs, durationMs)
     }
 
     /** 缓存当前播放位置。 */
@@ -288,31 +259,29 @@ class PlayerService : MediaSessionService() {
     /** 收集当前变更并落盘（无变化则跳过写库）。 */
     private fun persistProgress() {
         val player = this.player ?: return
-        if (pendingDropUris.isNotEmpty()) {
-            // URI 已真正离开播放队列后解除抑制，避免集合无限增长
+        // URI 已真正离开播放队列后解除抑制，避免集合无限增长
+        if (progress.hasPendingDrops()) {
             val present = (0 until player.mediaItemCount)
                 .mapNotNull { player.getMediaItemAt(it).localConfiguration?.uri?.toString() }
                 .toSet()
-            pendingDropUris.retainAll(present)
+            progress.retainPending(present)
         }
         cacheCurrentPosition(player)
-        val removals = removedUris.toSet()
-        val writes = progressCache.filter { (uri, pos) -> lastPersistedSnapshot[uri] != pos }
+        val removals = progress.pendingRemovals()
+        val writes = progress.writes()
         if (writes.isEmpty() && removals.isEmpty()) return
         writeToDisk(writes, removals)
     }
 
     /** 提交一次数据库写入；成功更新快照，失败则保留待写数据并重新排期。 */
     private fun writeToDisk(writes: Map<String, Long>, removals: Set<String>) {
-        val snapshot = progressCache.toMap()
+        val snapshot = progress.snapshot()
         PlayerRepository.applyProgressUpdates(writes, removals) { persisted ->
             mainHandler.post {
                 if (persisted) {
-                    removedUris.removeAll(removals)
-                    lastPersistedSnapshot = snapshot
+                    progress.markPersisted(snapshot, removals)
                 } else {
-                    removedUris.addAll(removals)
-                    lastPersistedSnapshot = emptyMap()
+                    progress.markFailed(removals)
                     if (!destroyed) scheduleProgressTicker()
                 }
             }
@@ -385,32 +354,109 @@ class PlayerService : MediaSessionService() {
                 ?.localConfiguration
                 ?.uri
                 ?.toString()
-            // 连快照一并移除：否则下一轮落盘会按旧快照把同一次删除再提交一遍
-            for (key in keys) svc.progressCache.remove(key)
-            svc.lastPersistedSnapshot -= keys
-            // 播放器真正移除该条目前，ticker 不得把它的位置重新缓存回来
-            for (key in keys) {
-                if (key == currentUri) svc.pendingDropUris.add(key)
-            }
+            // 连快照一并移除，避免下一轮落盘按旧快照重复提交；当前项还会进入
+            // pendingDrops，直到播放器真正把它移出队列才允许重新缓存进度。
+            svc.progress.drop(keys, currentUri)
         }
 
         /** 删除单条进度。 */
         fun dropProgress(uri: String) = dropProgress(listOf(uri))
 
-        /** 播放队列已按列表重建后，解除对这些 URI 的进度抑制。 */
-        fun clearPendingDrops(uris: Collection<String>) {
-            instance?.pendingDropUris?.removeAll(uris.toSet())
-        }
-
         /** 队列与列表已一致时清空全部抑制项（用于条目在控制器未连接时被删除的兜底）。 */
         fun clearAllPendingDrops() {
-            instance?.pendingDropUris?.clear()
+            instance?.progress?.clearAllPendingDrops()
         }
 
         /** 立即把当前播放位置落盘（暂停 / 切后台 / 点播前调用）。 */
         fun flushCurrentPosition() {
             instance?.persistProgress()
         }
+    }
+}
+
+/**
+ * 播放进度的内存状态：缓存待写位置、待删除 URI、删除抑制与落盘快照。
+ *
+ * 只负责纯状态迁移，不碰 Handler / Media3，便于单元测试覆盖切歌、暂停、
+ * 显式 seek 回 0、删除条目等生命周期路径。
+ */
+internal class ProgressCache {
+
+    /** 待落盘位置（uri → 毫秒）。 */
+    private val cached = mutableMapOf<String, Long>()
+
+    /** 需要从数据库删除进度的 uri。 */
+    private val removals = mutableSetOf<String>()
+
+    /**
+     * 已删除但播放器时间线里可能还存在的 uri。
+     * 在它真正离开队列前，ticker 不得把旧位置重新缓存回来。
+     */
+    private val pendingDrops = mutableSetOf<String>()
+
+    /** 上一次成功落盘时的缓存快照，用于跳过无变化的写入。 */
+    private var lastPersisted: Map<String, Long> = emptyMap()
+
+    /** 按末尾容差裁决缓存一个位置；[uri] 为 null 时忽略。 */
+    fun cache(uri: String?, positionMs: Long, durationMs: Long) {
+        if (uri == null || uri in pendingDrops) return
+        when (val decision = decideProgressWrite(positionMs, durationMs)) {
+            ProgressWriteDecision.Clear -> clear(uri)
+            is ProgressWriteDecision.Store -> cached[uri] = decision.positionMs
+            ProgressWriteDecision.Skip -> Unit
+        }
+    }
+
+    /** 显式清除某条进度（自动连播结束、seek 回 0）。 */
+    fun clear(uri: String?) {
+        if (uri == null) return
+        cached.remove(uri)
+        removals.add(uri)
+    }
+
+    /**
+     * 删除条目时同步清理缓存。
+     * @param currentUri 当前播放项；只有它需要进入 pendingDrops，防止 ticker 回写。
+     */
+    fun drop(uris: Collection<String>, currentUri: String?) {
+        for (key in uris) {
+            cached.remove(key)
+            lastPersisted = lastPersisted - key
+            if (key == currentUri) pendingDrops.add(key)
+        }
+    }
+
+    /** URI 真正离开播放队列后解除删除抑制。 */
+    fun retainPending(present: Set<String>) {
+        pendingDrops.retainAll(present)
+    }
+
+    fun hasPendingDrops(): Boolean = pendingDrops.isNotEmpty()
+
+    fun hasPendingRemovals(): Boolean = removals.isNotEmpty()
+
+    fun pendingRemovals(): Set<String> = removals.toSet()
+
+    /** 只返回相对上次成功落盘有变化的写入。 */
+    fun writes(): Map<String, Long> =
+        cached.filter { (uri, position) -> lastPersisted[uri] != position }
+
+    fun snapshot(): Map<String, Long> = cached.toMap()
+
+    /** 落盘成功：更新快照并移除本次已提交的删除项。 */
+    fun markPersisted(snapshot: Map<String, Long>, writtenRemovals: Set<String>) {
+        removals.removeAll(writtenRemovals)
+        lastPersisted = snapshot
+    }
+
+    /** 落盘失败：保留本次删除项并清空快照，下一轮重写全部内容。 */
+    fun markFailed(writtenRemovals: Set<String>) {
+        removals.addAll(writtenRemovals)
+        lastPersisted = emptyMap()
+    }
+
+    fun clearAllPendingDrops() {
+        pendingDrops.clear()
     }
 }
 

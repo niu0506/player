@@ -4,7 +4,7 @@
  * - [GestureController]：播放器手势（单击显隐控制栏、双击左/中/右区域快退/播放暂停/快进、横滑快进快退、上下滑调亮度 / 音量）；
  * - [MediaListAdapter]：播放列表 RecyclerView 适配器（DiffUtil 后台差分刷新）。
  */
-package com.example.player
+package io.github.niu0506.player
 
 import android.annotation.SuppressLint
 import android.app.Activity
@@ -33,7 +33,7 @@ import androidx.annotation.OptIn
 import androidx.annotation.RequiresApi
 import androidx.annotation.StringRes
 import androidx.appcompat.app.AppCompatActivity
-import androidx.core.view.WindowCompat
+import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.media3.common.C
@@ -45,8 +45,8 @@ import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 import androidx.recyclerview.widget.DiffUtil
 import androidx.recyclerview.widget.RecyclerView
-import com.example.player.databinding.ActivityMainBinding
-import com.example.player.databinding.ItemMediaBinding
+import io.github.niu0506.player.databinding.ActivityMainBinding
+import io.github.niu0506.player.databinding.ItemMediaBinding
 import java.util.Date
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -93,8 +93,8 @@ class FullscreenPipHelper(
     private val controllerProvider: () -> MediaController?
 ) {
     private companion object {
-        /** 全屏顶部时钟 / 电量的刷新间隔。 */
-        const val INFO_TICK_MS = 1000L
+        /** 全屏顶部只显示到分钟，30 秒刷新一次即可。 */
+        const val INFO_TICK_MS = 30_000L
     }
 
     var isFullscreen = false
@@ -102,6 +102,17 @@ class FullscreenPipHelper(
 
     var isInPipMode = false
         private set
+
+    /** 已发出 PiP 进入请求、回调尚未到达的过渡态。 */
+    private var pipPreparing = false
+
+    /**
+     * 正在同步 Media3 控制栏的全屏按钮状态。
+     *
+     * [PlayerView.setFullscreenButtonState] 会回调 FullscreenButtonClickListener，
+     * 从左上角返回 / 系统返回 / 进入 PiP 时直接调用 setFullscreen 会重入；这里挡掉。
+     */
+    private var applyingFullscreen = false
 
     /** 全屏顶部信息（文件名 / 系统时间 / 电量）的定时刷新。 */
     private val infoHandler = Handler(Looper.getMainLooper())
@@ -114,6 +125,21 @@ class FullscreenPipHelper(
     }
 
     init {
+        // Android 15+ 对 targetSdk 35+ 强制 edge-to-edge：普通界面必须自己消费系统栏 insets，
+        // 全屏 / PiP 时则让画面真正铺满窗口。
+        ViewCompat.setOnApplyWindowInsetsListener(binding.root) { view, insets ->
+            val bars = insets.getInsets(
+                WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout()
+            )
+            val apply = !isFullscreen && !isInPipMode && !pipPreparing
+            view.setPadding(
+                if (apply) bars.left else 0,
+                if (apply) bars.top else 0,
+                if (apply) bars.right else 0,
+                if (apply) bars.bottom else 0,
+            )
+            insets
+        }
         // 信息条跟随控制栏：控制栏 3 秒后自动隐藏时，顶部信息一并隐藏；点按唤出时再显示。
         binding.playerView.setControllerVisibilityListener(
             PlayerView.ControllerVisibilityListener { visibility ->
@@ -124,9 +150,15 @@ class FullscreenPipHelper(
         )
     }
 
+    /** 状态切换后重新请求一次 insets，让普通模式与全屏 / PiP 的 padding 立即生效。 */
+    private fun requestContentInsets() {
+        ViewCompat.requestApplyInsets(binding.root)
+    }
+
     /** 系统 PiP 模式切换回调：退出 PiP 且非全屏时恢复系统栏。 */
     fun onPipModeChanged(isInPictureInPictureMode: Boolean) {
         isInPipMode = isInPictureInPictureMode
+        pipPreparing = false
         if (!isInPictureInPictureMode && !isFullscreen) {
             showSystemBars()
         }
@@ -194,12 +226,13 @@ class FullscreenPipHelper(
 
     /** 根据当前（普通 / 全屏 / PiP）状态统一套用界面样式。 */
     private fun applyVisualState(pipPreparing: Boolean = false) {
+        this.pipPreparing = pipPreparing
         val pipLike = isInPipMode || pipPreparing
         setChromeVisible(!pipLike && !isFullscreen)
         setFullscreenBackVisible(isFullscreen && !pipLike)
-        applyInfoBar(isFullscreen && !pipLike)
         binding.playerView.useController = !pipLike
         applyInfoBar(isFullscreen && !pipLike && binding.playerView.isControllerFullyVisible)
+        requestContentInsets()
         when {
             // PiP（或进入前的过渡态）：按真实比例缩放铺满小窗
             pipLike -> applyEdgeToEdgeSurface(AspectRatioFrameLayout.RESIZE_MODE_ZOOM)
@@ -228,31 +261,38 @@ class FullscreenPipHelper(
         binding.playerCard.layoutParams = lp
     }
 
-    /** 切换全屏（横屏 + 隐藏系统栏）。 */
+    /** 切换全屏（横屏 + 隐藏系统栏），并同步控制栏里的全屏 / 退出全屏图标。 */
     fun setFullscreen(enabled: Boolean) {
-        isFullscreen = enabled
-        if (enabled) {
-            activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-            hideSystemBars()
-        } else {
-            activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
-            showSystemBars()
+        if (applyingFullscreen) return
+        applyingFullscreen = true
+        try {
+            isFullscreen = enabled
+            // 左上角返回、系统返回、进入 PiP 等路径不经过控制栏按钮，必须显式同步状态，
+            // 否则退出全屏后按钮仍显示“退出全屏”图标。
+            binding.playerView.setFullscreenButtonState(enabled)
+            if (enabled) {
+                activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                hideSystemBars()
+            } else {
+                activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+                showSystemBars()
+            }
+            applyVisualState()
+        } finally {
+            applyingFullscreen = false
         }
-        applyVisualState()
     }
 
     private fun hideSystemBars() {
-        WindowCompat.setDecorFitsSystemWindows(activity.window, false)
         val insetsController = WindowInsetsControllerCompat(activity.window, binding.root)
-        insetsController.hide(WindowInsetsCompat.Type.systemBars())
+        insetsController.hide(WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout())
         insetsController.systemBarsBehavior =
             WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
     }
 
     private fun showSystemBars() {
-        WindowCompat.setDecorFitsSystemWindows(activity.window, true)
         WindowInsetsControllerCompat(activity.window, binding.root)
-            .show(WindowInsetsCompat.Type.systemBars())
+            .show(WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout())
     }
 
     /** 仅在正在播放视频时自动进入 PiP（Home 键触发），失败不提示。 */
@@ -352,6 +392,7 @@ class FullscreenPipHelper(
         applyInfoBar(
             isFullscreen && !isInPipMode && binding.playerView.isControllerFullyVisible
         )
+        requestContentInsets()
     }
 
     /** Activity onStop：若仍在 PiP 则暂停并清除 PiP 标记，同时停止顶部信息刷新。 */
@@ -359,6 +400,7 @@ class FullscreenPipHelper(
         if (isInPipMode) {
             controllerProvider()?.pause()
             isInPipMode = false
+            pipPreparing = false
         }
         infoTickerRunning = false
         infoHandler.removeCallbacks(infoTick)

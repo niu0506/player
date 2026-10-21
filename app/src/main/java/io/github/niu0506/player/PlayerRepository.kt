@@ -10,7 +10,7 @@
  * 设计要点：内存状态始终为权威读取源（[PlayerRepository.getPlaylist] 等），
  * 数据库写入经 [PlayerRepository.dispatchWrite] 串行化，写入失败会重试并对外广播；加载失败时，写入路径按冷却时间重试。
  */
-package com.example.player
+package io.github.niu0506.player
 
 import android.content.Context
 import android.content.pm.PackageManager
@@ -226,24 +226,133 @@ internal suspend fun <T> withOrderedRetry(
     null
 }
 
+/** 扫描导入的最短时长：过滤提示音、极短片段等噪声。 */
+internal const val MIN_SCAN_DURATION_MS = 5_000L
+
 /**
- * 回填缺失的文件夹分组键：仅对 [MediaItemData.folderKey] 为空的条目，
- * 按扫描结果的 uri→folder 映射补齐（已有分组不覆盖）。无变化时原样返回。
+ * 用扫描结果刷新已有条目的元数据。
+ *
+ * MediaStore 的 URI（ID）通常稳定，但文件名、时长和所在文件夹都可能变化
+ * （重命名、移动目录、重新编码）。这里按 [normalizeUri] 匹配扫描结果并覆盖
+ * 对应字段；扫描结果中不存在的条目保持原样（例如 SD 卡暂时不可用）。
  */
-internal fun backfillFolderKeys(
+internal fun mergeScannedMetadata(
     items: List<MediaItemData>,
-    uriToFolder: Map<String, String>
+    scanned: List<MediaItemData>
 ): List<MediaItemData> {
-    if (uriToFolder.isEmpty()) return items
+    if (items.isEmpty() || scanned.isEmpty()) return items
+    val scannedByKey = scanned.associateBy { normalizeUri(it.uri) }
     var changed = false
-    val result = items.map { item ->
-        if (item.folderKey.isNotEmpty()) return@map item
-        val folder = uriToFolder[normalizeUri(item.uri)].orEmpty()
-        if (folder.isEmpty()) return@map item
-        changed = true
-        item.copy(folderKey = folder)
+    val merged = items.map { item ->
+        val scannedItem = scannedByKey[normalizeUri(item.uri)] ?: return@map item
+        val name = scannedItem.name.ifBlank { item.name }
+        val duration = if (scannedItem.duration > 0) scannedItem.duration else item.duration
+        if (name == item.name &&
+            duration == item.duration &&
+            scannedItem.folderKey == item.folderKey
+        ) {
+            item
+        } else {
+            changed = true
+            item.copy(name = name, duration = duration, folderKey = scannedItem.folderKey)
+        }
     }
-    return if (changed) result else items
+    return if (changed) merged else items
+}
+
+/** 一次扫描对账的结果；纯计算，不涉及 Activity/播放器状态。 */
+internal data class ScanReconcileResult(
+    val playlist: List<MediaItemData>,
+    val addedCount: Int,
+    val removedCount: Int,
+    /** 条目顺序是否发生变化（仅比较 URI 顺序，不把元数据刷新算作重排）。 */
+    val orderChanged: Boolean,
+)
+
+/**
+ * 纯函数对账：删除已消失条目、追加新文件、刷新已有条目元数据并重排。
+ *
+ * @param removedUris 本轮扫描确认需要删除的 URI（见 [decidePruneCandidates]）
+ * @param silent 静默扫描只做清理/元数据刷新，不追加新文件
+ */
+internal fun reconcilePlaylist(
+    current: List<MediaItemData>,
+    scannedVideos: List<MediaItemData>?,
+    scannedAudios: List<MediaItemData>?,
+    removedUris: Set<String>,
+    silent: Boolean,
+): ScanReconcileResult {
+    val afterPrune = if (removedUris.isEmpty()) {
+        current
+    } else {
+        current.filterNot { it.uri.toString() in removedUris }
+    }
+    val scanned = scannedVideos.orEmpty() + scannedAudios.orEmpty()
+    val newItems = if (silent) {
+        emptyList()
+    } else {
+        val seen = afterPrune.map { normalizeUri(it.uri) }.toMutableSet()
+        scanned.filter { item ->
+            item.duration >= MIN_SCAN_DURATION_MS && seen.add(normalizeUri(item.uri))
+        }
+    }
+    val appended = afterPrune + newItems
+    val merged = mergeScannedMetadata(appended, scanned)
+    val ordered = sortPlaylist(merged)
+    return ScanReconcileResult(
+        playlist = ordered,
+        addedCount = newItems.size,
+        removedCount = current.size - afterPrune.size,
+        orderChanged = ordered.map { it.uri.toString() } != appended.map { it.uri.toString() },
+    )
+}
+
+/** 缺失文件对账的中间结果；由 IO 线程计算，主线程只负责应用。 */
+internal data class PruneCandidates(
+    val missingUris: Set<String>,
+    val observedUris: Set<String>,
+    val removedUris: Set<String>,
+)
+
+/**
+ * 纯函数：根据本轮扫描、权限、卷状态与缺失记录，决定哪些条目可以删除。
+ *
+ * - 只有拥有对应类型完整权限时才检查该类型（部分授权下 [videoKeys]/[audioKeys] 为 null）；
+ * - 可移除卷未全部挂载时不做单条“已删除”确认，退回 24 小时宽限期；
+ * - 宽限期到期或单条查询确认已无此行，才加入 [PruneCandidates.removedUris]。
+ */
+internal fun decidePruneCandidates(
+    playlistSnapshot: List<MediaItemData>,
+    videoKeys: Set<String>?,
+    audioKeys: Set<String>?,
+    videoPrefix: String,
+    audioPrefix: String,
+    canConfirmImmediately: Boolean,
+    missingInfo: (String) -> MissingInfo?,
+    confirmedDeleted: (Uri) -> Boolean,
+    now: Long,
+    graceMs: Long,
+): PruneCandidates {
+    val missingNow = mutableSetOf<String>()
+    val observedNow = mutableSetOf<String>()
+    val removedUris = mutableSetOf<String>()
+    for ((uri) in playlistSnapshot) {
+        val uriStr = uri.toString()
+        val keys = when {
+            uriStr.startsWith(videoPrefix) -> videoKeys
+            uriStr.startsWith(audioPrefix) -> audioKeys
+            else -> null
+        } ?: continue
+        observedNow.add(uriStr)
+        if (normalizeUri(uri) in keys) continue
+        missingNow.add(uriStr)
+        val prev = missingInfo(uriStr)
+        val graceExpired = prev != null && prev.missCount >= 1 &&
+            now - prev.firstMissingMs >= graceMs
+        val confirmed = canConfirmImmediately && confirmedDeleted(uri)
+        if (graceExpired || confirmed) removedUris.add(uriStr)
+    }
+    return PruneCandidates(missingNow, observedNow, removedUris)
 }
 
 /** 时间格式化结果缓存，避免列表中大量相同时长反复格式化。 */
