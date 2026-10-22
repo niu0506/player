@@ -1294,4 +1294,152 @@ class ProgressCacheTest {
         progress.cache("u", 20_000, 60_000)
         assertEquals(mapOf("u" to 20_000L), progress.writes())
     }
+
+    @Test
+    fun `drop during in flight write is not resurrected by stale snapshot`() {
+        val progress = newCache()
+        val snapshot = progress.snapshot()
+
+        progress.drop(listOf("u"), currentUri = null)
+        progress.markPersisted(snapshot, emptySet())
+        progress.cache("u", 10_000, 60_000)
+
+        assertEquals(mapOf("u" to 10_000L), progress.writes())
+    }
+
+    @Test
+    fun `clear during in flight write is not resurrected by stale snapshot`() {
+        val progress = newCache()
+        val snapshot = progress.snapshot()
+
+        progress.clear("u")
+        progress.markPersisted(snapshot, emptySet())
+        progress.cache("u", 10_000, 60_000)
+
+        assertEquals(mapOf("u" to 10_000L), progress.writes())
+    }
+
+    @Test
+    fun `clearAll removes every cached state`() {
+        val progress = newCache()
+        progress.markPersisted(progress.snapshot(), emptySet())
+        progress.clearAll()
+
+        assertTrue(progress.writes().isEmpty())
+        assertFalse(progress.hasPendingRemovals())
+        assertFalse(progress.hasPendingDrops())
+
+        progress.cache("u", 10_000, 60_000)
+        assertEquals(mapOf("u" to 10_000L), progress.writes())
+    }
+}
+
+/** 扫描行解析与音频类型过滤。 */
+class MediaScanFilterTest {
+
+    @Test
+    fun `null display name uses fallback`() {
+        assertEquals("未知文件", scanDisplayNameOrFallback(null, "未知文件"))
+    }
+
+    @Test
+    fun `blank display name uses fallback`() {
+        assertEquals("未知文件", scanDisplayNameOrFallback("  \t ", "未知文件"))
+    }
+
+    @Test
+    fun `normal display name is kept`() {
+        assertEquals("第 1 集.mp4", scanDisplayNameOrFallback("第 1 集.mp4", "未知文件"))
+    }
+
+    @Test
+    fun `ringtone notification and alarm are excluded`() {
+        assertTrue(isExcludedAudioType(1, 0, 0))
+        assertTrue(isExcludedAudioType(0, 1, 0))
+        assertTrue(isExcludedAudioType(0, 0, 1))
+        assertFalse(isExcludedAudioType(0, 0, 0))
+    }
+}
+
+/** 队列项按 URI 定位：覆盖列表与队列错位时的删除路径。 */
+class MediaQueueLookupTest {
+
+    @Test
+    fun `finds queue item by normalized uri`() {
+        val queue = listOf(FakeUri("content://media/audio/1"), null, FakeUri("content://media/audio/2"))
+
+        assertEquals(
+            0,
+            findMediaItemIndexByUri(queue.size, { queue[it] }, FakeUri("content://media/audio/1"))
+        )
+        assertEquals(
+            2,
+            findMediaItemIndexByUri(queue.size, { queue[it] }, FakeUri("content://media/audio/2?x=1"))
+        )
+    }
+
+    @Test
+    fun `missing uri returns minus one`() {
+        val queue = listOf(FakeUri("content://media/audio/1"))
+        assertEquals(
+            -1,
+            findMediaItemIndexByUri(queue.size, { queue[it] }, FakeUri("content://media/audio/9"))
+        )
+    }
+
+    @Test
+    fun `empty queue returns minus one`() {
+        assertEquals(-1, findMediaItemIndexByUri(0, { null }, FakeUri("content://media/audio/1")))
+    }
+}
+
+/** 数据库自愈判定：只对明确的损坏/迁移异常清库。 */
+class DatabaseSelfHealTest {
+
+    @Test
+    fun `malformed database message is self healable`() {
+        assertTrue(
+            isSelfHealableDatabaseFailure(
+                RuntimeException("database disk image is malformed")
+            )
+        )
+    }
+
+    @Test
+    fun `missing migration is self healable`() {
+        assertTrue(
+            isSelfHealableDatabaseFailure(
+                IllegalStateException(
+                    "A migration from 1 to 2 was required but not found. " +
+                        "Please provide the necessary Migration path."
+                )
+            )
+        )
+    }
+
+    @Test
+    fun `wrapped migration failure is self healable`() {
+        assertTrue(
+            isSelfHealableDatabaseFailure(
+                IllegalStateException(
+                    "open failed",
+                    IllegalStateException("Room cannot verify the data integrity.")
+                )
+            )
+        )
+    }
+
+    @Test
+    fun `disk full is not self healable`() {
+        assertFalse(
+            isSelfHealableDatabaseFailure(
+                RuntimeException("No space left on device")
+            )
+        )
+    }
+
+    @Test
+    fun `generic failure is not self healable`() {
+        assertFalse(isSelfHealableDatabaseFailure(IllegalStateException("Something else")))
+    }
 }

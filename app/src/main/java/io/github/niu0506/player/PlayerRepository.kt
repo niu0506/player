@@ -7,6 +7,7 @@ package io.github.niu0506.player
 import android.content.Context
 import android.content.pm.PackageManager
 import android.database.Cursor
+import android.database.sqlite.SQLiteDatabaseCorruptException
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
@@ -42,7 +43,9 @@ import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import org.json.JSONObject
+import java.io.File
 import java.util.Locale
 import kotlin.time.Duration.Companion.milliseconds
 
@@ -66,6 +69,26 @@ fun normalizeUri(uri: Uri): String {
     val base = uri.toString().substringBefore('?').trimEnd('/')
     val lastSeg = uri.lastPathSegment ?: base
     return "$base|$lastSeg"
+}
+
+/** 扫描到的名称为空时用兜底文案，避免平台空值传给非空模型。 */
+internal fun scanDisplayNameOrFallback(raw: String?, fallback: String): String =
+    if (raw.isNullOrBlank()) fallback else raw
+
+/** 铃声 / 通知音 / 闹钟音不属于媒体播放列表。 */
+internal fun isExcludedAudioType(isRingtone: Int, isNotification: Int, isAlarm: Int): Boolean =
+    isRingtone != 0 || isNotification != 0 || isAlarm != 0
+
+/** 在播放器队列中按 URI 定位条目；找不到返回 -1，避免用列表下标误删队列项。 */
+internal fun findMediaItemIndexByUri(
+    mediaItemCount: Int,
+    uriAt: (Int) -> Uri?,
+    target: Uri,
+): Int {
+    val key = normalizeUri(target)
+    return (0 until mediaItemCount).firstOrNull { index ->
+        uriAt(index)?.let(::normalizeUri) == key
+    } ?: -1
 }
 
 /** API 29+ 使用 MediaStore 的 RELATIVE_PATH 作为分组键：去除首尾空白与斜杠。 */
@@ -332,11 +355,26 @@ fun formatTime(ms: Long): String {
 /** MediaStore 扫描器：API 29+ 用 RELATIVE_PATH 分组，低版本用 DATA 的父目录。 */
 class MediaStoreScanner(private val context: Context) {
 
+    private companion object {
+        const val TAG = "MediaStoreScanner"
+
+        /** 音频类型列：用于过滤铃声、通知音与闹钟音。 */
+        val AUDIO_TYPE_COLUMNS = arrayOf(
+            MediaStore.Audio.Media.IS_RINGTONE,
+            MediaStore.Audio.Media.IS_NOTIFICATION,
+            MediaStore.Audio.Media.IS_ALARM,
+        )
+    }
+
     /** 查询所有视频；失败（权限/异常）返回 null。 */
     fun queryVideos(): List<MediaItemData>? = query(MediaStore.Video.Media.EXTERNAL_CONTENT_URI)
 
     /** 查询所有音频；失败（权限/异常）返回 null。 */
-    fun queryAudios(): List<MediaItemData>? = query(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI)
+    fun queryAudios(): List<MediaItemData>? = query(
+        contentUri = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
+        extraColumns = AUDIO_TYPE_COLUMNS,
+        includeRow = ::shouldIncludeAudioRow,
+    )
 
     /** 用于提取文件夹分组键的列：API 29+ 用 RELATIVE_PATH，更低版本用 DATA。 */
     @Suppress("DEPRECATION")
@@ -358,14 +396,18 @@ class MediaStoreScanner(private val context: Context) {
 
     /** 执行一次查询；异常或 cursor 为 null 时返回 null，交由调用方按「扫描失败」处理。 */
     @Suppress("InlinedApi") // DURATION 常量 API 29+，但为编译期内联字符串，低版本可安全使用
-    private fun query(contentUri: Uri): List<MediaItemData>? {
+    private fun query(
+        contentUri: Uri,
+        extraColumns: Array<String> = emptyArray(),
+        includeRow: (Cursor) -> Boolean = { true },
+    ): List<MediaItemData>? {
         val items = mutableListOf<MediaItemData>()
         val projection = arrayOf(
             BaseColumns._ID,
             MediaStore.MediaColumns.DISPLAY_NAME,
             MediaStore.MediaColumns.DURATION,
             folderColumn
-        )
+        ) + extraColumns
         return try {
             val cursor = context.contentResolver.query(
                 contentUri, projection, null, null, null
@@ -376,8 +418,14 @@ class MediaStoreScanner(private val context: Context) {
                 val durIdx = it.getColumnIndexOrThrow(MediaStore.MediaColumns.DURATION)
                 val folderIdx = it.getColumnIndex(folderColumn)
                 while (it.moveToNext()) {
+                    if (!includeRow(it)) continue
                     val id = it.getLong(idIdx)
-                    val name = it.getString(nameIdx)
+                    // DISPLAY_NAME 是平台类型：某些坏数据会返回 null，
+                    // 直接传给非空模型会让整次扫描失败，这里按行兜底。
+                    val name = scanDisplayNameOrFallback(
+                        it.getString(nameIdx),
+                        context.getString(R.string.unknown_file),
+                    )
                     val duration = it.getLong(durIdx)
                     items.add(
                         MediaItemData(
@@ -390,9 +438,23 @@ class MediaStoreScanner(private val context: Context) {
                 }
             }
             items
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            Log.e(TAG, "查询媒体库失败: $contentUri", e)
             null
         }
+    }
+
+    /** 过滤铃声、通知音与闹钟音；列缺失或为 NULL 时按“不排除”处理。 */
+    private fun shouldIncludeAudioRow(cursor: Cursor): Boolean = !isExcludedAudioType(
+        isRingtone = cursor.getIntOrZero(MediaStore.Audio.Media.IS_RINGTONE),
+        isNotification = cursor.getIntOrZero(MediaStore.Audio.Media.IS_NOTIFICATION),
+        isAlarm = cursor.getIntOrZero(MediaStore.Audio.Media.IS_ALARM),
+    )
+
+    /** 读取整型列；列不存在或值为 NULL 时返回 0。 */
+    private fun Cursor.getIntOrZero(column: String): Int {
+        val index = getColumnIndex(column)
+        return if (index >= 0 && !isNull(index)) getInt(index) else 0
     }
 
     /** 从当前行读取目录列并归一化为文件夹分组键。 */
@@ -572,6 +634,17 @@ object PlayerRepository {
     @Volatile
     private var lastLoadAttemptMs = 0L
 
+    /** 手动重置进行中：阻止 ensureLoaded 并发启动新的加载。 */
+    @Volatile
+    private var resetting = false
+
+    /** 本进程是否已尝试过损坏/迁移失败自愈，避免反复清库。 */
+    @Volatile
+    private var selfHealAttempted = false
+
+    /** 数据库旁路文件：备份与删除时一并处理。 */
+    private val DB_SIDECAR_SUFFIXES = arrayOf("", "-wal", "-shm", "-journal")
+
     /** 加载失败后再次重试的最小间隔。 */
     private const val LOAD_RETRY_COOLDOWN_MS = 30_000L
 
@@ -605,6 +678,7 @@ object PlayerRepository {
     fun ensureLoaded(context: Context) {
         synchronized(loadLock) {
             if (appContext == null) appContext = context.applicationContext
+            if (resetting) return
             val running = loadJob?.isCompleted == false
             if (!running && !loadSucceeded) restartLoadLocked()
         }
@@ -634,6 +708,68 @@ object PlayerRepository {
 
     /** 数据是否已成功加载。 */
     fun isLoaded(): Boolean = loadSucceeded
+
+    /**
+     * 删除本地数据库并重建（播放列表、进度、上次播放项、缺失记录都会清空）。
+     * 调用方必须先向用户确认；返回 true 表示新库已成功加载。
+     */
+    suspend fun resetAllData(context: Context): Boolean = withContext(Dispatchers.IO) {
+        val appCtx = context.applicationContext
+        synchronized(loadLock) {
+            appContext = appCtx
+            resetting = true
+        }
+        try {
+            // 先等当前加载结束，避免关闭数据库时它仍在读取
+            synchronized(loadLock) { loadJob }?.join()
+            val reset = writeMutex.withLock {
+                synchronized(loadLock) {
+                    loadJob = null
+                    loadSucceeded = false
+                    try {
+                        db?.close()
+                    } catch (e: Exception) {
+                        Log.w(TAG, "关闭数据库失败", e)
+                    }
+                    db = null
+                    synchronized(stateLock) {
+                        playlistState = emptyList()
+                        progressState = emptyMap()
+                        lastItemState = null
+                        missingState = emptyMap()
+                    }
+                }
+                val dbFile = appCtx.getDatabasePath(DB_NAME)
+                val deleted = try {
+                    appCtx.deleteDatabase(DB_NAME)
+                } catch (e: Exception) {
+                    Log.e(TAG, "删除数据库失败", e)
+                    false
+                }
+                if (!deleted) {
+                    for (suffix in DB_SIDECAR_SUFFIXES) {
+                        File(dbFile.path + suffix).delete()
+                    }
+                }
+                if (dbFile.exists()) {
+                    Log.e(TAG, "重置失败：数据库文件仍存在")
+                    false
+                } else {
+                    synchronized(loadLock) {
+                        selfHealAttempted = false
+                        lastLoadAttemptMs = 0L
+                        restartLoadLocked()
+                    }
+                    true
+                }
+            }
+            if (!reset) return@withContext false
+            val job = synchronized(loadLock) { loadJob } ?: return@withContext false
+            job.awaitOrNull() == null && loadSucceeded
+        } finally {
+            synchronized(loadLock) { resetting = false }
+        }
+    }
 
     /** 读取某 uri 的进度；无记录返回 null。 */
     fun getProgress(uri: String): Long? = progressState[uri]
@@ -853,7 +989,21 @@ object PlayerRepository {
 
     /** 真正打开数据库并把全量数据载入内存。 */
     private suspend fun loadInternal(appCtx: Context) {
+        try {
+            openAndLoad(appCtx)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            if (selfHealAttempted || !isSelfHealableDatabaseFailure(e)) throw e
+            selfHealAttempted = true
+            Log.e(TAG, "数据库损坏或迁移失败，备份旧库后重建", e)
+            if (!backupAndResetDatabaseFiles(appCtx)) throw e
+            openAndLoad(appCtx)
+        }
+    }
 
+    /** 打开 Room 并全量读取；调用方负责失败后的重试/自愈。 */
+    private suspend fun openAndLoad(appCtx: Context) {
         val database = Room.databaseBuilder(appCtx, PlayerDatabase::class.java, DB_NAME)
             .addMigrations(PlayerDatabase.MIGRATION_1_2)
             .build()
@@ -873,6 +1023,84 @@ object PlayerRepository {
         }
         loadSucceeded = true
     }
+
+    /** 备份旧库文件（含 -wal/-shm/-journal）后删除，成功返回 true。 */
+    private fun backupAndResetDatabaseFiles(appCtx: Context): Boolean {
+        val dbFile = appCtx.getDatabasePath(DB_NAME)
+        val backupDir = File(appCtx.noBackupFilesDir, "db-backup-${System.currentTimeMillis()}")
+        return try {
+            try {
+                db?.close()
+            } catch (e: Exception) {
+                Log.w(TAG, "关闭损坏数据库失败", e)
+            }
+            db = null
+            if (dbFile.exists()) {
+                if (!backupDir.mkdirs() && !backupDir.isDirectory) {
+                    Log.e(TAG, "无法创建数据库备份目录: ${backupDir.absolutePath}")
+                    return false
+                }
+                for (suffix in DB_SIDECAR_SUFFIXES) {
+                    val source = File(dbFile.path + suffix)
+                    if (!source.exists()) continue
+                    try {
+                        source.copyTo(File(backupDir, source.name), overwrite = true)
+                    } catch (e: Exception) {
+                        // 主库必须备份成功；旁路文件在极端情况下可能被 SQLite 回收，失败可忽略
+                        if (suffix.isEmpty()) throw e
+                        Log.w(TAG, "备份数据库旁路文件失败: ${source.name}", e)
+                    }
+                }
+                Log.w(TAG, "旧数据库已备份到 ${backupDir.absolutePath}")
+            }
+            val deleted = appCtx.deleteDatabase(DB_NAME)
+            if (!deleted) {
+                for (suffix in DB_SIDECAR_SUFFIXES) {
+                    File(dbFile.path + suffix).delete()
+                }
+            }
+            if (dbFile.exists()) {
+                Log.e(TAG, "删除损坏数据库失败: ${dbFile.absolutePath}")
+                false
+            } else {
+                synchronized(stateLock) {
+                    playlistState = emptyList()
+                    progressState = emptyMap()
+                    lastItemState = null
+                    missingState = emptyMap()
+                }
+                true
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "备份或重建数据库失败", e)
+            false
+        }
+    }
+}
+
+/** 判断加载失败是否属于可通过备份旧库并重建来自愈的损坏/迁移问题。 */
+internal fun isSelfHealableDatabaseFailure(error: Throwable): Boolean {
+    var current: Throwable? = error
+    while (current != null) {
+        val message = current.message.orEmpty().lowercase(Locale.US)
+        if (current is SQLiteDatabaseCorruptException) return true
+        if ("database disk image is malformed" in message ||
+            "file is encrypted or is not a database" in message ||
+            "database corruption" in message ||
+            "no such table: room_master_table" in message
+        ) {
+            return true
+        }
+        if (current is IllegalStateException &&
+            ("a migration from" in message ||
+                "migration didn't properly handle" in message ||
+                "room cannot verify the data integrity" in message)
+        ) {
+            return true
+        }
+        current = current.cause
+    }
+    return false
 }
 
 /** 进度写入裁决结果。 */

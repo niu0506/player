@@ -4,6 +4,7 @@
  */
 package io.github.niu0506.player
 
+import android.app.PendingIntent
 import android.content.Intent
 import android.os.Handler
 import android.os.Looper
@@ -187,6 +188,19 @@ class PlayerService : MediaSessionService() {
     @OptIn(UnstableApi::class)
     private fun buildMediaSession(player: Player): MediaSession =
         MediaSession.Builder(this, player)
+            // 通知栏 / 锁屏 / 系统媒体控件的点击都依赖 session activity 才能回到界面
+            .setSessionActivity(
+                PendingIntent.getActivity(
+                    this,
+                    0,
+                    Intent(this, MainActivity::class.java).apply {
+                        flags = Intent.FLAG_ACTIVITY_NEW_TASK or
+                            Intent.FLAG_ACTIVITY_SINGLE_TOP or
+                            Intent.FLAG_ACTIVITY_CLEAR_TOP
+                    },
+                    PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                )
+            )
             .setCallback(object : MediaSession.Callback {
                 override fun onConnectAsync(
                     session: MediaSession,
@@ -356,6 +370,11 @@ class PlayerService : MediaSessionService() {
         fun flushCurrentPosition() {
             instance?.persistProgress()
         }
+
+        /** 重置本地数据时清空服务侧进度缓存，避免旧快照重新写回数据库。 */
+        fun clearProgressCache() {
+            instance?.progress?.clearAll()
+        }
     }
 }
 
@@ -391,6 +410,8 @@ internal class ProgressCache {
     fun clear(uri: String?) {
         if (uri == null) return
         cached.remove(uri)
+        // 删除请求可能先于旧快照落盘回调，先从快照移除，避免进度被“复活”
+        lastPersisted = lastPersisted - uri
         removals.add(uri)
     }
 
@@ -423,7 +444,9 @@ internal class ProgressCache {
     /** 落盘成功：更新快照并移除本次已提交的删除项。 */
     fun markPersisted(snapshot: Map<String, Long>, writtenRemovals: Set<String>) {
         removals.removeAll(writtenRemovals)
-        lastPersisted = snapshot
+        // 写入飞行期间被 clear/drop 的 key 已不在 cached 中，
+        // 不能再借旧快照复活到 lastPersisted。
+        lastPersisted = snapshot.filterKeys { it in cached }
     }
 
     /** 落盘失败：保留本次删除项并清空快照，下一轮重写全部内容。 */
@@ -434,6 +457,14 @@ internal class ProgressCache {
 
     fun clearAllPendingDrops() {
         pendingDrops.clear()
+    }
+
+    /** 清空全部内存状态（重置本地数据时使用）。 */
+    fun clearAll() {
+        cached.clear()
+        removals.clear()
+        pendingDrops.clear()
+        lastPersisted = emptyMap()
     }
 }
 

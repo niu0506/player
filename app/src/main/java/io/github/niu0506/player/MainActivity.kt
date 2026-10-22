@@ -19,6 +19,7 @@ import android.os.SystemClock
 import android.os.storage.StorageManager
 import android.provider.BaseColumns
 import android.provider.MediaStore
+import android.util.Log
 import android.view.View
 import android.widget.TextView
 import androidx.activity.OnBackPressedCallback
@@ -96,6 +97,10 @@ class MainActivity : AppCompatActivity() {
         /** 更多菜单项 id。 */
         const val MENU_CHECK_UPDATE = 1
         const val MENU_BRIGHTNESS_SYSTEM = 2
+        const val MENU_RESET_DATA = 3
+
+        /** 日志标签。 */
+        const val TAG = "MainActivity"
     }
 
     private val notifPermission = registerForActivityResult(
@@ -104,20 +109,35 @@ class MainActivity : AppCompatActivity() {
 
     private val storagePermission = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
-    ) { grants: Map<String, Boolean> ->
-        if (grants.values.any { it }) {
-            toast(R.string.toast_permission_granted)
+    ) { _ ->
+        if (hasStoragePermission()) {
+            // 授权成功后直接开始首次扫描，避免用户还要再点一次扫描
+            startScan(silent = false)
+        } else {
+            toast(R.string.toast_permission_denied)
         }
     }
 
     /** 删除单条：同步列表、播放队列与进度，然后刷新 UI、保存并提示。 */
     private fun removeItemFromPlaylist(index: Int) {
         if (index !in playlist.indices) return
-        val uri = playlist[index].uri.toString()
+        val item = playlist[index]
+        val uri = item.uri.toString()
         PlayerService.dropProgress(uri)
-        playlist.removeAt(index)
+
+        // 队列与列表理论上由 rebuildQueue* 对齐，但扫描/重连窗口内可能错位；
+        // 用 URI 定位队列项，避免用列表下标误删或越界崩溃。
         val ctrl = controller
-        ctrl?.removeMediaItem(index)
+        if (ctrl != null) {
+            val queueIndex = findMediaItemIndexByUri(
+                mediaItemCount = ctrl.mediaItemCount,
+                uriAt = { i -> ctrl.getMediaItemAt(i).localConfiguration?.uri },
+                target = item.uri,
+            )
+            if (queueIndex >= 0) ctrl.removeMediaItem(queueIndex)
+        }
+
+        playlist.removeAt(index)
         syncAdapterPlayingState()
         refreshPlaylist()
         savePlaylist()
@@ -606,11 +626,12 @@ class MainActivity : AppCompatActivity() {
         false
     }
 
-    /** 「更多」菜单：检查更新 / 恢复跟随系统亮度。 */
+    /** 「更多」菜单：检查更新 / 恢复跟随系统亮度 / 重置本地数据。 */
     private fun showMoreMenu() {
         val popup = PopupMenu(this, binding.btnMore)
         popup.menu.add(0, MENU_CHECK_UPDATE, 0, R.string.check_update)
         popup.menu.add(0, MENU_BRIGHTNESS_SYSTEM, 1, R.string.brightness_follow_system)
+        popup.menu.add(0, MENU_RESET_DATA, 2, R.string.reset_local_data)
         popup.setOnMenuItemClickListener { item ->
             when (item.itemId) {
                 MENU_CHECK_UPDATE -> {
@@ -622,10 +643,52 @@ class MainActivity : AppCompatActivity() {
                     toast(R.string.toast_brightness_follow_system)
                     true
                 }
+                MENU_RESET_DATA -> {
+                    confirmResetLocalData()
+                    true
+                }
                 else -> false
             }
         }
         popup.show()
+    }
+
+    /** 重置本地数据前的二次确认。 */
+    private fun confirmResetLocalData() {
+        AlertDialog.Builder(this)
+            .setTitle(R.string.reset_data_title)
+            .setMessage(R.string.reset_data_message)
+            .setPositiveButton(R.string.reset_data_confirm) { _, _ -> resetLocalData() }
+            .setNegativeButton(R.string.cancel, null)
+            .show()
+    }
+
+    /** 删除数据库并重建；成功后清空界面列表并重新扫描。 */
+    private fun resetLocalData() {
+        // 取消进行中的扫描与待保存任务，避免它们把旧列表写回新库
+        cancelScans()
+        mainHandler.removeCallbacks(savePlaylistRunnable)
+        // 先停掉播放并清空队列/进度缓存，避免重置期间旧进度再次写库
+        controller?.stop()
+        controller?.clearMediaItems()
+        PlayerService.clearProgressCache()
+        lifecycleScope.launch {
+            val ok = PlayerRepository.resetAllData(this@MainActivity)
+            if (isFinishing || isDestroyed) return@launch
+            if (!ok) {
+                toastLong(R.string.reset_data_failed)
+                return@launch
+            }
+            playlist.clear()
+            playlistLoaded = true
+            refreshPlaylist()
+            toast(R.string.reset_data_done)
+            if (hasStoragePermission()) {
+                startScan(silent = false)
+            } else {
+                requestStoragePermission()
+            }
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -778,7 +841,11 @@ class MainActivity : AppCompatActivity() {
             if (controllerFuture !== future) return@addListener
             val ctrl = try {
                 future.get()
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                Log.e(TAG, "连接播放服务失败", e)
+                if (controllerFuture === future) {
+                    toastLong(R.string.toast_player_not_connected)
+                }
                 return@addListener
             }
             controller = ctrl
