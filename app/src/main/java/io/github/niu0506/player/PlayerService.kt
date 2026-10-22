@@ -1,12 +1,6 @@
 /**
- * 后台播放前台服务。
- *
- * 基于 Media3 的 [MediaSessionService] 托管一个 ExoPlayer：
- * 1. 提供媒体会话（通知栏与外部控制器通过它操控播放）；
- * 2. 负责播放进度的采集与持久化（每 5 秒一次快照，暂停 / seek / 内存吃紧 / 销毁时立即落盘）；
- * 3. 播放出错时自动跳到下一项，并对外广播 [io.github.niu0506.player.PlayerService.Companion.PlaybackErrorEvent]。
- *
- * 注意：倍速等播放参数由本服务的播放器持有，界面重建后需从会话重新读取以保持同步。
+ * 后台播放前台服务：托管 ExoPlayer 与 MediaSession，负责进度落盘、
+ * 播放错误自动跳项，并拒绝不可信控制器。播放参数由服务侧持有。
  */
 package io.github.niu0506.player
 
@@ -54,10 +48,8 @@ class PlayerService : MediaSessionService() {
     private val playerEventListener = object : Player.Listener {
         override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
             if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO) {
-                // 自动连播到下一首：上一首视为自然播完，清除其断点
-
+                // 自动连播：上一首视为自然播完，清除断点
                 lastPlayedUri?.let(progress::clear)
-
             }
             lastPlayedUri = mediaItem?.localConfiguration?.uri?.toString()
             lastPlayedUri?.let { PlayerRepository.setLastItem(it) }
@@ -191,14 +183,7 @@ class PlayerService : MediaSessionService() {
         mediaSession = buildMediaSession(player)
     }
 
-    /**
-     * 构建媒体会话：服务对系统导出，但只允许可信控制器连接。
-     *
-     * Media3 默认对不可信控制器也给只读命令，任何第三方应用都能读取当前媒体项/元数据；
-     * 这里直接用 [MediaSession.ControllerInfo.isTrusted] 拒绝不可信控制器。
-     * 本应用、system UID、MEDIA_CONTENT_CONTROL / STATUS_BAR_SERVICE、通知监听器仍可控制，
-     * 因此不会影响通知栏、蓝牙、Android Auto 等系统入口。
-     */
+    /** 构建媒体会话：只允许可信控制器连接，避免第三方应用读取媒体信息。 */
     @OptIn(UnstableApi::class)
     private fun buildMediaSession(player: Player): MediaSession =
         MediaSession.Builder(this, player)
@@ -374,12 +359,7 @@ class PlayerService : MediaSessionService() {
     }
 }
 
-/**
- * 播放进度的内存状态：缓存待写位置、待删除 URI、删除抑制与落盘快照。
- *
- * 只负责纯状态迁移，不碰 Handler / Media3，便于单元测试覆盖切歌、暂停、
- * 显式 seek 回 0、删除条目等生命周期路径。
- */
+/** 进度内存状态：待写位置、待删除 URI、删除抑制与落盘快照（纯逻辑，便于测试）。 */
 internal class ProgressCache {
 
     /** 待落盘位置（uri → 毫秒）。 */
@@ -414,10 +394,7 @@ internal class ProgressCache {
         removals.add(uri)
     }
 
-    /**
-     * 删除条目时同步清理缓存。
-     * @param currentUri 当前播放项；只有它需要进入 pendingDrops，防止 ticker 回写。
-     */
+    /** 删除条目时清理缓存；当前播放项需进入 pendingDrops，防止 ticker 回写。 */
     fun drop(uris: Collection<String>, currentUri: String?) {
         for (key in uris) {
             cached.remove(key)
@@ -460,12 +437,7 @@ internal class ProgressCache {
     }
 }
 
-/**
- * 是否是「当前条目从非零位置显式 seek 回 0」。
- *
- * 只有这种 seek 才代表用户想从头看并清除旧断点；普通的 positionMs == 0
- * （初始位置、seekToDefaultPosition、队列重建）仍按 [ProgressWriteDecision.Skip] 处理。
- */
+/** 是否为当前条目从非零位置显式 seek 回 0（只有这种情况清除旧断点）。 */
 internal fun isExplicitSeekToZero(
     reason: Int,
     sameItem: Boolean,

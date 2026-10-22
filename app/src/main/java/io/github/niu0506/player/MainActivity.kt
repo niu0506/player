@@ -1,12 +1,6 @@
 /**
- * 界面入口与流程编排。
- *
- * 包含：
- * - [PlayerApp]：应用启动时触发仓库加载；
- * - [MainActivity]：维护播放列表 UI、连接 [PlayerService] 的 MediaController、
- *   扫描媒体库并与已存列表对账（含已删除文件的清理）、断点续播与更新流程编排。
- *
- * 界面逻辑拆分为 [GestureController]、[FullscreenPipHelper]、[MediaListAdapter]（见 PlayerUi.kt）。
+ * 界面入口与流程编排：播放列表 UI、MediaController 连接、扫描对账、断点恢复与更新。
+ * 手势、全屏/PiP、列表适配器见 PlayerUi.kt。
  */
 package io.github.niu0506.player
 
@@ -194,12 +188,7 @@ class MainActivity : AppCompatActivity() {
         return playlist.indexOfFirst { normalizeUri(it.uri) == key }
     }
 
-    /**
-     * 从仓库把已存列表载入当前列表（仅在首次成功加载时调用）。
-     *
-     * 不能直接 addAll：首次加载失败期间用户可能已经手动扫描，内存列表里会有
-     * 尚未落盘的条目；按 normalizeUri 合并去重，既保留这些条目又不产生重复。
-     */
+    /** 首次加载时把仓库列表合并进内存（保留加载失败期间手动扫描的条目）。 */
     private fun loadPlaylist() {
         val merged = mergePlaylistOnLoad(PlayerRepository.getPlaylist(), playlist)
         playlist.clear()
@@ -208,11 +197,8 @@ class MainActivity : AppCompatActivity() {
 
     private val playerListener = object : Player.Listener {
         override fun onMediaItemTransition(mediaItem: M3MediaItem?, reason: Int) {
-
             syncAdapterPlayingState()
-            // 全屏顶部信息条里的文件名跟随当前条目变化
             fullscreenPip.refreshInfoBarContent()
-
             // 单曲循环回绕不恢复断点，其余切歌按需续播
             if (reason != Player.MEDIA_ITEM_TRANSITION_REASON_REPEAT) {
                 restoreProgressIfNeeded()
@@ -224,14 +210,13 @@ class MainActivity : AppCompatActivity() {
             updateKeepScreenOn()
             fullscreenPip.refreshPipParams()
             if (!isPlaying) {
-                // 先落盘再刷新：仓储内存同步更新后，下一行才能读到最新进度（服务侧落盘幂等）
+                // 先落盘再刷新，保证读到最新进度
                 PlayerService.flushCurrentPosition()
                 adapter.refreshProgress(controller?.currentMediaItemIndex ?: -1)
             }
         }
 
         override fun onPlaybackStateChanged(playbackState: Int) {
-            // 就绪后回填真实时长
             if (playbackState == Player.STATE_READY) {
                 val index = controller?.currentMediaItemIndex ?: -1
                 val duration = controller?.duration ?: C.TIME_UNSET
@@ -242,7 +227,6 @@ class MainActivity : AppCompatActivity() {
         }
 
         override fun onPlaybackSuppressionReasonChanged(playbackSuppressionReason: Int) {
-
             // 被其他应用暂时抢占音频焦点：提示稍后自动续播
             if (playbackSuppressionReason == Player.PLAYBACK_SUPPRESSION_REASON_TRANSIENT_AUDIO_FOCUS_LOSS) {
                 toast(R.string.toast_playback_interrupted)
@@ -250,14 +234,12 @@ class MainActivity : AppCompatActivity() {
         }
 
         override fun onPlaybackParametersChanged(playbackParameters: PlaybackParameters) {
-
-            // 倍速由服务侧播放器持有，参数变化时同步按钮文案
+            // 倍速由服务侧持有，重连或外部改速后同步按钮文案
             syncSpeedLabel()
         }
 
         override fun onVideoSizeChanged(videoSize: VideoSize) {
             updateKeepScreenOn()
-            // 依据视频与播放状态刷新系统 PiP 参数（比例、自动进入开关与动画锚点）
             fullscreenPip.refreshPipParams()
         }
     }
@@ -440,10 +422,8 @@ class MainActivity : AppCompatActivity() {
     private val debouncedScanRunnable = Runnable { startScan(silent = true) }
 
     /**
-     * 启动或复用一次扫描任务；调用方可对返回的 Job 选择是否 join。
-     *
-     * 静默扫描请求直接复用正在运行的任务；手动扫描请求在静默扫描运行时排队，
-     * 等它结束后再完整扫描一次（静默对账不会追加新文件，不能把手动请求吞掉）。
+     * 启动或复用扫描任务：静默扫描复用运行中的任务；
+     * 手动扫描在静默扫描之后排队，确保能追加新文件。
      */
     private fun startScan(silent: Boolean): Job {
         val running = scanJob?.takeIf { it.isActive }
@@ -480,12 +460,7 @@ class MainActivity : AppCompatActivity() {
         manualScanJob = null
     }
 
-    /**
-     * 在 IO 线程查询媒体库并完成对账计算，只把结果应用回主线程。
-     *
-     * 单条 ContentResolver 查询（[isConfirmedDeleted]）和缺失记录更新都不再占用主线程；
-     * playlist 本身只在主线程读写，IO 侧使用进入扫描时的快照。
-     */
+    /** IO 线程查询媒体库并计算对账结果；playlist 只在主线程读写，IO 侧使用快照。 */
     private suspend fun scanMediaInternal(silent: Boolean) {
         val playlistSnapshot = playlist.toList()
         val (videos, audios) = withContext(Dispatchers.IO) {
@@ -499,10 +474,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /**
-     * 用扫描结果对账：清理已删除文件、追加新文件、刷新元数据并重排。
-     * @param silent 后台静默扫描（不弹提示，也不主动追加新文件）
-     */
+    /** 应用扫描结果：清理已删除项、追加新文件、刷新元数据并重排。 */
     private fun reconcileScanResult(
         scannedVideos: List<MediaItemData>?,
         scannedAudios: List<MediaItemData>?,
@@ -560,9 +532,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 在 IO 线程计算扫描中已不存在的条目（不修改 playlist）：
-     * 拥有对应类型完整权限时，对权威扫描未列出的条目做一次单条精确查询确认；
-     * 无法确认（查询失败/卷不可用）时退回「连续两轮未见且超过宽限期」的保守判定。
+     * 计算本轮需要删除的条目：完整权限下做单条复核，
+     * 无法确认时退回「连续两轮缺失 + 24 小时宽限期」。
      */
     private fun computePruneDeletedMedia(
         playlistSnapshot: List<MediaItemData>,
@@ -604,13 +575,7 @@ class MainActivity : AppCompatActivity() {
         return candidates
     }
 
-    /**
-     * 外部存储卷是否全部处于挂载状态。
-     *
-     * 任一可移除卷未挂载时，禁止走“单条查询确认后立即删除”，退回 24 小时宽限期，
-     * 避免拔 SD 卡/OTG 时把整卷条目误判为已删除。API 29+ 也可用
-     * MediaStore.getExternalVolumeNames()，这里用 StorageManager 兼容 minSdk 24。
-     */
+    /** 可移除卷是否全部挂载；有卷离线时禁用「单条查询后立即删除」，避免误删。 */
     private fun externalVolumesFullyMounted(): Boolean {
         val primaryState = Environment.getExternalStorageState()
         if (primaryState != Environment.MEDIA_MOUNTED &&
@@ -633,10 +598,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /**
-     * 对单条媒体 URI 做一次精确查询：查不到任何行即确认该文件已从媒体库删除。
-     * 查询返回 null（媒体库暂不可用）或抛异常时返回 false，交回保守判定，避免误删。
-     */
+    /** 单条精确查询：查不到行才算已删除；查询异常返回 false，交回保守判定。 */
     private fun isConfirmedDeleted(uri: Uri): Boolean = try {
         contentResolver.query(uri, arrayOf(BaseColumns._ID), null, null, null)
             ?.use { !it.moveToFirst() } ?: false

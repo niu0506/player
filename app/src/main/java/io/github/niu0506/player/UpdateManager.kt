@@ -1,11 +1,6 @@
 /**
- * 应用内更新。
- *
- * 检查：请求 GitHub Releases API。
- * 下载：经系统 DownloadManager，从 GitHub Release 资产直连下载到公共「下载」目录。
- * 校验：下载产物必须通过包名 / 版本号 / SHA-256 校验（fail-closed：拿不到校验和即判定失败）。
- * 安装：本应用**不**调起系统安装器；校验通过后提示用户在系统「下载」目录中手动安装
- *      （或点系统下载完成通知自行安装）。
+ * 应用内更新：经 GitHub Releases 检查版本，DownloadManager 下载到公共「下载」目录，
+ * 校验包名/版本/SHA-256（fail-closed），由用户手动安装。
  */
 package io.github.niu0506.player
 
@@ -39,13 +34,7 @@ import androidx.core.content.edit
 /** 版本检查器：从 GitHub Releases API 解析最新 Release 信息。 */
 class UpdateChecker {
 
-    /**
-     * 最新版本信息。
-     * @property version 版本号（已去掉 v 前缀）
-     * @property apkUrl 安装包下载地址
-     * @property notes 更新说明
-     * @property sha256 安装包 SHA-256（可能为 null，此时将判定下载失败）
-     */
+    /** 最新版本信息；sha256 缺失时下载校验会失败。 */
     data class Release(
         val version: String,
         val apkUrl: String,
@@ -177,13 +166,7 @@ internal fun verifyApkChecksum(expected: String?, actual: String): ApkValidation
     }
 }
 
-/**
- * 已下载的更新包版本是否已经装到本机。
- *
- * 用于区分「下载失败」与「已安装完成」：用户手动安装更新后，系统会删除安装包
- * （下载记录也可能一并消失），此时已无产物可校验。若当前安装版本已达到（或超过）
- * 下载版本，说明安装成功，应静默清理下载状态，而不是误报「下载失败」。
- */
+/** 已安装版本达到下载版本时视为安装成功（避免安装包被系统删除后误报失败）。 */
 internal fun isDownloadedVersionInstalled(downloaded: String, installed: String?): Boolean =
     installed != null && !UpdateChecker.isNewer(downloaded, installed)
 
@@ -201,10 +184,7 @@ class UpdateManager(private val activity: AppCompatActivity) {
         private const val APK_NAME_PREFIX = "player-v"
         private const val APK_NAME_SUFFIX = "-release.apk"
 
-        /**
-         * 应用替换（升级）成功后清理残留的更新包：公共「下载」目录（MediaStore）
-         * 与应用私有下载目录（早期版本遗留）。
-         */
+        /** 升级后清理公共「下载」目录与私有目录中的旧安装包。 */
         fun cleanupUpdateApks(context: Context) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 ignoreFailure {
@@ -299,12 +279,8 @@ class UpdateManager(private val activity: AppCompatActivity) {
     }
 
     fun registerReceivers() {
-        // 必须用 RECEIVER_EXPORTED：DOWNLOAD_COMPLETE 由「下载」提供方
-        // (com.android.providers.downloads) 这个**另一个应用/uid** 发出，而非系统直接发出。
-        // 用 RECEIVER_NOT_EXPORTED 时系统会以
-        // 「Exported Denial: ... not specifying RECEIVER_EXPORTED」为由直接丢弃该广播，
-        // 导致下载完成后本应用收不到回调（不校验、不清理、不提示），
-        // 残留的下载状态会在系统安装更新包删除安装包后被再次校验，从而误报「下载失败」。
+        // DOWNLOAD_COMPLETE 由下载提供方（另一个应用）发出，必须用 RECEIVER_EXPORTED，
+        // 否则收不到回调。
         ContextCompat.registerReceiver(
             activity, downloadCompleteReceiver,
             IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE),
@@ -328,9 +304,7 @@ class UpdateManager(private val activity: AppCompatActivity) {
                 clearPersistedDownload()
                 return@launch
             }
-            // 该更新包对应的版本已经装到本机：说明用户已手动安装成功，系统安装完成后
-            // 会删除安装包（下载记录也可能被一并清掉）。此时再校验已消失的产物只会误报
-            // 「下载失败」，应静默清理残留的下载状态。
+            // 目标版本已安装：安装包可能已被系统删除，静默清理即可
             if (isDownloadedVersionInstalled(pendingDownloadVersion, installedVersionName())) {
                 clearPersistedDownload()
                 return@launch
@@ -388,13 +362,7 @@ class UpdateManager(private val activity: AppCompatActivity) {
         !activity.isFinishing && !activity.isDestroyed &&
             activity.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)
 
-    /**
-     * 把「创建更新弹窗」推迟到主线程下一轮消息，必须延后而不是立即创建：
-     * - 检查是异步返回的，弹窗可能在当前输入事件 / 界面遍历尚未结束时就被创建，
-     *   从而刚显示即被系统移除（表现为「一闪即逝」）；
-     * - `onResume()` 执行期间 lifecycle 仍是 STARTED（RESUMED 要等 onResume 返回后才分发），
-     *   立即创建会被 [canShowDialog] 拦下并再次暂存，导致补弹永远不触发。
-     */
+    /** 延后到主线程下一轮再弹窗，避免 onResume 期间状态仍为 STARTED 而被拦下。 */
     private fun postUpdateDialog(release: UpdateChecker.Release) {
         activity.window.decorView.post { presentUpdateDialog(release) }
     }
@@ -458,11 +426,7 @@ class UpdateManager(private val activity: AppCompatActivity) {
     private fun apkFileName(version: String): String =
         "$APK_NAME_PREFIX$version$APK_NAME_SUFFIX"
 
-    /**
-     * 入队前删除公共「下载」目录中的同名旧包，避免 DownloadManager 因目标文件已存在
-     * （ERROR_FILE_ALREADY_EXISTS）判定下载失败。删除失败（非本应用所有 / 无权限）时静默忽略，
-     * API 29+ 与 [cleanupUpdateApks] 一样经 MediaStore 删除。
-     */
+    /** 删除同名旧包，避免 DownloadManager 因文件已存在而失败；删除失败静默忽略。 */
     private fun deleteExistingDownloadFile(fileName: String) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             ignoreFailure {
@@ -484,9 +448,8 @@ class UpdateManager(private val activity: AppCompatActivity) {
     }
 
     /**
-     * 经 DownloadManager 入队一次下载到公共「下载」目录。
-     * 使用 `setDestinationInExternalPublicDir`（内部为 `file://`），
-     * 不可传 `content://` 目标（会抛 IllegalArgumentException）——这正是 v1.4.8 的闪退根因。
+     * 入队下载到公共「下载」目录。
+     * 必须用 setDestinationInExternalPublicDir（file://）；传 content:// 会抛异常。
      */
     private fun enqueueDownload(url: String) {
         val fileName = apkFileName(pendingDownloadVersion)
@@ -532,16 +495,7 @@ class UpdateManager(private val activity: AppCompatActivity) {
         clearPersistedDownload()
     }
 
-    /**
-     * 校验下载产物：
-     * 1. 能被读到且可被系统解析为 APK；
-     * 2. 包名一致；版本号（若已知）一致；
-     * 3. SHA-256 匹配（fail-closed：缺失校验和也判定失败）。
-     * 用于拦截「反代返回 200 + HTML 错误页」或残包 / 篡改包。
-     *
-     * 产物位于公共「下载」目录（非本应用可直读的路径），故经 DownloadManager 提供的
-     * content uri 读取，并复制到缓存临时文件以读取 APK 元数据。
-     */
+    /** 校验下载产物：可解析、包名/版本一致、SHA-256 匹配；缺失校验和也判定失败。 */
     private fun validateDownloadedApk(id: Long): ApkValidation {
         val uri = downloadManager.getUriForDownloadedFile(id) ?: return ApkValidation.INVALID
         val temp = File(activity.cacheDir, "update-verify.apk")

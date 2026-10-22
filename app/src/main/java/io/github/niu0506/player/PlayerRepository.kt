@@ -1,14 +1,6 @@
 /**
- * 数据与存储层。
- *
- * 主要职责：
- * 1. 定义播放列表条目模型 [MediaItemData]，并提供 URI 归一化、文件夹分组键提取与自然排序；
- * 2. 通过 [MediaStoreScanner] 扫描系统媒体库（视频 / 音频）；
- * 3. 通过 Room（[PlayerDatabase]）持久化播放列表、播放进度与 KV 配置，作为全应用唯一的写入口；
- * 4. 提供播放进度写入裁决（末尾容差）与「合并写」语义。
- *
- * 设计要点：内存状态始终为权威读取源（[PlayerRepository.getPlaylist] 等），
- * 数据库写入经 [PlayerRepository.dispatchWrite] 串行化，写入失败会重试并对外广播；加载失败时，写入路径按冷却时间重试。
+ * 数据与存储层：媒体模型、MediaStore 扫描、排序、Room 持久化与进度写入裁决。
+ * 内存状态是权威读取源，所有写库操作经 [PlayerRepository.dispatchWrite] 串行执行。
  */
 package io.github.niu0506.player
 
@@ -69,10 +61,7 @@ data class MediaItemData(
     val folderKey: String = "",
 )
 
-/**
- * 将 URI 归一化为稳定的键：去掉 query 参数与结尾斜杠，再拼接最后一段路径。
- * 用于跨扫描 / 存储对比同一个文件（避免 query 变化或末尾斜杠差异导致误判为新文件）。
- */
+/** 归一化 URI 作为比较键：去掉 query 与末尾斜杠，并拼接最后一段路径。 */
 fun normalizeUri(uri: Uri): String {
     val base = uri.toString().substringBefore('?').trimEnd('/')
     val lastSeg = uri.lastPathSegment ?: base
@@ -83,10 +72,7 @@ fun normalizeUri(uri: Uri): String {
 internal fun folderKeyFromRelativePath(relativePath: String?): String =
     relativePath?.trim()?.trim('/')?.trim().orEmpty()
 
-/**
- * API 29 以下没有 RELATIVE_PATH，改用绝对路径取父目录。
- * 若父目录位于主存储根之下，则返回相对根目录的路径；否则保留绝对父目录。
- */
+/** API 29 以下从绝对路径取父目录；在存储根下则转成相对路径。 */
 internal fun folderKeyFromAbsolutePath(absolutePath: String?, storageRoot: String?): String {
     val path = absolutePath?.trim().orEmpty()
     if (path.isEmpty()) return ""
@@ -128,10 +114,7 @@ private fun compareTextSegments(a: String, b: String): Int {
     return if (byCase < 0) -1 else if (byCase > 0) 1 else 0
 }
 
-/**
- * 自然排序：把字符串切成「数字段 / 文本段」交替比较。
- * 效果：`第2集` < `第10集`（按数值而非字典序），数字段排在文本段之前。
- */
+/** 自然排序：数字段按数值比较（第2集 < 第10集），数字段排在文本段之前。 */
 internal fun naturalCompare(a: String, b: String): Int {
     var i = 0
     var j = 0
@@ -178,12 +161,7 @@ internal fun comparePlaylistItems(a: MediaItemData, b: MediaItemData): Int {
 internal fun sortPlaylist(items: List<MediaItemData>): List<MediaItemData> =
     items.sortedWith(::comparePlaylistItems)
 
-/**
- * 首次加载时合并「数据库中的列表」与「内存中尚未落盘的列表」。
- *
- * 以数据库顺序为准，内存独有条目追加到末尾；按 [normalizeUri] 去重，
- * 避免加载失败后手动扫描再加回数据库列表时出现重复项。
- */
+/** 首次加载时合并数据库列表与内存中尚未落盘的条目（数据库顺序优先，按 URI 去重）。 */
 internal fun mergePlaylistOnLoad(
     stored: List<MediaItemData>,
     scanned: List<MediaItemData>
@@ -199,10 +177,7 @@ internal fun mergePlaylistOnLoad(
     return result
 }
 
-/**
- * 在写锁内按顺序重试：重试期间持续持有 [mutex]，后面的写入不能插到失败重试之前。
- * 最终失败时回调 [onFinalFailure] 并返回 null；取消异常继续抛出。
- */
+/** 在锁内重试写入，保证重试顺序；最终失败回调 [onFinalFailure] 并返回 null。 */
 internal suspend fun <T> withOrderedRetry(
     mutex: Mutex,
     maxAttempts: Int,
@@ -229,13 +204,7 @@ internal suspend fun <T> withOrderedRetry(
 /** 扫描导入的最短时长：过滤提示音、极短片段等噪声。 */
 internal const val MIN_SCAN_DURATION_MS = 5_000L
 
-/**
- * 用扫描结果刷新已有条目的元数据。
- *
- * MediaStore 的 URI（ID）通常稳定，但文件名、时长和所在文件夹都可能变化
- * （重命名、移动目录、重新编码）。这里按 [normalizeUri] 匹配扫描结果并覆盖
- * 对应字段；扫描结果中不存在的条目保持原样（例如 SD 卡暂时不可用）。
- */
+/** 按 URI 用扫描结果刷新名称、时长与文件夹；扫描结果中不存在的条目保持原样。 */
 internal fun mergeScannedMetadata(
     items: List<MediaItemData>,
     scanned: List<MediaItemData>
@@ -269,12 +238,7 @@ internal data class ScanReconcileResult(
     val orderChanged: Boolean,
 )
 
-/**
- * 纯函数对账：删除已消失条目、追加新文件、刷新已有条目元数据并重排。
- *
- * @param removedUris 本轮扫描确认需要删除的 URI（见 [decidePruneCandidates]）
- * @param silent 静默扫描只做清理/元数据刷新，不追加新文件
- */
+/** 纯函数对账：删除已消失条目、追加新文件、刷新元数据并重排；静默扫描不追加。 */
 internal fun reconcilePlaylist(
     current: List<MediaItemData>,
     scannedVideos: List<MediaItemData>?,
@@ -314,13 +278,7 @@ internal data class PruneCandidates(
     val removedUris: Set<String>,
 )
 
-/**
- * 纯函数：根据本轮扫描、权限、卷状态与缺失记录，决定哪些条目可以删除。
- *
- * - 只有拥有对应类型完整权限时才检查该类型（部分授权下 [videoKeys]/[audioKeys] 为 null）；
- * - 可移除卷未全部挂载时不做单条“已删除”确认，退回 24 小时宽限期；
- * - 宽限期到期或单条查询确认已无此行，才加入 [PruneCandidates.removedUris]。
- */
+/** 判断哪些缺失条目可以删除：单条复核确认，或宽限期到期。 */
 internal fun decidePruneCandidates(
     playlistSnapshot: List<MediaItemData>,
     videoKeys: Set<String>?,
@@ -371,10 +329,7 @@ fun formatTime(ms: Long): String {
     return result
 }
 
-/**
- * MediaStore 扫描器：查询设备上的视频与音频，构造 [MediaItemData]。
- * 目录列在 API 29+ 用 RELATIVE_PATH，低版本退回 DATA（绝对路径）。
- */
+/** MediaStore 扫描器：API 29+ 用 RELATIVE_PATH 分组，低版本用 DATA 的父目录。 */
 class MediaStoreScanner(private val context: Context) {
 
     /** 查询所有视频；失败（权限/异常）返回 null。 */
@@ -553,11 +508,7 @@ interface KvDao {
     suspend fun put(entry: KvEntity)
 }
 
-/**
- * Room 数据库。注意：**未启用** fallbackToDestructiveMigration，
- * 新增字段/表时必须在下方补 Migration 并递增 version，否则打开数据库会直接报错，
- * 而不会静默清空用户数据。
- */
+/** Room 数据库：未启用破坏性迁移，升级版本时必须补 Migration 并提交导出的 schema。 */
 @Database(
     entities = [PlaylistItemEntity::class, ProgressEntity::class, KvEntity::class],
     version = 2,
@@ -578,10 +529,7 @@ abstract class PlayerDatabase : RoomDatabase() {
     }
 }
 
-/**
- * 全局单例仓库：内存状态为权威读取源，所有写操作经 [dispatchWrite] 串行落盘。
- * 加载失败不是终态：后续 [ensureLoaded] 会重新加载，写入路径按 [LOAD_RETRY_COOLDOWN_MS] 冷却重试。
- */
+/** 全局仓库：内存状态为权威读取源，写入串行落盘，加载失败可按冷却时间重试。 */
 object PlayerRepository {
     private const val TAG = "PlayerRepository"
     private const val DB_NAME = "player.db"
@@ -694,11 +642,8 @@ object PlayerRepository {
     fun getLastItem(): String? = lastItemState
 
     /**
-     * 应用一批进度变更（合并写）。
-     *
-     * @param writes uri → 位置；仅保留 > 0 的值（0 不覆盖已有进度）
-     * @param removes 需要删除进度记录的 uri
-     * @param onPersisted 落盘完成回调，true 表示已成功写入数据库
+     * 批量应用进度变更：只写 > 0 的位置（0 不覆盖旧值），先删除后写入。
+     * @param onPersisted 落盘完成回调，true 表示已成功写库
      */
     fun applyProgressUpdates(
         writes: Map<String, Long>,
@@ -731,12 +676,7 @@ object PlayerRepository {
         )
     }
 
-    /**
-     * 全量保存播放列表（内存立即更新，数据库异步整体替换）。
-     *
-     * 增删/重排会让所有条目的 sortOrder 变化，逐行 diff 并不比整体替换更省；
-     * 单条时长回填请走 [updatePlaylistDuration]，避免为一处变更重写整表。
-     */
+    /** 全量保存播放列表：内存立即更新，数据库异步整体替换。 */
     fun savePlaylist(items: List<MediaItemData>) {
         // 兜底去重：即使界面侧因异常路径产生重复 URI，也不让主键冲突的整表替换写出脏数据
         val itemsSnapshot = items.distinctBy { normalizeUri(it.uri) }
@@ -805,10 +745,7 @@ object PlayerRepository {
         }
     }
 
-    /**
-     * 缺失记录的唯一写入口：在 [stateLock] 内完成读-改-写，避免扫描对账（IO 线程）
-     * 与播放错误登记（主线程）并发时互相覆盖；没有变化时不触发数据库写入。
-     */
+    /** 缺失记录写入口：在 [stateLock] 内读-改-写，无变化时不写库。 */
     private fun updateMissingState(
         transform: (Map<String, MissingInfo>) -> Map<String, MissingInfo>
     ) {
@@ -835,10 +772,7 @@ object PlayerRepository {
         e
     }
 
-    /**
-     * 统一写入入口：先更新内存，再串行落盘。
-     * 若尚未加载成功，会在写入前尝试重试加载（受冷却限制），避免写入被静默丢弃。
-     */
+    /** 统一写入入口：先更新内存，再串行落盘；未加载成功时先尝试重试加载。 */
     private fun dispatchWrite(
         memPart: () -> Unit,
         dbPart: suspend PlayerDatabase.() -> Unit,
@@ -899,12 +833,7 @@ object PlayerRepository {
 
     private fun nowMs(): Long = System.nanoTime() / 1_000_000
 
-    /**
-     * 在写锁与事务中执行一次落盘；失败重试一次，最终失败会广播 [writeFailures]。
-     *
-     * 重试必须留在锁内：否则第一次失败释放锁后的 delay 窗口里，后续排队的写入
-     * 会先成功，而这次重试再用旧数据覆盖它们，破坏按提交顺序串行落盘的承诺。
-     */
+    /** 在写锁与事务中落盘，失败重试一次；重试保持在锁内以维持写入顺序。 */
     private suspend fun persist(block: suspend PlayerDatabase.() -> Unit): Boolean {
         val result = withOrderedRetry(
             mutex = writeMutex,
@@ -976,10 +905,7 @@ internal fun decideProgressWrite(positionMs: Long, durationMs: Long): ProgressWr
     return ProgressWriteDecision.Store(positionMs)
 }
 
-/**
- * 合并写语义：先应用删除，再写入 > 0 的位置（0 不覆盖已有非零进度）。
- * 同一 uri 同时出现在 removes 与 writes 时，以 writes 为准。
- */
+/** 合并进度：先删除，再写入 > 0 的位置；同一 URI 同时删除与写入时以写入为准。 */
 internal fun mergeProgressMap(
     disk: Map<String, Long>,
     writes: Map<String, Long>,
@@ -1004,10 +930,8 @@ internal data class MissingInfo(
 )
 
 /**
- * 缺失记录状态迁移（纯函数，便于测试）：
- * - 删除优先级最高；
- * - 本轮见到的 uri 视为恢复，移除记录（同一轮又标记缺失时保留缺失）；
- * - 本轮未见到的 uri 计数 +1，首次缺失时间保持不变。
+ * 缺失记录状态迁移：删除优先；见到的 URI 视为恢复；
+ * 未见到的 URI 计数 +1，首次缺失时间不变。
  */
 internal fun mergeMissingRecords(
     current: Map<String, MissingInfo>,

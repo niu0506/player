@@ -1,8 +1,5 @@
 /**
- * 界面组件集合（与业务无关的纯 UI 逻辑）：
- * - [FullscreenPipHelper]：全屏 / 画中画切换与系统栏、视频表面样式管理；
- * - [GestureController]：播放器手势（单击显隐控制栏、双击左/中/右区域快退/播放暂停/快进、横滑快进快退、上下滑调亮度 / 音量）；
- * - [MediaListAdapter]：播放列表 RecyclerView 适配器（DiffUtil 后台差分刷新）。
+ * 界面组件：全屏/PiP 管理、播放器手势、播放列表适配器，以及若干 UI 工具函数。
  */
 package io.github.niu0506.player
 
@@ -81,11 +78,7 @@ internal fun VideoSize?.hasVideo(): Boolean =
 internal fun systemBrightnessToFraction(raw: Int?): Float =
     raw?.coerceIn(0, 255)?.div(255f) ?: 0.5f
 
-/**
- * 全屏与画中画（PiP）辅助类：统一管理视频表面样式、系统栏显隐与方向。
- *
- * @param controllerProvider 惰性获取当前 MediaController（可能为 null）
- */
+/** 全屏与画中画管理：系统栏、方向、视频表面样式与顶部信息条。 */
 @OptIn(UnstableApi::class)
 class FullscreenPipHelper(
     private val activity: AppCompatActivity,
@@ -106,12 +99,7 @@ class FullscreenPipHelper(
     /** 已发出 PiP 进入请求、回调尚未到达的过渡态。 */
     private var pipPreparing = false
 
-    /**
-     * 正在同步 Media3 控制栏的全屏按钮状态。
-     *
-     * [PlayerView.setFullscreenButtonState] 会回调 FullscreenButtonClickListener，
-     * 从左上角返回 / 系统返回 / 进入 PiP 时直接调用 setFullscreen 会重入；这里挡掉。
-     */
+    /** 防止 setFullscreenButtonState 触发回调造成重入。 */
     private var applyingFullscreen = false
 
     /** 全屏顶部信息（文件名 / 系统时间 / 电量）的定时刷新。 */
@@ -193,10 +181,7 @@ class FullscreenPipHelper(
         }
     }
 
-    /**
-     * 刷新顶部信息：文件名取当前媒体标题，时间取系统时钟，电量为百分比。
-     * 媒体切换或进入全屏时主动调用；全屏期间由定时器每秒刷新。
-     */
+    /** 刷新顶部信息：文件名、系统时间与电量。 */
     fun refreshInfoBarContent() {
         binding.tvFullscreenName.text = currentItemTitle().orEmpty()
         binding.tvFullscreenClock.text = DateFormat.getTimeFormat(activity).format(Date())
@@ -301,10 +286,7 @@ class FullscreenPipHelper(
         return !(!ctrl.isPlaying || !ctrl.videoSize.hasVideo()) && enterPipMode(showError = false)
     }
 
-    /**
-     * 尝试进入 PiP 模式，按视频真实宽高比设置小窗比例。
-     * @param showError 失败时是否 Toast 提示
-     */
+    /** 进入 PiP，按视频真实比例设置小窗；失败时按需提示。 */
     fun enterPipMode(showError: Boolean = true): Boolean {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
             if (showError) activity.toast(R.string.toast_pip_unsupported)
@@ -337,11 +319,7 @@ class FullscreenPipHelper(
             null
         }
 
-    /**
-     * 依据视频与播放状态刷新系统 PiP 参数：有视频且正在播放时允许自动进入小窗
-     * （API 31+ 的按 Home / 手势），并给出进入 / 退出小窗的动画锚点。
-     * 纯音频时关闭自动进入，避免弹出空的黑色小窗。
-     */
+    /** 刷新 PiP 参数：仅播放视频时允许自动进入，并设置动画锚点。 */
     fun refreshPipParams() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
         val ctrl = controllerProvider()
@@ -357,10 +335,7 @@ class FullscreenPipHelper(
         }
     }
 
-    /**
-     * 构造 PiP 参数。
-     * @param autoEnter API 31+ 是否允许系统自动进入小窗（无视频时传 false）
-     */
+    /** 构造 PiP 参数（API 31+ 支持自动进入与无缝缩放）。 */
     @RequiresApi(Build.VERSION_CODES.O)
     private fun buildPipParams(ratio: Rational, autoEnter: Boolean): PictureInPictureParams {
         val builder = PictureInPictureParams.Builder().setAspectRatio(ratio)
@@ -408,16 +383,8 @@ class FullscreenPipHelper(
 }
 
 /**
- * 播放器手势控制。
- *
- * 手势：
- * - 单击 → 显隐控制栏；
- * - 双击左 1/3 屏 → 快退 15s；双击中间 1/3 屏 → 播放 / 暂停；双击右 1/3 屏 → 快进 15s；
- * - 横向滑动（滑动结束时才 seek）→ 快进/快退，浮层实时预览目标进度；
- * - 左半屏上下滑动 → 亮度；右半屏上下滑动 → 音量。
- *
- * @param overlay 手势反馈浮层
- * @param controllerProvider 惰性获取当前 MediaController
+ * 播放器手势：单击显隐控制栏；双击左/中/右区域快退/播放暂停/快进；
+ * 横滑快进快退；左半屏调亮度、右半屏调音量。
  */
 @OptIn(UnstableApi::class)
 class GestureController(
@@ -650,16 +617,7 @@ class GestureController(
     }
 }
 
-/**
- * 播放列表适配器。
- *
- * 使用 DiffUtil 在后台线程计算差量，避免主线程卡顿；
- * 仅进度变化通过 payload 局部刷新，其余变化走默认重绑。
- *
- * @param onClick 点击条目回调（传入 uri）
- * @param onDelete 点击删除回调（传入 uri）
- * @param getProgress 读取某 uri 当前进度的回调
- */
+/** 播放列表适配器：DiffUtil 后台差分，进度变化用 payload 局部刷新。 */
 class MediaListAdapter(
     private val onClick: (String) -> Unit,
     private val onDelete: (String) -> Unit,
