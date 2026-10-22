@@ -294,21 +294,51 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 列表变化后重建播放队列，尽量保持当前项与播放位置。 */
+    /**
+     * 列表变化后差分更新播放队列：扫描通常会插入/删除少量条目，
+     * 用 add/remove/move/replace 可以避免 setMediaItems 重建整个队列导致短暂断音。
+     * 只有当前播放项被移除（或差分无法安全落地）时才整体重建。
+     */
     private fun rebuildQueueIfNeeded(ctrl: MediaController) {
         if (playlist.isEmpty() || queueMatchesPlaylist(ctrl)) return
 
-        val curUri = ctrl.currentMediaItem?.localConfiguration?.uri?.toString()
+        val currentItem = ctrl.currentMediaItem
+        val curUri = currentItem?.localConfiguration?.uri?.toString()
         val curPos = ctrl.currentPosition
         val curIdx = curUri?.let(::indexOfUri) ?: -1
 
-        val items = playlist.map(::buildMediaItem)
-        if (curIdx >= 0) {
-            // 仅当当前项仍在列表时才需要先落盘再重建，避免为已移除项写回进度
-            PlayerService.flushCurrentPosition()
-            ctrl.setMediaItems(items, curIdx, curPos)
-        } else {
-            ctrl.setMediaItems(items)
+        val queue = (0 until ctrl.mediaItemCount).map { index ->
+            val item = ctrl.getMediaItemAt(index)
+            QueueItemSnapshot(
+                uri = item.localConfiguration?.uri?.toString().orEmpty(),
+                title = item.mediaMetadata.title?.toString(),
+            )
+        }
+        val target = playlist.map { QueueItemSnapshot(it.uri.toString(), it.name) }
+        val plan = planQueueDiff(queue, target, curUri)
+
+        // 当前项仍可识别时优先增量更新；当前项已被移除才整体重建。
+        // 当前项存在但没有 URI 属于异常状态，同样退回整体重建以避免误删。
+        if (plan.requiresFullReset || (currentItem != null && curUri == null)) {
+            val items = playlist.map(::buildMediaItem)
+            if (curIdx >= 0) {
+                // 仅当当前项仍在列表时才需要先落盘再重建，避免为已移除项写回进度
+                PlayerService.flushCurrentPosition()
+                ctrl.setMediaItems(items, curIdx, curPos)
+            } else {
+                ctrl.setMediaItems(items)
+            }
+            return
+        }
+
+        // 下标由 planQueueDiff 按“执行到该步时”的队列状态计算，必须顺序执行。
+        for (edit in plan.edits) {
+            when (edit) {
+                is QueueEdit.Add -> ctrl.addMediaItem(edit.index, buildMediaItem(playlist[edit.index]))
+                is QueueEdit.Remove -> ctrl.removeMediaItem(edit.index)
+                is QueueEdit.Move -> ctrl.moveMediaItem(edit.fromIndex, edit.toIndex)
+                is QueueEdit.Replace -> ctrl.replaceMediaItem(edit.index, buildMediaItem(playlist[edit.index]))
+            }
         }
     }
 

@@ -175,6 +175,8 @@ class PlayerService : MediaSessionService() {
                     .build(),
                 true
             )
+            // 本地媒体播放期间保持 CPU 唤醒；只持有本地唤醒锁，不需要 Wi-Fi 锁
+            .setWakeMode(C.WAKE_MODE_LOCAL)
             // 拔掉耳机（音频路由变为 noisy）时自动暂停
             .setHandleAudioBecomingNoisy(true)
             .setSeekBackIncrementMs(15_000)

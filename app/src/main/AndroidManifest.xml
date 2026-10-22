@@ -5,6 +5,9 @@
     <!-- 前台服务（后台播放）及媒体播放类型 -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"
         tools:ignore="ForegroundServicesPolicy" />
+
+    <!-- 后台音频播放期间保持 CPU 唤醒（配合 ExoPlayer 的 WAKE_MODE_LOCAL） -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
     
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     

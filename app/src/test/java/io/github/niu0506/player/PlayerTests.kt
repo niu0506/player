@@ -1443,3 +1443,156 @@ class DatabaseSelfHealTest {
         assertFalse(isSelfHealableDatabaseFailure(IllegalStateException("Something else")))
     }
 }
+
+/** 播放队列差分计划：验证增删移换能按顺序把旧队列变成目标队列。 */
+class QueueDiffTest {
+
+    private fun snap(uri: String, title: String = uri) = QueueItemSnapshot(uri, title)
+
+    private fun applyEdits(
+        current: List<QueueItemSnapshot>,
+        target: List<QueueItemSnapshot>,
+        edits: List<QueueEdit>,
+    ): List<QueueItemSnapshot> {
+        val working = current.toMutableList()
+        for (edit in edits) {
+            when (edit) {
+                is QueueEdit.Add -> {
+                    assertEquals(edit.uri, target[edit.index].uri)
+                    working.add(edit.index, target[edit.index])
+                }
+                is QueueEdit.Remove -> {
+                    assertEquals(edit.uri, working.removeAt(edit.index).uri)
+                }
+                is QueueEdit.Move -> {
+                    val moved = working.removeAt(edit.fromIndex)
+                    assertEquals(edit.uri, moved.uri)
+                    working.add(edit.toIndex, moved)
+                }
+                is QueueEdit.Replace -> {
+                    assertEquals(edit.uri, target[edit.index].uri)
+                    working[edit.index] = target[edit.index]
+                }
+            }
+        }
+        return working
+    }
+
+    private fun assertPlanTransforms(
+        current: List<QueueItemSnapshot>,
+        target: List<QueueItemSnapshot>,
+        currentUri: String? = null,
+    ) {
+        val plan = planQueueDiff(current, target, currentUri)
+        assertFalse("当前项仍在目标中时不应整体重建", plan.requiresFullReset)
+        assertEquals(target, applyEdits(current, target, plan.edits))
+    }
+
+    @Test
+    fun `equal queues need no edits`() {
+        val queue = listOf(snap("a"), snap("b"))
+        val plan = planQueueDiff(queue, queue, "a")
+
+        assertTrue(plan.edits.isEmpty())
+        assertFalse(plan.requiresFullReset)
+    }
+
+    @Test
+    fun `inserts item at target position`() {
+        assertPlanTransforms(
+            listOf(snap("a"), snap("c")),
+            listOf(snap("a"), snap("b"), snap("c")),
+            currentUri = "a",
+        )
+    }
+
+    @Test
+    fun `removes item missing from target`() {
+        assertPlanTransforms(
+            listOf(snap("a"), snap("b"), snap("c")),
+            listOf(snap("a"), snap("c")),
+            currentUri = "a",
+        )
+    }
+
+    @Test
+    fun `moves item to new position`() {
+        assertPlanTransforms(
+            listOf(snap("a"), snap("b"), snap("c")),
+            listOf(snap("c"), snap("a"), snap("b")),
+            currentUri = "a",
+        )
+    }
+
+    @Test
+    fun `insert before current keeps current item`() {
+        val plan = planQueueDiff(
+            listOf(snap("a"), snap("b")),
+            listOf(snap("x"), snap("a"), snap("b")),
+            currentUri = "a",
+        )
+
+        assertFalse(plan.requiresFullReset)
+        assertEquals(listOf(QueueEdit.Add(0, "x")), plan.edits)
+    }
+
+    @Test
+    fun `title only change uses replace`() {
+        val plan = planQueueDiff(
+            listOf(snap("a", "旧标题")),
+            listOf(snap("a", "新标题")),
+            currentUri = "a",
+        )
+
+        assertFalse(plan.requiresFullReset)
+        assertEquals(listOf(QueueEdit.Replace(0, "a")), plan.edits)
+    }
+
+    @Test
+    fun `reorder and title changes apply in order`() {
+        assertPlanTransforms(
+            listOf(snap("a", "旧 A"), snap("b", "旧 B")),
+            listOf(snap("b", "新 B"), snap("a", "新 A")),
+            currentUri = "a",
+        )
+    }
+
+    @Test
+    fun `current item removed requires full reset`() {
+        val plan = planQueueDiff(
+            listOf(snap("a"), snap("b")),
+            listOf(snap("b")),
+            currentUri = "a",
+        )
+
+        assertTrue(plan.requiresFullReset)
+        assertTrue(plan.edits.isEmpty())
+    }
+
+    @Test
+    fun `empty queue fills from target`() {
+        assertPlanTransforms(
+            emptyList(),
+            listOf(snap("a"), snap("b")),
+            currentUri = null,
+        )
+    }
+
+    @Test
+    fun `empty target removes everything`() {
+        assertPlanTransforms(
+            listOf(snap("a"), snap("b")),
+            emptyList(),
+            currentUri = null,
+        )
+    }
+
+    @Test
+    fun `duplicate uris still reach target order`() {
+        assertPlanTransforms(
+            listOf(snap("a"), snap("b"), snap("a")),
+            listOf(snap("a"), snap("a")),
+            currentUri = "a",
+        )
+    }
+}
