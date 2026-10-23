@@ -64,12 +64,11 @@ data class MediaItemData(
     val folderKey: String = "",
 )
 
-/** 归一化 URI 作为比较键：去掉 query 与末尾斜杠，并拼接最后一段路径。 */
-fun normalizeUri(uri: Uri): String {
-    val base = uri.toString().substringBefore('?').trimEnd('/')
-    val lastSeg = uri.lastPathSegment ?: base
-    return "$base|$lastSeg"
-}
+/** 归一化 URI 作为比较键：去掉 query 与末尾斜杠。 */
+fun normalizeUri(uri: Uri): String = normalizeUri(uri.toString())
+
+/** 字符串版本的 [normalizeUri]，避免调用方为了比较再解析一次 URI。 */
+fun normalizeUri(uri: String): String = uri.substringBefore('?').trimEnd('/')
 
 /** 扫描到的名称为空时用兜底文案，避免平台空值传给非空模型。 */
 internal fun scanDisplayNameOrFallback(raw: String?, fallback: String): String =
@@ -108,33 +107,18 @@ internal fun folderKeyFromAbsolutePath(absolutePath: String?, storageRoot: Strin
     return parent.trimEnd('/')
 }
 
-/** 超过此位数的数字段改用「长度 + 字典序」比较，避免 Long 溢出。 */
-private const val NATURAL_MAX_DIGITS = 18
-
-/** 超出安全位数时用「长度 + 字典序」比较，避免 Long 溢出。 */
-private fun compareDigitTails(x: String, y: String): Int {
-    val byLength = x.length.compareTo(y.length)
-    return if (byLength != 0) byLength else x.compareTo(y)
-}
-
-/** 比较两段纯数字：先按数值大小；超出安全位数时退化为长度 + 字典序。 */
+/** 比较两段纯数字：去掉前导零后先比长度再比字典序，对任意长度都正确且不会溢出。 */
 private fun compareDigitSegments(a: String, b: String): Int {
     val x = a.trimStart('0').ifEmpty { "0" }
     val y = b.trimStart('0').ifEmpty { "0" }
-    if (x.length <= NATURAL_MAX_DIGITS && y.length <= NATURAL_MAX_DIGITS) {
-        val vx = x.toLong()
-        val vy = y.toLong()
-        if (vx != vy) return if (vx < vy) -1 else 1
-    }
-    return compareDigitTails(x, y)
+    val byLength = x.length.compareTo(y.length)
+    return if (byLength != 0) byLength else x.compareTo(y)
 }
 
 /** 比较两段非数字文本：忽略大小写优先，完全相同再按大小写敏感比较，保证排序确定性。 */
 private fun compareTextSegments(a: String, b: String): Int {
     val byIgnoreCase = a.compareTo(b, ignoreCase = true)
-    if (byIgnoreCase != 0) return if (byIgnoreCase < 0) -1 else 1
-    val byCase = a.compareTo(b)
-    return if (byCase < 0) -1 else if (byCase > 0) 1 else 0
+    return if (byIgnoreCase != 0) byIgnoreCase else a.compareTo(b)
 }
 
 /** 自然排序：数字段按数值比较（第2集 < 第10集），数字段排在文本段之前。 */
@@ -279,8 +263,12 @@ internal fun reconcilePlaylist(
         emptyList()
     } else {
         val seen = afterPrune.map { normalizeUri(it.uri) }.toMutableSet()
-        scanned.filter { item ->
-            item.duration >= MIN_SCAN_DURATION_MS && seen.add(normalizeUri(item.uri))
+        buildList {
+            for (item in scanned) {
+                if (item.duration >= MIN_SCAN_DURATION_MS && seen.add(normalizeUri(item.uri))) {
+                    add(item)
+                }
+            }
         }
     }
     val appended = afterPrune + newItems
@@ -490,18 +478,10 @@ fun hasMediaReadAccess(context: Context, permission: String, includePartial: Boo
         ) == PackageManager.PERMISSION_GRANTED)
 }
 
-/** 视频或音频任一读取权限即视为有访问权（低版本为 READ_EXTERNAL_STORAGE）。 */
+/** 视频或音频任一读取权限即视为有访问权（低版本两次调用都会落到 READ_EXTERNAL_STORAGE）。 */
 fun hasAnyMediaReadAccess(context: Context, includePartial: Boolean): Boolean =
-    if (Build.VERSION.SDK_INT < 33) {
-        hasMediaReadAccess(
-            context,
-            android.Manifest.permission.READ_EXTERNAL_STORAGE,
-            includePartial = false
-        )
-    } else {
-        hasMediaReadAccess(context, android.Manifest.permission.READ_MEDIA_VIDEO, includePartial) ||
-            hasMediaReadAccess(context, android.Manifest.permission.READ_MEDIA_AUDIO, includePartial)
-    }
+    hasMediaReadAccess(context, android.Manifest.permission.READ_MEDIA_VIDEO, includePartial) ||
+        hasMediaReadAccess(context, android.Manifest.permission.READ_MEDIA_AUDIO, includePartial)
 
 /** 播放列表表：uri 为主键，sortOrder 维持用户可见顺序，folder 为文件夹分组键。 */
 @Entity(tableName = "playlist")
@@ -692,12 +672,7 @@ object PlayerRepository {
         Log.e(TAG, "数据库加载失败", failure)
         synchronized(loadLock) {
             if (loadJob === job && !loadSucceeded) {
-                synchronized(stateLock) {
-                    playlistState = emptyList()
-                    progressState = emptyMap()
-                    lastItemState = null
-                    missingState = emptyMap()
-                }
+                synchronized(stateLock) { clearMemoryStateLocked() }
             }
         }
         return loadSucceeded
@@ -708,6 +683,14 @@ object PlayerRepository {
 
     /** 数据是否已成功加载。 */
     fun isLoaded(): Boolean = loadSucceeded
+
+    /** 清空四份内存状态；调用方必须持有 [stateLock]。 */
+    private fun clearMemoryStateLocked() {
+        playlistState = emptyList()
+        progressState = emptyMap()
+        lastItemState = null
+        missingState = emptyMap()
+    }
 
     /**
      * 删除本地数据库并重建（播放列表、进度、上次播放项、缺失记录都会清空）。
@@ -726,32 +709,11 @@ object PlayerRepository {
                 synchronized(loadLock) {
                     loadJob = null
                     loadSucceeded = false
-                    try {
-                        db?.close()
-                    } catch (e: Exception) {
-                        Log.w(TAG, "关闭数据库失败", e)
-                    }
-                    db = null
-                    synchronized(stateLock) {
-                        playlistState = emptyList()
-                        progressState = emptyMap()
-                        lastItemState = null
-                        missingState = emptyMap()
-                    }
+                    closeDb("关闭数据库失败")
+                    synchronized(stateLock) { clearMemoryStateLocked() }
                 }
                 val dbFile = appCtx.getDatabasePath(DB_NAME)
-                val deleted = try {
-                    appCtx.deleteDatabase(DB_NAME)
-                } catch (e: Exception) {
-                    Log.e(TAG, "删除数据库失败", e)
-                    false
-                }
-                if (!deleted) {
-                    for (suffix in DB_SIDECAR_SUFFIXES) {
-                        File(dbFile.path + suffix).delete()
-                    }
-                }
-                if (dbFile.exists()) {
+                if (!deleteDatabaseFiles(appCtx, dbFile)) {
                     Log.e(TAG, "重置失败：数据库文件仍存在")
                     false
                 } else {
@@ -891,9 +853,10 @@ object PlayerRepository {
             missingState = newState
             newState
         }
-        dispatchDbWrite {
-            kvDao().put(KvEntity(KEY_MISSING_URIS, encodeMissingJson(snapshot)))
-        }
+        dispatchWrite(
+            memPart = {},
+            dbPart = { kvDao().put(KvEntity(KEY_MISSING_URIS, encodeMissingJson(snapshot))) },
+        )
     }
 
     private fun nowWallClockMs(): Long = System.currentTimeMillis()
@@ -936,10 +899,6 @@ object PlayerRepository {
         }
     }
 
-    /** 仅落库的写入：内存状态已由调用方先行更新（如缺失记录）。 */
-    private fun dispatchDbWrite(dbPart: suspend PlayerDatabase.() -> Unit) =
-        dispatchWrite(memPart = {}, dbPart = dbPart)
-
     /** 加载失败后按冷却时间重启加载；返回是否已成功加载。 */
     private suspend fun reloadAfterFailure(): Boolean {
         val job = synchronized(loadLock) {
@@ -953,16 +912,38 @@ object PlayerRepository {
         return job.awaitOrNull() == null
     }
 
+    /** 关闭并丢弃数据库句柄；调用方需保证没有并发写入。 */
+    private fun closeDb(logMessage: String? = null) {
+        try {
+            db?.close()
+        } catch (e: Exception) {
+            if (logMessage != null) Log.w(TAG, logMessage, e)
+        }
+        db = null
+    }
+
+    /** 删除数据库及其旁路文件；返回主库文件是否已不存在。 */
+    private fun deleteDatabaseFiles(appCtx: Context, dbFile: File): Boolean {
+        val deleted = try {
+            appCtx.deleteDatabase(DB_NAME)
+        } catch (e: Exception) {
+            Log.e(TAG, "删除数据库失败", e)
+            false
+        }
+        if (!deleted) {
+            for (suffix in DB_SIDECAR_SUFFIXES) {
+                File(dbFile.path + suffix).delete()
+            }
+        }
+        return !dbFile.exists()
+    }
+
     /** 关闭旧数据库并重新发起加载（调用方需持有 loadLock）。 */
     private fun restartLoadLocked() {
         val ctx = appContext ?: return
         loadJob = null
         loadSucceeded = false
-        try {
-            db?.close()
-        } catch (_: Exception) {
-        }
-        db = null
+        closeDb()
         lastLoadAttemptMs = nowMs()
         loadJob = persistScope.async { loadInternal(ctx) }
     }
@@ -1029,12 +1010,7 @@ object PlayerRepository {
         val dbFile = appCtx.getDatabasePath(DB_NAME)
         val backupDir = File(appCtx.noBackupFilesDir, "db-backup-${System.currentTimeMillis()}")
         return try {
-            try {
-                db?.close()
-            } catch (e: Exception) {
-                Log.w(TAG, "关闭损坏数据库失败", e)
-            }
-            db = null
+            closeDb("关闭损坏数据库失败")
             if (dbFile.exists()) {
                 if (!backupDir.mkdirs() && !backupDir.isDirectory) {
                     Log.e(TAG, "无法创建数据库备份目录: ${backupDir.absolutePath}")
@@ -1053,22 +1029,11 @@ object PlayerRepository {
                 }
                 Log.w(TAG, "旧数据库已备份到 ${backupDir.absolutePath}")
             }
-            val deleted = appCtx.deleteDatabase(DB_NAME)
-            if (!deleted) {
-                for (suffix in DB_SIDECAR_SUFFIXES) {
-                    File(dbFile.path + suffix).delete()
-                }
-            }
-            if (dbFile.exists()) {
+            if (!deleteDatabaseFiles(appCtx, dbFile)) {
                 Log.e(TAG, "删除损坏数据库失败: ${dbFile.absolutePath}")
                 false
             } else {
-                synchronized(stateLock) {
-                    playlistState = emptyList()
-                    progressState = emptyMap()
-                    lastItemState = null
-                    missingState = emptyMap()
-                }
+                synchronized(stateLock) { clearMemoryStateLocked() }
                 true
             }
         } catch (e: Exception) {

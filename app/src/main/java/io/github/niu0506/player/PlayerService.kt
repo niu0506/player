@@ -25,6 +25,10 @@ import com.google.common.util.concurrent.ListenableFuture
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 
+/** MediaItem 的字符串 URI；无 localConfiguration 时返回 null。 */
+internal val MediaItem?.uriString: String?
+    get() = this?.localConfiguration?.uri?.toString()
+
 class PlayerService : MediaSessionService() {
 
     private var mediaSession: MediaSession? = null
@@ -60,7 +64,7 @@ class PlayerService : MediaSessionService() {
                     progress.cache(finishedUri, finishedDuration, finishedDuration)
                 }
             }
-            lastPlayedUri = mediaItem?.localConfiguration?.uri?.toString()
+            lastPlayedUri = mediaItem.uriString
             lastPlayedDurationMs = this@PlayerService.player
                 ?.duration
                 ?.takeIf { it > 0 }
@@ -71,7 +75,7 @@ class PlayerService : MediaSessionService() {
             if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO ||
                 reason == Player.MEDIA_ITEM_TRANSITION_REASON_SEEK
             ) {
-                restoreResumePosition(mediaItem)
+                restoreResumePosition(mediaItem, reason)
             }
             persistProgress()
         }
@@ -115,19 +119,23 @@ class PlayerService : MediaSessionService() {
                     ?.toString()
                     ?.let(progress::clear)
             }
-            if (reason == Player.DISCONTINUITY_REASON_SEEK && !sameItem) {
+            when {
                 // 跨条目 seek：先补记旧条目的位置，再统一落盘
-                cacheOldPosition(oldPosition)
-            } else if (reason != Player.DISCONTINUITY_REASON_SEEK && sameItem) {
-                return
+                reason == Player.DISCONTINUITY_REASON_SEEK && !sameItem -> {
+                    cacheOldPosition(oldPosition)
+                    persistProgress()
+                }
+                reason == Player.DISCONTINUITY_REASON_SEEK -> persistProgress()
+                !sameItem -> persistProgress()
+                // 同条目、非 seek 的位置变化不产生有效进度
+                else -> return
             }
-            persistProgress()
         }
 
         override fun onPlayerError(error: PlaybackException) {
             Log.w(TAG, "播放出错: code=${error.errorCode}", error)
             val player = this@PlayerService.player ?: return
-            val errorUri = player.currentMediaItem?.localConfiguration?.uri?.toString()
+            val errorUri = player.currentMediaItem.uriString
             if (error.errorCode == PlaybackException.ERROR_CODE_IO_FILE_NOT_FOUND &&
                 errorUri != null
             ) {
@@ -249,17 +257,12 @@ class PlayerService : MediaSessionService() {
         }
     }
 
-    /** 按裁决结果缓存某个条目的播放位置（当前项与已切走的旧项共用）。 */
-    private fun cachePosition(uri: String?, positionMs: Long, durationMs: Long) {
-        progress.cache(uri, positionMs, durationMs)
-    }
-
     /** 缓存当前播放位置，并记住当前项时长供自动连播时标记完成。 */
     private fun cacheCurrentPosition(player: Player) {
         val duration = player.duration
         if (duration > 0) lastPlayedDurationMs = duration
-        cachePosition(
-            player.currentMediaItem?.localConfiguration?.uri?.toString(),
+        progress.cache(
+            player.currentMediaItem.uriString,
             player.currentPosition,
             duration
         )
@@ -267,18 +270,25 @@ class PlayerService : MediaSessionService() {
 
     /**
      * 切到新条目后按断点续播；没有记录或已看完时保持从头播放。
-     * 位置已明显离开开头说明界面点播时已经 seek 过，不必重复 seek。
+     *
+     * 只有跨条目 SEEK 需要保留“界面已经定位过”的检查；自动连播时
+     * onMediaItemTransition 会经主线程派发，回调执行时新条目可能已经播了
+     * 一秒以上，不能再因此跳过续播。
      */
-    private fun restoreResumePosition(mediaItem: MediaItem?) {
+    private fun restoreResumePosition(mediaItem: MediaItem?, reason: Int) {
         val player = this.player ?: return
-        if (player.currentPosition > RESUME_START_TOLERANCE_MS) return
-        val uri = mediaItem?.localConfiguration?.uri?.toString() ?: return
+        if (!shouldRestoreResume(reason, player.currentPosition, RESUME_START_TOLERANCE_MS)) return
+        val uri = mediaItem.uriString ?: return
         // 刚切歌时新条目尚未 READY，优先用列表里扫描到的时长判定「已看完」
-        val duration = player.duration.takeIf { it > 0 }
-            ?: PlayerRepository.getPlaylist().firstOrNull { it.uri.toString() == uri }?.duration
+        val playlistDuration = PlayerRepository.getPlaylist()
+            .firstOrNull { it.uri.toString() == uri }
+            ?.duration
+            ?: 0L
+        val duration = playlistDuration.takeIf { it > 0 }
+            ?: player.duration.takeIf { it > 0 }
             ?: 0L
         val position = resumablePositionMs(PlayerRepository.getProgress(uri), duration) ?: return
-        player.seekTo(position)
+        player.seekTo(player.currentMediaItemIndex, position)
     }
 
     /** 缓存某个旧条目的位置（已切走后仍能补记其进度）。 */
@@ -287,8 +297,8 @@ class PlayerService : MediaSessionService() {
         if (oldPosition.mediaItemIndex !in 0 until player.currentTimeline.windowCount) return
         val window = Timeline.Window()
         player.currentTimeline.getWindow(oldPosition.mediaItemIndex, window)
-        cachePosition(
-            window.mediaItem.localConfiguration?.uri?.toString(),
+        progress.cache(
+            window.mediaItem.uriString,
             oldPosition.positionMs,
             window.durationMs
         )
@@ -300,7 +310,7 @@ class PlayerService : MediaSessionService() {
         // URI 已真正离开播放队列后解除抑制，避免集合无限增长
         if (progress.hasPendingDrops()) {
             val present = (0 until player.mediaItemCount)
-                .mapNotNull { player.getMediaItemAt(it).localConfiguration?.uri?.toString() }
+                .mapNotNull { player.getMediaItemAt(it).uriString }
                 .toSet()
             progress.retainPending(present)
         }
@@ -519,3 +529,16 @@ internal fun isExplicitSeekToZero(
     sameItem &&
     oldPositionMs > 0L &&
     newPositionMs == 0L
+
+/**
+ * 是否需要按断点续播。
+ *
+ * 自动连播必须恢复：事件经主线程派发，回调执行时新条目可能已经播了一段，
+ * 不能用“当前位置已离开开头”来推断界面已经 seek 过。只有跨条目 SEEK 才做这个检查。
+ */
+internal fun shouldRestoreResume(
+    reason: Int,
+    currentPositionMs: Long,
+    toleranceMs: Long,
+): Boolean = reason != Player.MEDIA_ITEM_TRANSITION_REASON_SEEK ||
+    currentPositionMs <= toleranceMs

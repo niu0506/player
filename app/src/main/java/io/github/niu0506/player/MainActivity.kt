@@ -32,7 +32,6 @@ import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.widget.PopupMenu
 import androidx.core.content.ContextCompat
-import androidx.core.net.toUri
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
@@ -98,6 +97,9 @@ class MainActivity : AppCompatActivity() {
         const val MENU_CHECK_UPDATE = 1
         const val MENU_BRIGHTNESS_SYSTEM = 2
         const val MENU_RESET_DATA = 3
+
+        /** 可选倍速档位。 */
+        val speedLevels = floatArrayOf(0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 2.0f, 3.0f)
 
         /** 日志标签。 */
         const val TAG = "MainActivity"
@@ -165,16 +167,17 @@ class MainActivity : AppCompatActivity() {
     /** 把当前播放项 / 播放状态同步到列表高亮。 */
     private fun syncAdapterPlayingState() {
         adapter.setCurrentPlaying(
-            controller?.currentMediaItem?.localConfiguration?.uri?.toString(),
+            controller?.currentMediaItem.uriString,
             controller?.isPlaying == true
         )
     }
 
-    /** 用播放器解析出的真实时长回填列表条目（只写单行，不触发整表替换）。 */
+    /** 用播放器解析出的真实时长回填列表条目（只刷新单条，不触发整表差分）。 */
     private fun updateDurationAt(index: Int, duration: Long) {
         if (index !in playlist.indices || playlist[index].duration == duration) return
         playlist[index] = playlist[index].copy(duration = duration)
-        submitPlaylist()
+        // 差分进行中或列表尚未同步到适配器时退回整表提交，避免单条更新被旧结果覆盖
+        if (adapter.isDiffing || !adapter.updateItem(playlist[index])) submitPlaylist()
         PlayerRepository.updatePlaylistDuration(playlist[index].uri, duration)
     }
 
@@ -203,10 +206,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     /** 按统一的身份键（[normalizeUri]）定位列表条目；找不到返回 -1。 */
-    private fun indexOfUri(uri: String): Int {
-        val key = normalizeUri(uri.toUri())
-        return playlist.indexOfFirst { normalizeUri(it.uri) == key }
-    }
+    private fun indexOfUri(uri: String): Int =
+        playlist.indexOfFirst { normalizeUri(it.uri) == normalizeUri(uri) }
 
     /** 首次加载时把仓库列表合并进内存（保留加载失败期间手动扫描的条目）。 */
     private fun loadPlaylist() {
@@ -228,8 +229,7 @@ class MainActivity : AppCompatActivity() {
             updateKeepScreenOn()
             fullscreenPip.refreshPipParams()
             if (!isPlaying) {
-                // 先落盘再刷新，保证读到最新进度
-                PlayerService.flushCurrentPosition()
+                // Service 自己的监听器已在暂停时落盘，这里只刷新界面
                 adapter.refreshProgress(controller?.currentMediaItemIndex ?: -1)
             }
         }
@@ -276,7 +276,7 @@ class MainActivity : AppCompatActivity() {
         if (ctrl.mediaItemCount != playlist.size) return false
         for (i in playlist.indices) {
             val queueItem = ctrl.getMediaItemAt(i)
-            val queueUri = queueItem.localConfiguration?.uri?.toString() ?: return false
+            val queueUri = queueItem.uriString ?: return false
             if (queueUri != playlist[i].uri.toString()) return false
             val queueTitle = queueItem.mediaMetadata.title?.toString()
             if (queueTitle != null && queueTitle != playlist[i].name) return false
@@ -301,14 +301,14 @@ class MainActivity : AppCompatActivity() {
         if (playlist.isEmpty() || queueMatchesPlaylist(ctrl)) return
 
         val currentItem = ctrl.currentMediaItem
-        val curUri = currentItem?.localConfiguration?.uri?.toString()
+        val curUri = currentItem.uriString
         val curPos = ctrl.currentPosition
         val curIdx = curUri?.let(::indexOfUri) ?: -1
 
         val queue = (0 until ctrl.mediaItemCount).map { index ->
             val item = ctrl.getMediaItemAt(index)
             QueueItemSnapshot(
-                uri = item.localConfiguration?.uri?.toString().orEmpty(),
+                uri = item.uriString.orEmpty(),
                 title = item.mediaMetadata.title?.toString(),
             )
         }
@@ -367,9 +367,6 @@ class MainActivity : AppCompatActivity() {
         syncAdapterPlayingState()
     }
 
-    /** 可选倍速档位。 */
-    private val speedLevels = floatArrayOf(0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 2.0f, 3.0f)
-
     /** 配置控制栏扩展：循环 / 随机按钮、倍速与音轨 / 字幕入口。 */
     @OptIn(UnstableApi::class)
     private fun setupControllerExtras() {
@@ -403,7 +400,7 @@ class MainActivity : AppCompatActivity() {
     /** 找到当前速度对应的档位下标；不在档位内时回退到 1x。 */
     private fun speedsIndex(speed: Float): Int {
         val idx = speedLevels.indexOfFirst { it == speed }
-        return if (idx >= 0) idx else speedLevels.indexOfFirst { it == 1.0f }.coerceAtLeast(0)
+        return if (idx >= 0) idx else speedLevels.indexOfFirst { it == 1.0f }
     }
 
     /** 弹出倍速选择对话框。 */
@@ -908,10 +905,9 @@ class MainActivity : AppCompatActivity() {
                 startScan(silent = true).join()
 
                 if (!isCurrentController(future, ctrl)) return@launch
-                // 扫描可能删除/重排条目，完成后统一重建队列并刷新
-                rebuildQueueAndClearPending(ctrl)
+                // 扫描有变化时 reconcileScanResult 已重建队列并刷新；这里只处理
+                // 当前项被删除后需要重新定位上次播放项的情况。
                 restoreLastPlayed()
-                refreshPlaylist()
             }
         }, ContextCompat.getMainExecutor(this))
     }
@@ -937,12 +933,6 @@ class MainActivity : AppCompatActivity() {
         super.onPause()
         // 切后台先把当前位置落盘
         PlayerService.flushCurrentPosition()
-    }
-
-    override fun onResume() {
-        super.onResume()
-        // 回到前台补弹检查期间被推迟的更新提示
-        updateManager.resumePendingUpdateDialog()
     }
 
     override fun onUserLeaveHint() {

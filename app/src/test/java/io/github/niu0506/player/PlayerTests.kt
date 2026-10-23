@@ -164,6 +164,19 @@ class ProgressDecisionTest {
     fun `unknown duration still allows resuming`() {
         assertEquals(60_000L, resumablePositionMs(60_000, 0))
     }
+
+    @Test
+    fun `auto transition restores even when callback is delayed`() {
+        assertTrue(
+            shouldRestoreResume(Player.MEDIA_ITEM_TRANSITION_REASON_AUTO, 60_000, 1_000)
+        )
+        assertFalse(
+            shouldRestoreResume(Player.MEDIA_ITEM_TRANSITION_REASON_SEEK, 60_000, 1_000)
+        )
+        assertTrue(
+            shouldRestoreResume(Player.MEDIA_ITEM_TRANSITION_REASON_SEEK, 500, 1_000)
+        )
+    }
 }
 
 /** 适配器「当前播放项」更新：越界防护、仅刷新受影响条目。 */

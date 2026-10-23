@@ -49,6 +49,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlin.math.abs
@@ -183,6 +184,8 @@ class FullscreenPipHelper(
 
     /** 刷新顶部信息：文件名、系统时间与电量。 */
     fun refreshInfoBarContent() {
+        // 信息条只在全屏且非 PiP 时可见；普通模式不必读时间/电量
+        if (!isFullscreen || isInPipMode) return
         binding.tvFullscreenName.text = currentItemTitle().orEmpty()
         binding.tvFullscreenClock.text = DateFormat.getTimeFormat(activity).format(Date())
         val percent = batteryPercent()
@@ -210,9 +213,9 @@ class FullscreenPipHelper(
     }
 
     /** 根据当前（普通 / 全屏 / PiP）状态统一套用界面样式。 */
-    private fun applyVisualState(pipPreparing: Boolean = false) {
-        this.pipPreparing = pipPreparing
-        val pipLike = isInPipMode || pipPreparing
+    private fun applyVisualState(preparing: Boolean = false) {
+        this.pipPreparing = preparing
+        val pipLike = isInPipMode || preparing
         setChromeVisible(!pipLike && !isFullscreen)
         setFullscreenBackVisible(isFullscreen && !pipLike)
         binding.playerView.useController = !pipLike
@@ -220,29 +223,25 @@ class FullscreenPipHelper(
         requestContentInsets()
         when {
             // PiP（或进入前的过渡态）：按真实比例缩放铺满小窗
-            pipLike -> applyEdgeToEdgeSurface(AspectRatioFrameLayout.RESIZE_MODE_ZOOM)
+            pipLike -> applyCardStyle(AspectRatioFrameLayout.RESIZE_MODE_ZOOM, marginDp = 0, radiusDp = 0f)
             // 全屏：按真实比例完整显示（不裁剪画面，可能留黑边）
-            isFullscreen -> applyEdgeToEdgeSurface(AspectRatioFrameLayout.RESIZE_MODE_FIT)
-            else -> applyNormalVideoSurfaceStyle()
+            isFullscreen -> applyCardStyle(AspectRatioFrameLayout.RESIZE_MODE_FIT, marginDp = 0, radiusDp = 0f)
+            else -> applyCardStyle(
+                AspectRatioFrameLayout.RESIZE_MODE_FIT,
+                marginDp = 12,
+                radiusDp = 18f,
+            )
         }
     }
 
-    /** 边到边视频表面：去除卡片圆角与边距。 */
-    private fun applyEdgeToEdgeSurface(resizeMode: Int) {
+    /** 统一设置视频表面：缩放模式、卡片边距与圆角。 */
+    private fun applyCardStyle(resizeMode: Int, marginDp: Int, radiusDp: Float) {
         binding.playerView.setResizeMode(resizeMode)
-        binding.playerCard.radius = 0f
+        val density = activity.resources.displayMetrics.density
+        val margin = (marginDp * density).toInt()
         val lp = binding.playerCard.layoutParams as ViewGroup.MarginLayoutParams
-        lp.setMargins(0, 0, 0, 0)
-        binding.playerCard.layoutParams = lp
-    }
-
-    /** 普通内嵌样式：恢复卡片圆角与内边距。 */
-    private fun applyNormalVideoSurfaceStyle() {
-        binding.playerView.setResizeMode(AspectRatioFrameLayout.RESIZE_MODE_FIT)
-        val lp = binding.playerCard.layoutParams as ViewGroup.MarginLayoutParams
-        val m = (12 * activity.resources.displayMetrics.density).toInt()
-        lp.setMargins(m, m, m, m / 3)
-        binding.playerCard.radius = 18 * activity.resources.displayMetrics.density
+        lp.setMargins(margin, margin, margin, margin / 3)
+        binding.playerCard.radius = radiusDp * density
         binding.playerCard.layoutParams = lp
     }
 
@@ -282,9 +281,12 @@ class FullscreenPipHelper(
 
     /** 仅在正在播放视频时自动进入 PiP（Home 键触发），失败不提示。 */
     fun enterPipWhenPlayingVideo(): Boolean {
-        val ctrl = controllerProvider() ?: return false
-        return !(!ctrl.isPlaying || !ctrl.videoSize.hasVideo()) && enterPipMode(showError = false)
+        return isPlayingVideo(controllerProvider()) && enterPipMode(showError = false)
     }
+
+    /** 自动进入 PiP 的条件：有控制器、正在播放、且视频尺寸可用。 */
+    private fun isPlayingVideo(ctrl: MediaController?): Boolean =
+        ctrl?.isPlaying == true && ctrl.videoSize.hasVideo()
 
     /** 进入 PiP，按视频真实比例设置小窗；失败时按需提示。 */
     fun enterPipMode(showError: Boolean = true): Boolean {
@@ -299,7 +301,7 @@ class FullscreenPipHelper(
         }
         val wasFullscreen = isFullscreen
         if (wasFullscreen) setFullscreen(false)
-        applyVisualState(pipPreparing = true)
+        applyVisualState(preparing = true)
         try {
             val ratio = aspectRatioOf(vs) ?: Rational(16, 9)
             if (activity.enterPictureInPictureMode(buildPipParams(ratio, autoEnter = false))) return true
@@ -324,8 +326,8 @@ class FullscreenPipHelper(
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
         val ctrl = controllerProvider()
         val vs = ctrl?.videoSize
-        // 与原手动行为一致：仅在「正在播放视频」时才允许系统自动进入小窗
-        val autoEnter = vs.hasVideo() && ctrl?.isPlaying == true
+        // 仅在「正在播放视频」时才允许系统自动进入小窗
+        val autoEnter = isPlayingVideo(ctrl)
         val ratio = vs?.let(::aspectRatioOf) ?: Rational(16, 9)
         try {
             activity.setPictureInPictureParams(
@@ -377,8 +379,7 @@ class FullscreenPipHelper(
             isInPipMode = false
             pipPreparing = false
         }
-        infoTickerRunning = false
-        infoHandler.removeCallbacks(infoTick)
+        applyInfoBar(false)
     }
 }
 
@@ -396,7 +397,6 @@ class GestureController(
     private companion object {
         const val BRIGHTNESS_PREFS = "gesture_settings"
         const val KEY_BRIGHTNESS = "manual_brightness"
-        const val KEY_FOLLOW_SYSTEM = "follow_system_brightness"
     }
 
     /** 本轮手势的类型；[Gesture.IGNORED] 表示时长未知等无法处理的滑动，本轮忽略。 */
@@ -422,13 +422,8 @@ class GestureController(
     /** 安装手势检测器与触摸监听。 */
     @SuppressLint("ClickableViewAccessibility")
     fun setup() {
-        // 仅当用户之前手动设置过亮度、且没有恢复“跟随系统”时才恢复手动值。
-        // 旧版本没有 KEY_FOLLOW_SYSTEM：有手动亮度就视为手动模式，保持原行为。
-        val followSystem = brightnessPrefs.getBoolean(
-            KEY_FOLLOW_SYSTEM,
-            !brightnessPrefs.contains(KEY_BRIGHTNESS)
-        )
-        if (!followSystem && brightnessPrefs.contains(KEY_BRIGHTNESS)) {
+        // 存在手动亮度值即表示手动模式；恢复“跟随系统”时会删除该键。
+        if (brightnessPrefs.contains(KEY_BRIGHTNESS)) {
             applyBrightness(brightnessPrefs.getFloat(KEY_BRIGHTNESS, 0.5f), persist = false)
         }
         val detector = GestureDetector(activity, object : GestureDetector.SimpleOnGestureListener() {
@@ -586,14 +581,13 @@ class GestureController(
         return systemBrightnessToFraction(systemValue)
     }
 
-    /** 应用屏幕亮度（限制在 2%~100%）；persist 为 true 时写入偏好并标记为手动模式。 */
+    /** 应用屏幕亮度（限制在 2%~100%）；persist 为 true 时写入偏好。 */
     private fun applyBrightness(value: Float, persist: Boolean) {
         val lp = activity.window.attributes
         lp.screenBrightness = value.coerceIn(0.02f, 1f)
         activity.window.attributes = lp
         if (persist) brightnessPrefs.edit {
             putFloat(KEY_BRIGHTNESS, lp.screenBrightness)
-            putBoolean(KEY_FOLLOW_SYSTEM, false)
         }
     }
 
@@ -604,7 +598,6 @@ class GestureController(
         activity.window.attributes = lp
         brightnessPrefs.edit {
             remove(KEY_BRIGHTNESS)
-            putBoolean(KEY_FOLLOW_SYSTEM, true)
         }
     }
 
@@ -638,6 +631,10 @@ class MediaListAdapter(
     private val diffScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
     private var diffJob: Job? = null
 
+    /** 是否有差分正在后台计算；此时单条更新必须让位给整表提交，避免被旧结果覆盖。 */
+    internal val isDiffing: Boolean
+        get() = diffJob?.isActive == true
+
     /** 提交新列表：取消上一次差分任务，后台计算后回主线程分发更新。 */
     fun submitList(list: List<MediaItemData>) {
         if (items == list) return
@@ -663,8 +660,20 @@ class MediaListAdapter(
         }
     }
 
-    private fun indexOfUri(uri: String?): Int =
-        if (uri == null) -1 else items.indexOfFirst { it.uri.toString() == uri }
+    private fun indexOfUri(uri: String?): Int {
+        if (uri == null) return -1
+        val key = normalizeUri(uri)
+        return items.indexOfFirst { normalizeUri(it.uri) == key }
+    }
+
+    /** 单条更新（如播放器回填时长）；返回 false 表示列表尚未包含该条，需整表提交。 */
+    fun updateItem(item: MediaItemData): Boolean {
+        val index = items.indexOfFirst { it.uri == item.uri }
+        if (index < 0) return false
+        items[index] = item
+        notifyItemChanged(index)
+        return true
+    }
 
     /** 设置当前播放项 / 播放状态，并只刷新受影响的条目。 */
     fun setCurrentPlaying(uri: String?, playing: Boolean = false) {
@@ -705,22 +714,27 @@ class MediaListAdapter(
             context.getString(R.string.list_item_index, position + 1)
         holder.binding.tvName.text = item.name
         bindDuration(holder, item)
-        val isActive = item.uri.toString() == currentPlayingUri && isPlaying
+        val active = isItemActive(item)
         // 播放中隐藏序号、显示均衡器图标并高亮名称
-        holder.binding.imgPlaying.visibility = if (isActive) View.VISIBLE else View.GONE
-        holder.binding.tvIndex.visibility = if (isActive) View.GONE else View.VISIBLE
+        holder.binding.imgPlaying.visibility = if (active) View.VISIBLE else View.GONE
+        holder.binding.tvIndex.visibility = if (active) View.GONE else View.VISIBLE
         holder.binding.tvName.setTextColor(
-            context.getColor(if (isActive) R.color.accent else R.color.text_primary)
+            context.getColor(if (active) R.color.accent else R.color.text_primary)
         )
 
-        bindProgress(holder, item)
+        bindProgress(holder, item, active)
     }
+
+    /** 当前条目是否正在播放（列表高亮与进度文案共用）。 */
+    private fun isItemActive(item: MediaItemData): Boolean =
+        item.uri.toString() == currentPlayingUri && isPlaying
 
     /** 带 payload 的绑定：仅进度局部刷新走快路径，其余（含时长变化）走默认重绑。 */
     override fun onBindViewHolder(holder: VH, position: Int, payloads: MutableList<Any>) {
+        val item = items[position]
         when {
             payloads.isNotEmpty() && payloads.all { it === progressPayload } ->
-                bindProgress(holder, items[position])
+                bindProgress(holder, item, isItemActive(item))
             else -> super.onBindViewHolder(holder, position, payloads)
         }
     }
@@ -734,9 +748,8 @@ class MediaListAdapter(
      * 绑定进度行：未看完显示「播放中 x」或「x / 总时长」；
      * 已看完显示 100% 与「已看完」，避免播完后看起来像从未播放过。
      */
-    private fun bindProgress(holder: VH, item: MediaItemData) {
+    private fun bindProgress(holder: VH, item: MediaItemData, isActive: Boolean) {
         val context = holder.itemView.context
-        val isActive = item.uri.toString() == currentPlayingUri && isPlaying
         val progress = getProgress(item.uri.toString())
         if (progress > 0 && item.duration > 0) {
             holder.binding.progressRow.visibility = View.VISIBLE
@@ -760,6 +773,12 @@ class MediaListAdapter(
         } else {
             holder.binding.progressRow.visibility = View.GONE
         }
+    }
+
+    /** 适配器脱离 RecyclerView 后取消未完成的差分，避免向已销毁的界面派发更新。 */
+    override fun onDetachedFromRecyclerView(recyclerView: RecyclerView) {
+        super.onDetachedFromRecyclerView(recyclerView)
+        diffScope.cancel()
     }
 
     override fun getItemCount() = items.size
