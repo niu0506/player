@@ -24,8 +24,8 @@ android {
         minSdk = 24
         // 目标最新的稳定版本；compileSdk 37 亦满足 media3 1.11 的传递依赖要求
         targetSdk = 37
-        versionCode = 59
-        versionName = "1.6.0"
+        versionCode = 60
+        versionName = "1.6.1"
     }
 
     signingConfigs {
