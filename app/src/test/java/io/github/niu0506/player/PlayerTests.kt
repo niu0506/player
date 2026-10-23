@@ -15,6 +15,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -148,6 +149,20 @@ class ProgressDecisionTest {
 
         assertFalse(isProgressFinished(8_900, 10_000))
         assertTrue(isProgressFinished(9_000, 10_000))
+    }
+
+    @Test
+    fun `resumable position ignores missing zero and finished entries`() {
+        assertEquals(60_000L, resumablePositionMs(60_000, duration))
+        assertNull(resumablePositionMs(null, duration))
+        assertNull(resumablePositionMs(0, duration))
+        assertNull(resumablePositionMs(duration, duration))
+        assertNull(resumablePositionMs(duration - 1_000, duration))
+    }
+
+    @Test
+    fun `unknown duration still allows resuming`() {
+        assertEquals(60_000L, resumablePositionMs(60_000, 0))
     }
 }
 

@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- FileProvider 只暴露已校验更新包所在的私有目录 -->
+<paths>
+    <files-path
+        name="updates"
+        path="updates/" />
+</paths>

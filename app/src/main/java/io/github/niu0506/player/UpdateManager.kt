@@ -1,6 +1,6 @@
 /**
  * 应用内更新：经 GitHub Releases 检查版本，DownloadManager 下载到公共「下载」目录，
- * 校验包名/版本/SHA-256（fail-closed），由用户手动安装。
+ * 校验包名/版本/SHA-256（fail-closed），校验通过后直接调起系统安装器。
  */
 package io.github.niu0506.player
 
@@ -13,10 +13,12 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
+import android.provider.Settings
 import android.util.Log
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import androidx.core.net.toUri
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
@@ -170,7 +172,7 @@ internal fun verifyApkChecksum(expected: String?, actual: String): ApkValidation
 internal fun isDownloadedVersionInstalled(downloaded: String, installed: String?): Boolean =
     installed != null && !UpdateChecker.isNewer(downloaded, installed)
 
-/** 应用内更新编排：检查、下载与校验。下载校验通过后由用户手动安装，不代调系统安装器。 */
+/** 应用内更新编排：检查、下载与校验。校验通过后直接调起系统安装器。 */
 class UpdateManager(private val activity: AppCompatActivity) {
 
     companion object {
@@ -183,6 +185,12 @@ class UpdateManager(private val activity: AppCompatActivity) {
         private const val APK_MIME = "application/vnd.android.package-archive"
         private const val APK_NAME_PREFIX = "player-v"
         private const val APK_NAME_SUFFIX = "-release.apk"
+
+        /** 私有目录中的已校验安装包副本（供 FileProvider 交给系统安装器）。 */
+        private const val VERIFIED_APK_DIR = "updates"
+
+        /** 与 AndroidManifest 中 FileProvider 的 authorities 保持一致。 */
+        private const val FILE_PROVIDER_SUFFIX = ".fileprovider"
 
         /** 升级后清理公共「下载」目录与私有目录中的旧安装包。 */
         fun cleanupUpdateApks(context: Context) {
@@ -198,6 +206,7 @@ class UpdateManager(private val activity: AppCompatActivity) {
             context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
                 ?.listFiles { f -> f.name.startsWith(APK_NAME_PREFIX) && f.name.endsWith(APK_NAME_SUFFIX) }
                 ?.forEach { it.delete() }
+            File(context.filesDir, VERIFIED_APK_DIR).listFiles()?.forEach { it.delete() }
         }
     }
 
@@ -219,8 +228,17 @@ class UpdateManager(private val activity: AppCompatActivity) {
     /** 当前下载对应的期望 SHA-256。 */
     private var pendingDownloadSha256: String? = null
 
+    /** 校验通过、可直接交给系统安装器的 APK 副本。 */
+    private var verifiedApkFile: File? = null
+
     /** 下载流程忙标志：同时防止重复入队与重复处理完成回调。 */
     private var downloadBusy = false
+
+    /** 「安装未知应用」授权提示，避免重复弹窗。 */
+    private var installPermissionDialog: AlertDialog? = null
+
+    /** 需要在界面回到前台后补弹的「安装未知应用」授权提示。 */
+    private var pendingInstallPermissionPrompt = false
 
     /** 因界面非前台而暂存的更新提示。 */
     private var pendingUpdate: UpdateChecker.Release? = null
@@ -254,7 +272,7 @@ class UpdateManager(private val activity: AppCompatActivity) {
         }
     }
 
-    /** 下载结束处理：失败提示；成功则校验（OK 提示手动安装 / 缺校验和或无效均判定失败）。 */
+    /** 下载结束处理：失败提示；成功则校验并直接调起安装器（缺校验和或无效均判定失败）。 */
     private suspend fun handleDownloadOutcome(id: Long, context: Context = activity) {
         when (withContext(Dispatchers.IO) { queryDownloadStatus(id) }) {
             DownloadManager.STATUS_FAILED -> failDownload(context)
@@ -263,10 +281,7 @@ class UpdateManager(private val activity: AppCompatActivity) {
                 downloadBusy = true
                 try {
                     when (withContext(Dispatchers.IO) { validateDownloadedApk(id) }) {
-                        ApkValidation.OK -> {
-                            clearPersistedDownload()
-                            activity.toastLong(R.string.update_download_ready)
-                        }
+                        ApkValidation.OK -> installVerifiedApk()
                         ApkValidation.MISSING_CHECKSUM -> abortUnverifiedDownload()
                         ApkValidation.INVALID -> failDownload(context)
                     }
@@ -352,6 +367,7 @@ class UpdateManager(private val activity: AppCompatActivity) {
 
     /** onResume 调用：补弹前台期间被推迟的更新提示。 */
     fun resumePendingUpdateDialog() {
+        flushInstallPermissionPrompt()
         val release = pendingUpdate ?: return
         pendingUpdate = null
         postUpdateDialog(release)
@@ -424,7 +440,7 @@ class UpdateManager(private val activity: AppCompatActivity) {
     }
 
     private fun apkFileName(version: String): String =
-        "$APK_NAME_PREFIX$version$APK_NAME_SUFFIX"
+        "$APK_NAME_PREFIX${version.replace(Regex("[^A-Za-z0-9._-]"), "_")}$APK_NAME_SUFFIX"
 
     /** 删除同名旧包，避免 DownloadManager 因文件已存在而失败；删除失败静默忽略。 */
     private fun deleteExistingDownloadFile(fileName: String) {
@@ -454,6 +470,9 @@ class UpdateManager(private val activity: AppCompatActivity) {
     private fun enqueueDownload(url: String) {
         val fileName = apkFileName(pendingDownloadVersion)
         deleteExistingDownloadFile(fileName)
+        // 丢弃上一次校验留下的副本，避免指向旧版本
+        verifiedApkFile = null
+        File(activity.filesDir, VERIFIED_APK_DIR).listFiles()?.forEach { it.delete() }
         val request = DownloadManager.Request(url.toUri())
             .setTitle(activity.getString(R.string.update_download_title, pendingDownloadVersion))
             .setDescription(activity.getString(R.string.update_download_description))
@@ -495,8 +514,12 @@ class UpdateManager(private val activity: AppCompatActivity) {
         clearPersistedDownload()
     }
 
-    /** 校验下载产物：可解析、包名/版本一致、SHA-256 匹配；缺失校验和也判定失败。 */
+    /**
+     * 校验下载产物：可解析、包名/版本一致、SHA-256 匹配；缺失校验和也判定失败。
+     * 通过后把校验过的文件复制到私有目录，供 FileProvider 交给系统安装器。
+     */
     private fun validateDownloadedApk(id: Long): ApkValidation {
+        verifiedApkFile = null
         val uri = downloadManager.getUriForDownloadedFile(id) ?: return ApkValidation.INVALID
         val temp = File(activity.cacheDir, "update-verify.apk")
         return try {
@@ -517,22 +540,133 @@ class UpdateManager(private val activity: AppCompatActivity) {
                 return ApkValidation.INVALID
             }
             val actualHash = sha256OfFile(temp) ?: return ApkValidation.INVALID
-            when (verifyApkChecksum(pendingDownloadSha256, actualHash)) {
-                ApkValidation.OK -> ApkValidation.OK
-                ApkValidation.MISSING_CHECKSUM -> {
+            val checksum = verifyApkChecksum(pendingDownloadSha256, actualHash)
+            if (checksum != ApkValidation.OK) {
+                if (checksum == ApkValidation.MISSING_CHECKSUM) {
                     Log.w(TAG, "更新包未提供 SHA-256，无法验证完整性，判定下载失败")
-                    ApkValidation.MISSING_CHECKSUM
-                }
-                ApkValidation.INVALID -> {
+                } else {
                     Log.w(TAG, "更新包校验和不匹配：期望 ${pendingDownloadSha256}，实际 $actualHash")
-                    ApkValidation.INVALID
                 }
+                return checksum
             }
+            val target = verifiedApkTarget()
+            target.parentFile?.mkdirs()
+            target.delete()
+            temp.inputStream().use { input ->
+                target.outputStream().use { output -> input.copyTo(output) }
+            }
+            if (target.length() != temp.length()) {
+                target.delete()
+                return ApkValidation.INVALID
+            }
+            verifiedApkFile = target
+            ApkValidation.OK
         } catch (e: Exception) {
             Log.w(TAG, "读取下载产物失败", e)
             ApkValidation.INVALID
         } finally {
             temp.delete()
+        }
+    }
+
+    /** 已校验安装包在私有目录中的落点。 */
+    private fun verifiedApkTarget(): File =
+        File(File(activity.filesDir, VERIFIED_APK_DIR), apkFileName(pendingDownloadVersion))
+
+    /**
+     * 调起系统安装器安装已校验的 APK。
+     * Android 8+ 需要「安装未知应用」授权，未授权时先说明并跳转设置，返回后由
+     * [resumePendingDownload] 再次校验并继续安装。
+     */
+    private fun installVerifiedApk() {
+        if (activity.isFinishing || activity.isDestroyed) return
+        val file = verifiedApkFile?.takeIf { it.exists() && it.length() > 0L }
+        if (file == null) {
+            failDownload()
+            return
+        }
+        // 界面已不可见时先不拉起安装器，等下次回到前台（resumePendingDownload）再继续
+        if (!activity.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
+            !activity.packageManager.canRequestPackageInstalls()
+        ) {
+            requestInstallPermission()
+            return
+        }
+        val uri = try {
+            FileProvider.getUriForFile(
+                activity,
+                activity.packageName + FILE_PROVIDER_SUFFIX,
+                file
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "生成安装包 URI 失败", e)
+            activity.toastLong(R.string.update_install_failed)
+            return
+        }
+        val intent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(uri, APK_MIME)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        try {
+            pendingInstallPermissionPrompt = false
+            installPermissionDialog?.dismiss()
+            activity.startActivity(intent)
+            // 已把安装流程交给系统：清掉下载状态，避免每次回前台重复拉起安装器
+            clearPersistedDownload()
+        } catch (e: Exception) {
+            Log.w(TAG, "打开系统安装器失败", e)
+            activity.toastLong(R.string.update_install_failed)
+        }
+    }
+
+    /** 提示并引导用户授予「安装未知应用」权限（Android 8+）。 */
+    private fun requestInstallPermission() {
+        pendingInstallPermissionPrompt = true
+        activity.window.decorView.post { flushInstallPermissionPrompt() }
+    }
+
+    /** 界面回到前台后补弹授权提示；未到 RESUMED 时保留标记等待下一次。 */
+    private fun flushInstallPermissionPrompt() {
+        if (!pendingInstallPermissionPrompt || !canShowDialog()) return
+        pendingInstallPermissionPrompt = false
+        showInstallPermissionDialog()
+    }
+
+    private fun showInstallPermissionDialog() {
+        if (!canShowDialog() || installPermissionDialog?.isShowing == true) return
+        try {
+            val dialog = AlertDialog.Builder(activity)
+                .setTitle(R.string.update_install_permission_title)
+                .setMessage(R.string.update_install_permission_message)
+                .setPositiveButton(R.string.update_install_permission_action) { _, _ ->
+                    openInstallPermissionSettings()
+                }
+                .setNegativeButton(R.string.cancel, null)
+                .create()
+            dialog.setOnDismissListener {
+                if (installPermissionDialog === dialog) installPermissionDialog = null
+            }
+            installPermissionDialog = dialog
+            dialog.show()
+        } catch (e: Exception) {
+            Log.w(TAG, "显示安装权限提示失败", e)
+            activity.toastLong(R.string.update_install_permission_message)
+        }
+    }
+
+    private fun openInstallPermissionSettings() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+        try {
+            activity.startActivity(
+                Intent(
+                    Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                    "package:${activity.packageName}".toUri()
+                )
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "打开安装未知应用设置失败", e)
+            activity.toastLong(R.string.update_install_failed)
         }
     }
 

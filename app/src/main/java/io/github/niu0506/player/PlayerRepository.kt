@@ -1124,6 +1124,17 @@ internal fun isProgressFinished(positionMs: Long, durationMs: Long): Boolean {
 }
 
 /**
+ * 返回可续播的位置：无记录、位于开头或已看完时返回 null。
+ * 已看完的条目从头播放，避免切到它时直接落在结尾。
+ */
+internal fun resumablePositionMs(positionMs: Long?, durationMs: Long): Long? =
+    if (positionMs != null && positionMs > 0 && !isProgressFinished(positionMs, durationMs)) {
+        positionMs
+    } else {
+        null
+    }
+
+/**
  * 根据位置与时长决定一次进度写入：完成标记 / 记录 / 跳过。
  * 看完后保留「位置 = 总时长」的记录，列表可显示 100% 与「已看完」；
  * 续播判定仍会忽略已看完的位置，不会从末尾重新开始。

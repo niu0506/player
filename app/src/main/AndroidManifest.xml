@@ -30,6 +30,9 @@
     <!-- 检查更新 / 下载更新包 -->
     <uses-permission android:name="android.permission.INTERNET" />
 
+    <!-- Android 8+ 校验通过后直接调起系统安装器 -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
     <application
         android:name=".PlayerApp"
         android:allowBackup="true"
@@ -71,6 +74,17 @@
                 <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
             </intent-filter>
         </receiver>
+
+        <!-- 把已校验的更新包以 content:// 交给系统安装器，避免暴露 file:// -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
 
     </application>
 </manifest>

@@ -66,6 +66,13 @@ class PlayerService : MediaSessionService() {
                 ?.takeIf { it > 0 }
                 ?: C.TIME_UNSET
             lastPlayedUri?.let { PlayerRepository.setLastItem(it) }
+            // 自动连播、错误跳过和跨条目 seek 都在服务侧续播：界面退到后台时
+            // 控制器会释放，只靠界面监听切歌会漏掉恢复，下一项便从头播放。
+            if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO ||
+                reason == Player.MEDIA_ITEM_TRANSITION_REASON_SEEK
+            ) {
+                restoreResumePosition(mediaItem)
+            }
             persistProgress()
         }
 
@@ -258,6 +265,22 @@ class PlayerService : MediaSessionService() {
         )
     }
 
+    /**
+     * 切到新条目后按断点续播；没有记录或已看完时保持从头播放。
+     * 位置已明显离开开头说明界面点播时已经 seek 过，不必重复 seek。
+     */
+    private fun restoreResumePosition(mediaItem: MediaItem?) {
+        val player = this.player ?: return
+        if (player.currentPosition > RESUME_START_TOLERANCE_MS) return
+        val uri = mediaItem?.localConfiguration?.uri?.toString() ?: return
+        // 刚切歌时新条目尚未 READY，优先用列表里扫描到的时长判定「已看完」
+        val duration = player.duration.takeIf { it > 0 }
+            ?: PlayerRepository.getPlaylist().firstOrNull { it.uri.toString() == uri }?.duration
+            ?: 0L
+        val position = resumablePositionMs(PlayerRepository.getProgress(uri), duration) ?: return
+        player.seekTo(position)
+    }
+
     /** 缓存某个旧条目的位置（已切走后仍能补记其进度）。 */
     private fun cacheOldPosition(oldPosition: Player.PositionInfo) {
         val player = this.player ?: return
@@ -328,6 +351,9 @@ class PlayerService : MediaSessionService() {
 
         /** 周期落盘间隔：5 秒。 */
         private const val PROGRESS_TICKER_INTERVAL_MS = 5000L
+
+        /** 切歌后位置仍在开头附近才自动续播，避免覆盖界面已指定的位置。 */
+        private const val RESUME_START_TOLERANCE_MS = 1_000L
 
         @Volatile
         private var instance: PlayerService? = null
