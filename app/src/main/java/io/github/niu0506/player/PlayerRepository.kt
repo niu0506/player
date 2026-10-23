@@ -1106,10 +1106,7 @@ internal fun isSelfHealableDatabaseFailure(error: Throwable): Boolean {
 /** 进度写入裁决结果。 */
 internal sealed interface ProgressWriteDecision {
 
-    /** 已看完（落在末尾容差内）：清除该条进度。 */
-    data object Clear : ProgressWriteDecision
-
-    /** 正常记录该位置。 */
+    /** 记录位置；已看完时记录总时长，用于列表显示 100% 完成标记。 */
     data class Store(val positionMs: Long) : ProgressWriteDecision
 
     /** 无有效位置（<=0）：跳过，不写不删。 */
@@ -1126,9 +1123,15 @@ internal fun isProgressFinished(positionMs: Long, durationMs: Long): Boolean {
     return positionMs >= durationMs - tail
 }
 
-/** 根据位置与时长效决定一次进度写入：清除 / 记录 / 跳过。 */
+/**
+ * 根据位置与时长决定一次进度写入：完成标记 / 记录 / 跳过。
+ * 看完后保留「位置 = 总时长」的记录，列表可显示 100% 与「已看完」；
+ * 续播判定仍会忽略已看完的位置，不会从末尾重新开始。
+ */
 internal fun decideProgressWrite(positionMs: Long, durationMs: Long): ProgressWriteDecision {
-    if (isProgressFinished(positionMs, durationMs)) return ProgressWriteDecision.Clear
+    if (isProgressFinished(positionMs, durationMs)) {
+        return ProgressWriteDecision.Store(durationMs)
+    }
     if (positionMs <= 0) return ProgressWriteDecision.Skip
     return ProgressWriteDecision.Store(positionMs)
 }

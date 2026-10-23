@@ -43,16 +43,28 @@ class PlayerService : MediaSessionService() {
     /** 待落盘的进度缓存；把时间线事件与写库裁决收在一个可单测的状态对象里。 */
     private val progress = ProgressCache()
 
-    /** 当前媒体项的 uri，用于自动切歌时清除上一首的进度。 */
+    /** 当前媒体项的 uri，用于自动切歌时处理上一首的完成标记。 */
     private var lastPlayedUri: String? = null
+
+    /** 当前媒体项时长；自动连播时用于把上一项标记为已看完。 */
+    private var lastPlayedDurationMs = C.TIME_UNSET
 
     private val playerEventListener = object : Player.Listener {
         override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
             if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO) {
-                // 自动连播：上一首视为自然播完，清除断点
-                lastPlayedUri?.let(progress::clear)
+                // 自动连播：上一首视为自然播完，保留 100% 完成标记而不是清除记录，
+                // 否则列表里会像从未播放过一样。
+                val finishedUri = lastPlayedUri
+                val finishedDuration = lastPlayedDurationMs
+                if (finishedUri != null && finishedDuration > 0) {
+                    progress.cache(finishedUri, finishedDuration, finishedDuration)
+                }
             }
             lastPlayedUri = mediaItem?.localConfiguration?.uri?.toString()
+            lastPlayedDurationMs = this@PlayerService.player
+                ?.duration
+                ?.takeIf { it > 0 }
+                ?: C.TIME_UNSET
             lastPlayedUri?.let { PlayerRepository.setLastItem(it) }
             persistProgress()
         }
@@ -235,12 +247,14 @@ class PlayerService : MediaSessionService() {
         progress.cache(uri, positionMs, durationMs)
     }
 
-    /** 缓存当前播放位置。 */
+    /** 缓存当前播放位置，并记住当前项时长供自动连播时标记完成。 */
     private fun cacheCurrentPosition(player: Player) {
+        val duration = player.duration
+        if (duration > 0) lastPlayedDurationMs = duration
         cachePosition(
             player.currentMediaItem?.localConfiguration?.uri?.toString(),
             player.currentPosition,
-            player.duration
+            duration
         )
     }
 
@@ -402,13 +416,12 @@ internal class ProgressCache {
     fun cache(uri: String?, positionMs: Long, durationMs: Long) {
         if (uri == null || uri in pendingDrops) return
         when (val decision = decideProgressWrite(positionMs, durationMs)) {
-            ProgressWriteDecision.Clear -> clear(uri)
             is ProgressWriteDecision.Store -> cached[uri] = decision.positionMs
             ProgressWriteDecision.Skip -> Unit
         }
     }
 
-    /** 显式清除某条进度（自动连播结束、seek 回 0）。 */
+    /** 显式清除某条进度（seek 回 0、删除条目时）。 */
     fun clear(uri: String?) {
         if (uri == null) return
         cached.remove(uri)

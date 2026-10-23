@@ -115,15 +115,20 @@ class ProgressDecisionTest {
     }
 
     @Test
-    fun `position inside tail is treated as finished`() {
-
-        assertEquals(ProgressWriteDecision.Clear, decideProgressWrite(duration - 2_000, duration))
+    fun `position inside tail is stored as completion`() {
+        assertEquals(
+            ProgressWriteDecision.Store(duration),
+            decideProgressWrite(duration - 2_000, duration)
+        )
     }
 
     @Test
-    fun `exact end and beyond are finished`() {
-        assertEquals(ProgressWriteDecision.Clear, decideProgressWrite(duration, duration))
-        assertEquals(ProgressWriteDecision.Clear, decideProgressWrite(duration + 1, duration))
+    fun `exact end and beyond store completion at duration`() {
+        assertEquals(ProgressWriteDecision.Store(duration), decideProgressWrite(duration, duration))
+        assertEquals(
+            ProgressWriteDecision.Store(duration),
+            decideProgressWrite(duration + 1, duration)
+        )
     }
 
     @Test
@@ -1208,11 +1213,11 @@ class ProgressCacheTest {
     }
 
     @Test
-    fun `position inside the tail is cleared instead of written`() {
+    fun `position inside the tail is stored as a completion marker`() {
         val progress = newCache(position = 59_000)
 
-        assertTrue(progress.writes().isEmpty())
-        assertEquals(setOf("u"), progress.pendingRemovals())
+        assertEquals(mapOf("u" to 60_000L), progress.writes())
+        assertTrue(progress.pendingRemovals().isEmpty())
     }
 
     @Test
@@ -1259,7 +1264,8 @@ class ProgressCacheTest {
 
     @Test
     fun `successful persist clears submitted removals`() {
-        val progress = newCache(position = 59_000)
+        val progress = newCache()
+        progress.clear("u")
 
         progress.markPersisted(progress.snapshot(), progress.pendingRemovals())
 
@@ -1268,7 +1274,8 @@ class ProgressCacheTest {
 
     @Test
     fun `failed persist keeps removals for a retry`() {
-        val progress = newCache(position = 59_000)
+        val progress = newCache()
+        progress.clear("u")
 
         progress.markFailed(progress.pendingRemovals())
 

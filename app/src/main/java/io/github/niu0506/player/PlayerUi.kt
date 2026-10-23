@@ -730,24 +730,32 @@ class MediaListAdapter(
             if (item.duration > 0) formatTime(item.duration) else ""
     }
 
-    /** 绑定进度行：有进度时显示「播放中 x」或「x / 总时长」，无进度则隐藏。 */
+    /**
+     * 绑定进度行：未看完显示「播放中 x」或「x / 总时长」；
+     * 已看完显示 100% 与「已看完」，避免播完后看起来像从未播放过。
+     */
     private fun bindProgress(holder: VH, item: MediaItemData) {
         val context = holder.itemView.context
         val isActive = item.uri.toString() == currentPlayingUri && isPlaying
         val progress = getProgress(item.uri.toString())
         if (progress > 0 && item.duration > 0) {
-            val percent = (progress * 100 / item.duration).toInt().coerceIn(0, 100)
             holder.binding.progressRow.visibility = View.VISIBLE
-            holder.binding.pbItem.progress = percent
-            if (isActive) {
-                holder.binding.tvProgress.text = context.getString(
-                    R.string.playing_progress, formatTime(progress)
-                )
+            if (isProgressFinished(progress, item.duration)) {
+                holder.binding.pbItem.progress = 100
+                holder.binding.tvProgress.text = context.getString(R.string.progress_finished)
             } else {
-                holder.binding.tvProgress.text = context.getString(
-                    R.string.progress_range,
-                    formatTime(progress), formatTime(item.duration)
-                )
+                val percent = (progress * 100 / item.duration).toInt().coerceIn(0, 100)
+                holder.binding.pbItem.progress = percent
+                if (isActive) {
+                    holder.binding.tvProgress.text = context.getString(
+                        R.string.playing_progress, formatTime(progress)
+                    )
+                } else {
+                    holder.binding.tvProgress.text = context.getString(
+                        R.string.progress_range,
+                        formatTime(progress), formatTime(item.duration)
+                    )
+                }
             }
         } else {
             holder.binding.progressRow.visibility = View.GONE

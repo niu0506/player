@@ -37,6 +37,8 @@
     
     <string name="progress_range">%1$s / %2$s</string>
     
+    <string name="progress_finished">已看完</string>
+
     <string name="delete_dialog_title">删除条目</string>
     
     <string name="delete_dialog_message">确定从播放列表中删除「%1$s」吗？\n该文件的播放进度也会被清除。</string>
