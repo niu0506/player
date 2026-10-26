@@ -467,21 +467,36 @@ class MediaStoreScanner(private val context: Context) {
  */
 fun hasMediaReadAccess(context: Context, permission: String, includePartial: Boolean): Boolean {
     if (Build.VERSION.SDK_INT < 33) {
-        return ContextCompat.checkSelfPermission(
-            context, android.Manifest.permission.READ_EXTERNAL_STORAGE
-        ) == PackageManager.PERMISSION_GRANTED
+        return isPermissionGranted(context, android.Manifest.permission.READ_EXTERNAL_STORAGE)
     }
-    val full = ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED
-    return full || (includePartial && Build.VERSION.SDK_INT >= 34 &&
-        ContextCompat.checkSelfPermission(
-            context, android.Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED
-        ) == PackageManager.PERMISSION_GRANTED)
+    return isPermissionGranted(context, permission) ||
+        (includePartial && Build.VERSION.SDK_INT >= 34 &&
+            isPermissionGranted(context, android.Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED))
 }
 
-/** 视频或音频任一读取权限即视为有访问权（低版本两次调用都会落到 READ_EXTERNAL_STORAGE）。 */
-fun hasAnyMediaReadAccess(context: Context, includePartial: Boolean): Boolean =
-    hasMediaReadAccess(context, android.Manifest.permission.READ_MEDIA_VIDEO, includePartial) ||
+/** 视频读取权限：Android 13+ 为 READ_MEDIA_VIDEO，低版本回退 READ_EXTERNAL_STORAGE。 */
+fun hasVideoReadAccess(context: Context, includePartial: Boolean): Boolean =
+    if (Build.VERSION.SDK_INT >= 33) {
+        hasMediaReadAccess(context, android.Manifest.permission.READ_MEDIA_VIDEO, includePartial)
+    } else {
+        hasMediaReadAccess(context, android.Manifest.permission.READ_EXTERNAL_STORAGE, includePartial)
+    }
+
+/** 音频读取权限：Android 13+ 为 READ_MEDIA_AUDIO，低版本回退 READ_EXTERNAL_STORAGE。 */
+fun hasAudioReadAccess(context: Context, includePartial: Boolean): Boolean =
+    if (Build.VERSION.SDK_INT >= 33) {
         hasMediaReadAccess(context, android.Manifest.permission.READ_MEDIA_AUDIO, includePartial)
+    } else {
+        hasMediaReadAccess(context, android.Manifest.permission.READ_EXTERNAL_STORAGE, includePartial)
+    }
+
+/** 视频或音频任一读取权限即视为有访问权（低版本两者都会落到 READ_EXTERNAL_STORAGE）。 */
+fun hasAnyMediaReadAccess(context: Context, includePartial: Boolean): Boolean =
+    hasVideoReadAccess(context, includePartial) || hasAudioReadAccess(context, includePartial)
+
+/** 自身权限检查的薄包装，避免多处重复拼装 ContextCompat 调用。 */
+private fun isPermissionGranted(context: Context, permission: String): Boolean =
+    ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED
 
 /** 播放列表表：uri 为主键，sortOrder 维持用户可见顺序，folder 为文件夹分组键。 */
 @Entity(tableName = "playlist")

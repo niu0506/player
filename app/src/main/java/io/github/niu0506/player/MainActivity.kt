@@ -583,12 +583,12 @@ class MainActivity : AppCompatActivity() {
             return PruneCandidates(emptySet(), emptySet(), emptySet())
         }
         val videoKeys = if (scannedVideos != null &&
-            hasMediaReadAccess(this, android.Manifest.permission.READ_MEDIA_VIDEO, includePartial = false)
+            hasVideoReadAccess(this, includePartial = false)
         ) {
             scannedVideos.map { normalizeUri(it.uri) }.toSet()
         } else null
         val audioKeys = if (scannedAudios != null &&
-            hasMediaReadAccess(this, android.Manifest.permission.READ_MEDIA_AUDIO, includePartial = false)
+            hasAudioReadAccess(this, includePartial = false)
         ) {
             scannedAudios.map { normalizeUri(it.uri) }.toSet()
         } else null
