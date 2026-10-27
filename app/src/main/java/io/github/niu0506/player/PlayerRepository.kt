@@ -4,6 +4,7 @@
  */
 package io.github.niu0506.player
 
+import android.annotation.SuppressLint
 import android.content.Context
 import android.content.pm.PackageManager
 import android.database.Cursor
@@ -77,6 +78,21 @@ internal fun scanDisplayNameOrFallback(raw: String?, fallback: String): String =
 /** 铃声 / 通知音 / 闹钟音不属于媒体播放列表。 */
 internal fun isExcludedAudioType(isRingtone: Int, isNotification: Int, isAlarm: Int): Boolean =
     isRingtone != 0 || isNotification != 0 || isAlarm != 0
+
+/**
+ * 音频行过滤：除铃声 / 通知音 / 闹钟音外，还排除非音乐文件与录音。
+ * @param isRecording 低版本没有该列时传 0（按非录音处理）
+ */
+internal fun isExcludedAudioRow(
+    isRingtone: Int,
+    isNotification: Int,
+    isAlarm: Int,
+    isMusic: Int,
+    isRecording: Int,
+): Boolean =
+    isExcludedAudioType(isRingtone, isNotification, isAlarm) ||
+        isMusic == 0 ||
+        isRecording != 0
 
 /** 在播放器队列中按 URI 定位条目；找不到返回 -1，避免用列表下标误删队列项。 */
 internal fun findMediaItemIndexByUri(
@@ -346,12 +362,18 @@ class MediaStoreScanner(private val context: Context) {
     private companion object {
         const val TAG = "MediaStoreScanner"
 
-        /** 音频类型列：用于过滤铃声、通知音与闹钟音。 */
+        /** 音频类型列：用于过滤铃声、通知音、闹钟音、非音乐与录音。 */
         val AUDIO_TYPE_COLUMNS = arrayOf(
             MediaStore.Audio.Media.IS_RINGTONE,
             MediaStore.Audio.Media.IS_NOTIFICATION,
             MediaStore.Audio.Media.IS_ALARM,
-        )
+            MediaStore.Audio.Media.IS_MUSIC,
+        ) + if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            // IS_RECORDING 是 API 31+ 的列；低版本查询不存在的列会抛异常，故按版本拼接
+            arrayOf(MediaStore.Audio.Media.IS_RECORDING)
+        } else {
+            emptyArray()
+        }
     }
 
     /** 查询所有视频；失败（权限/异常）返回 null。 */
@@ -432,11 +454,14 @@ class MediaStoreScanner(private val context: Context) {
         }
     }
 
-    /** 过滤铃声、通知音与闹钟音；列缺失或为 NULL 时按“不排除”处理。 */
-    private fun shouldIncludeAudioRow(cursor: Cursor): Boolean = !isExcludedAudioType(
+    /** 过滤铃声、通知音、闹钟音、非音乐与录音；列缺失或为 NULL 时按“不排除”处理。 */
+    @Suppress("InlinedApi") // IS_RECORDING 常量 API 31+，但为编译期内联字符串，低版本安全
+    private fun shouldIncludeAudioRow(cursor: Cursor): Boolean = !isExcludedAudioRow(
         isRingtone = cursor.getIntOrZero(MediaStore.Audio.Media.IS_RINGTONE),
         isNotification = cursor.getIntOrZero(MediaStore.Audio.Media.IS_NOTIFICATION),
         isAlarm = cursor.getIntOrZero(MediaStore.Audio.Media.IS_ALARM),
+        isMusic = cursor.getIntOrZero(MediaStore.Audio.Media.IS_MUSIC),
+        isRecording = cursor.getIntOrZero(MediaStore.Audio.Media.IS_RECORDING),
     )
 
     /** 读取整型列；列不存在或值为 NULL 时返回 0。 */
@@ -474,21 +499,21 @@ fun hasMediaReadAccess(context: Context, permission: String, includePartial: Boo
             isPermissionGranted(context, android.Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED))
 }
 
-/** 视频读取权限：Android 13+ 为 READ_MEDIA_VIDEO，低版本回退 READ_EXTERNAL_STORAGE。 */
+/**
+ * 视频读取权限：Android 13+ 为 READ_MEDIA_VIDEO，低版本由 [hasMediaReadAccess] 回退到 READ_EXTERNAL_STORAGE。
+ * READ_MEDIA_VIDEO 只是编译期内联的字符串常量，且 [hasMediaReadAccess] 会先按版本回退，故无需再判版本。
+ */
+@SuppressLint("InlinedApi")
 fun hasVideoReadAccess(context: Context, includePartial: Boolean): Boolean =
-    if (Build.VERSION.SDK_INT >= 33) {
-        hasMediaReadAccess(context, android.Manifest.permission.READ_MEDIA_VIDEO, includePartial)
-    } else {
-        hasMediaReadAccess(context, android.Manifest.permission.READ_EXTERNAL_STORAGE, includePartial)
-    }
+    hasMediaReadAccess(context, android.Manifest.permission.READ_MEDIA_VIDEO, includePartial)
 
-/** 音频读取权限：Android 13+ 为 READ_MEDIA_AUDIO，低版本回退 READ_EXTERNAL_STORAGE。 */
+/**
+ * 音频读取权限：Android 13+ 为 READ_MEDIA_AUDIO，低版本由 [hasMediaReadAccess] 回退到 READ_EXTERNAL_STORAGE。
+ * READ_MEDIA_AUDIO 只是编译期内联的字符串常量，且 [hasMediaReadAccess] 会先按版本回退，故无需再判版本。
+ */
+@SuppressLint("InlinedApi")
 fun hasAudioReadAccess(context: Context, includePartial: Boolean): Boolean =
-    if (Build.VERSION.SDK_INT >= 33) {
-        hasMediaReadAccess(context, android.Manifest.permission.READ_MEDIA_AUDIO, includePartial)
-    } else {
-        hasMediaReadAccess(context, android.Manifest.permission.READ_EXTERNAL_STORAGE, includePartial)
-    }
+    hasMediaReadAccess(context, android.Manifest.permission.READ_MEDIA_AUDIO, includePartial)
 
 /** 视频或音频任一读取权限即视为有访问权（低版本两者都会落到 READ_EXTERNAL_STORAGE）。 */
 fun hasAnyMediaReadAccess(context: Context, includePartial: Boolean): Boolean =
@@ -633,6 +658,14 @@ object PlayerRepository {
     @Volatile
     private var resetting = false
 
+    /**
+     * 写代际：每次手动重置开始时自增。
+     * 写任务在提交内存与落盘前都会核对代际，代际已变化说明数据已被重置清空，
+     * 该写入属于旧数据，直接丢弃，避免旧进度/旧列表写回新库。
+     */
+    @Volatile
+    private var writeGeneration = 0L
+
     /** 本进程是否已尝试过损坏/迁移失败自愈，避免反复清库。 */
     @Volatile
     private var selfHealAttempted = false
@@ -716,6 +749,8 @@ object PlayerRepository {
         synchronized(loadLock) {
             appContext = appCtx
             resetting = true
+            // 先推进代际：此后所有在途写任务都会在提交前发现代际不符而放弃
+            writeGeneration++
         }
         try {
             // 先等当前加载结束，避免关闭数据库时它仍在读取
@@ -863,6 +898,8 @@ object PlayerRepository {
         transform: (Map<String, MissingInfo>) -> Map<String, MissingInfo>
     ) {
         val snapshot = synchronized(stateLock) {
+            // 重置期间旧播放产生的缺失记录不再写入，避免清空后又被加回内存
+            if (resetting) return
             val newState = transform(missingState)
             if (newState == missingState) return
             missingState = newState
@@ -892,31 +929,70 @@ object PlayerRepository {
         dbPart: suspend PlayerDatabase.() -> Unit,
         onComplete: (Boolean) -> Unit = {}
     ) {
-        val job: Deferred<Unit>? = synchronized(loadLock) { loadJob }
+        // 重置开始后到达的写入一律丢弃：此时内存与数据库都即将被清空
+        val snapshot = synchronized(loadLock) {
+            if (resetting) null else loadJob to writeGeneration
+        } ?: run {
+            Log.w(TAG, "仓库正在重置，丢弃一次写任务")
+            onComplete(false)
+            return
+        }
+        val job = snapshot.first
+        val generation = snapshot.second
         if (job == null) {
             Log.w(TAG, "仓库尚未初始化，丢弃一次写任务")
             onComplete(false)
             return
         }
         if (loadSucceeded) {
-            synchronized(stateLock) { memPart() }
-            persistScope.launch { onComplete(persist(dbPart)) }
+            persistScope.launch {
+                if (!applyMemoryPart(generation, memPart)) {
+                    Log.w(TAG, "仓库已重置，丢弃一次写任务")
+                    onComplete(false)
+                    return@launch
+                }
+                onComplete(persist(dbPart, generation))
+            }
         } else {
             persistScope.launch {
-                if (job.awaitOrNull() != null && !reloadAfterFailure()) {
+                val failure = job.awaitOrNull()
+                // 等待加载期间若已开始手动重置，本次写入直接作废，不再尝试重试加载
+                if (writeGeneration != generation) {
+                    Log.w(TAG, "仓库已重置，丢弃一次写任务")
+                    onComplete(false)
+                    return@launch
+                }
+                if (failure != null && !reloadAfterFailure(generation)) {
                     Log.e(TAG, "数据库加载失败且重试未成功，本次写入未落盘")
                     onComplete(false)
                     return@launch
                 }
-                synchronized(stateLock) { memPart() }
-                onComplete(persist(dbPart))
+                if (!applyMemoryPart(generation, memPart)) {
+                    Log.w(TAG, "仓库已重置，丢弃一次写任务")
+                    onComplete(false)
+                    return@launch
+                }
+                onComplete(persist(dbPart, generation))
             }
         }
     }
 
+    /** 代际未变化时提交内存变更；返回 false 表示写入已因手动重置作废。 */
+    private fun applyMemoryPart(generation: Long, memPart: () -> Unit): Boolean =
+        synchronized(stateLock) {
+            if (writeGeneration != generation) {
+                false
+            } else {
+                memPart()
+                true
+            }
+        }
+
     /** 加载失败后按冷却时间重启加载；返回是否已成功加载。 */
-    private suspend fun reloadAfterFailure(): Boolean {
+    private suspend fun reloadAfterFailure(generation: Long): Boolean {
         val job = synchronized(loadLock) {
+            // 重置期间/重置之后不重新加载，交由 resetAllData 自己启动新库
+            if (writeGeneration != generation || resetting) return false
             if (loadSucceeded) return true
             val running = loadJob?.isCompleted == false
             if (!running && nowMs() - lastLoadAttemptMs >= LOAD_RETRY_COOLDOWN_MS) {
@@ -966,7 +1042,12 @@ object PlayerRepository {
     private fun nowMs(): Long = System.nanoTime() / 1_000_000
 
     /** 在写锁与事务中落盘，失败重试一次；重试保持在锁内以维持写入顺序。 */
-    private suspend fun persist(block: suspend PlayerDatabase.() -> Unit): Boolean {
+    private suspend fun persist(
+        block: suspend PlayerDatabase.() -> Unit,
+        generation: Long,
+    ): Boolean {
+        // 等锁前先快速判断一次，避免为已作废的写任务排队
+        if (writeGeneration != generation) return false
         val result = withOrderedRetry(
             mutex = writeMutex,
             maxAttempts = PERSIST_MAX_ATTEMPTS,
@@ -976,11 +1057,15 @@ object PlayerRepository {
                 writeFailureChannel.trySend(Unit)
             }
         ) {
+            // 拿到写锁后再核对代际：等待期间可能已完成一次手动重置，
+            // 此时数据库已重建，旧写任务不能再写入。
+            if (writeGeneration != generation) return@withOrderedRetry false
             // 在锁内读取，避免重试期间数据库被重建/关闭后仍向旧句柄写入
             val database = db ?: error("数据库尚未初始化")
             database.withTransaction { database.block() }
+            true
         }
-        return result != null
+        return result == true
     }
 
     /** 真正打开数据库并把全量数据载入内存。 */

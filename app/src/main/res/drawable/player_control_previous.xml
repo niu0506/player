@@ -7,5 +7,5 @@
         android:viewportHeight="24.0">
     <path
         android:pathData="M6,6h2v12L6,18zM9.5,12l8.5,6L18,6z"
-        android:fillColor="#FFFFFF"/>
+        android:fillColor="@color/player_control_text"/>
 </vector>

@@ -12,4 +12,7 @@
     <!-- 文本 -->
     <color name="text_primary">#FFF2F2F7</color>
     <color name="text_secondary">#FF8E8E99</color>
+
+    <!-- 全屏信息条文字阴影 -->
+    <color name="fullscreen_info_shadow">#99000000</color>
 </resources>

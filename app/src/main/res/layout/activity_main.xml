@@ -2,7 +2,6 @@
 
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
-    android:id="@+id/root_layout"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:orientation="vertical">
@@ -61,42 +60,27 @@
             android:visibility="gone">
 
             <TextView
+                style="@style/FullscreenInfoText"
                 android:id="@+id/tv_fullscreen_name"
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
                 android:layout_weight="1"
                 android:singleLine="true"
-                android:ellipsize="end"
-                android:textColor="@color/text_primary"
-                android:textSize="13sp"
-                android:shadowColor="#99000000"
-                android:shadowDx="0"
-                android:shadowDy="1"
-                android:shadowRadius="3" />
+                android:ellipsize="end" />
 
             <TextView
+                style="@style/FullscreenInfoText"
                 android:id="@+id/tv_fullscreen_clock"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:layout_marginStart="12dp"
-                android:textColor="@color/text_primary"
-                android:textSize="13sp"
-                android:shadowColor="#99000000"
-                android:shadowDx="0"
-                android:shadowDy="1"
-                android:shadowRadius="3" />
+                android:layout_marginStart="12dp" />
 
             <TextView
+                style="@style/FullscreenInfoText"
                 android:id="@+id/tv_fullscreen_battery"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:layout_marginStart="10dp"
-                android:textColor="@color/text_primary"
-                android:textSize="13sp"
-                android:shadowColor="#99000000"
-                android:shadowDx="0"
-                android:shadowDy="1"
-                android:shadowRadius="3" />
+                android:layout_marginStart="10dp" />
 
         </LinearLayout>
 
@@ -138,7 +122,6 @@
             android:paddingEnd="16dp">
 
             <TextView
-                android:id="@+id/tv_playlist_info"
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
                 android:layout_weight="1"

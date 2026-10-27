@@ -13,8 +13,6 @@ room = "2.8.5"
 kotlinx-coroutines = "1.11.0"
 junit = "4.13.2"
 json = "20260814"
-# Media3 的 ListenableFuture API 由这个接口 jar 提供；显式声明避免依赖传递解析
-listenablefuture = "9999.0-empty-to-avoid-conflict-with-guava"
 
 [libraries]
 media3-exoplayer = { module = "androidx.media3:media3-exoplayer", version.ref = "media3" }
@@ -31,7 +29,6 @@ room-compiler = { module = "androidx.room:room-compiler", version.ref = "room" }
 coroutines-android = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-android", version.ref = "kotlinx-coroutines" }
 junit = { module = "junit:junit", version.ref = "junit" }
 json = { module = "org.json:json", version.ref = "json" }
-listenablefuture = { module = "com.google.guava:listenablefuture", version.ref = "listenablefuture" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

@@ -168,6 +168,7 @@ class PlayerService : MediaSessionService() {
     /** 周期落盘任务：播放中或仍有待删除项时，每次执行后重新排期。 */
     private val progressTicker = Runnable {
         tickerScheduled = false
+        if (resetting) return@Runnable
         if (player?.isPlaying == true || progress.hasPendingRemovals()) {
             persistProgress()
             scheduleProgressTicker()
@@ -176,7 +177,7 @@ class PlayerService : MediaSessionService() {
 
     /** 排期下一次周期落盘（幂等，已排期时不重复）。 */
     private fun scheduleProgressTicker() {
-        if (destroyed || mediaSession == null) return
+        if (destroyed || resetting || mediaSession == null) return
         if (tickerScheduled) return
         tickerScheduled = true
         mainHandler.postDelayed(progressTicker, PROGRESS_TICKER_INTERVAL_MS)
@@ -189,6 +190,14 @@ class PlayerService : MediaSessionService() {
         mainHandler.removeCallbacks(progressTicker)
     }
 
+    /** 重置本地数据时清空进度缓存与当前项记忆，避免旧进度被自动连播重新写回。 */
+    private fun clearProgressForReset() {
+        cancelProgressTicker()
+        progress.clearAll()
+        lastPlayedUri = null
+        lastPlayedDurationMs = C.TIME_UNSET
+    }
+
     @OptIn(UnstableApi::class)
     override fun onCreate() {
         super.onCreate()
@@ -198,7 +207,7 @@ class PlayerService : MediaSessionService() {
             .setAudioAttributes(
                 AudioAttributes.Builder()
                     .setUsage(C.USAGE_MEDIA)
-                    .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
+                    .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
                     .build(),
                 true
             )
@@ -306,6 +315,8 @@ class PlayerService : MediaSessionService() {
 
     /** 收集当前变更并落盘（无变化则跳过写库）。 */
     private fun persistProgress() {
+        // 重置期间不写库：此时数据库即将被删除重建，旧进度不能回写
+        if (resetting) return
         val player = this.player ?: return
         // URI 已真正离开播放队列后解除抑制，避免集合无限增长
         if (progress.hasPendingDrops()) {
@@ -326,6 +337,8 @@ class PlayerService : MediaSessionService() {
         val snapshot = progress.snapshot()
         PlayerRepository.applyProgressUpdates(writes, removals) { persisted ->
             mainHandler.post {
+                // 重置已开始：本次回调属于旧数据，既不能更新快照也不能重新排期
+                if (resetting) return@post
                 if (persisted) {
                     progress.markPersisted(snapshot, removals)
                 } else {
@@ -367,6 +380,10 @@ class PlayerService : MediaSessionService() {
 
         @Volatile
         private var instance: PlayerService? = null
+
+        /** 本地数据重置进行中：期间禁止任何进度写库，避免旧进度写回新库。 */
+        @Volatile
+        private var resetting = false
 
         /**
          * 播放错误事件。
@@ -420,12 +437,23 @@ class PlayerService : MediaSessionService() {
 
         /** 立即把当前播放位置落盘（暂停 / 切后台 / 点播前调用）。 */
         fun flushCurrentPosition() {
+            if (resetting) return
             instance?.persistProgress()
         }
 
-        /** 重置本地数据时清空服务侧进度缓存，避免旧快照重新写回数据库。 */
-        fun clearProgressCache() {
-            instance?.progress?.clearAll()
+        /**
+         * 开始重置本地数据：停止周期落盘并清空进度缓存。
+         * 之后到达的播放器回调只更新内存缓存，不再写库，直到 [endReset]。
+         */
+        fun beginReset() {
+            resetting = true
+            instance?.clearProgressForReset()
+        }
+
+        /** 结束重置：再清一次缓存（重置期间的回调可能重新缓存），然后恢复落盘。 */
+        fun endReset() {
+            instance?.clearProgressForReset()
+            resetting = false
         }
     }
 }

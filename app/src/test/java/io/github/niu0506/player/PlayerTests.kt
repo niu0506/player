@@ -1394,6 +1394,26 @@ class MediaScanFilterTest {
         assertTrue(isExcludedAudioType(0, 0, 1))
         assertFalse(isExcludedAudioType(0, 0, 0))
     }
+
+    @Test
+    fun `music rows are kept`() {
+        assertFalse(isExcludedAudioRow(0, 0, 0, isMusic = 1, isRecording = 0))
+    }
+
+    @Test
+    fun `non music rows are excluded`() {
+        assertTrue(isExcludedAudioRow(0, 0, 0, isMusic = 0, isRecording = 0))
+    }
+
+    @Test
+    fun `recording rows are excluded`() {
+        assertTrue(isExcludedAudioRow(0, 0, 0, isMusic = 1, isRecording = 1))
+    }
+
+    @Test
+    fun `ringtone rows are excluded even when marked as music`() {
+        assertTrue(isExcludedAudioRow(1, 0, 0, isMusic = 1, isRecording = 0))
+    }
 }
 
 /** 队列项按 URI 定位：覆盖列表与队列错位时的删除路径。 */

@@ -19,6 +19,7 @@
     <color name="player_control_overlay">#99000000</color>
     <color name="player_control_bar">#CC000000</color>
     <color name="player_control_text">#FFFFFFFF</color>
+    <color name="player_control_text_disabled">#4EFFFFFF</color>
     <color name="player_control_muted_text">#B3FFFFFF</color>
 
     <!-- 点号命名的隐式父样式：未显式指定 parent 的 PlayerControls.* 依赖它，不能删除 -->

@@ -14,7 +14,6 @@
     <string name="brightness_follow_system">亮度跟随系统</string>
     <string name="toast_brightness_follow_system">已恢复跟随系统亮度</string>
     <string name="reset_local_data">重置本地数据</string>
-    <string name="reset_data_title">重置本地数据</string>
     <string name="reset_data_message">将删除本地的播放列表、播放进度和缺失文件记录，并重新扫描媒体库。此操作不可撤销。</string>
     <string name="reset_data_confirm">重置</string>
     <string name="reset_data_done">本地数据已重置，正在重新扫描</string>

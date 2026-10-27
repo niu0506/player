@@ -16,9 +16,6 @@ build/
 # 本地配置文件（机器相关，含本机 SDK 路径）
 local.properties
 
-# 构建输出（模块级）
-app/build/
-
 # Capture/说明文件
 captures/
 .externalNativeBuild/

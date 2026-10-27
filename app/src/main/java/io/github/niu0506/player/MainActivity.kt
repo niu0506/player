@@ -36,6 +36,8 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import androidx.media3.common.C
+import androidx.media3.common.MediaItem
+import androidx.media3.common.MediaMetadata
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
@@ -52,8 +54,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import androidx.media3.common.MediaItem as M3MediaItem
-import androidx.media3.common.MediaMetadata as M3MediaMetadata
 
 /** 应用入口：尽早触发数据库加载，让界面启动时直接读到内存数据。 */
 class PlayerApp : Application() {
@@ -206,8 +206,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     /** 按统一的身份键（[normalizeUri]）定位列表条目；找不到返回 -1。 */
-    private fun indexOfUri(uri: String): Int =
-        playlist.indexOfFirst { normalizeUri(it.uri) == normalizeUri(uri) }
+    private fun indexOfUri(uri: String): Int {
+        val key = normalizeUri(uri)
+        return playlist.indexOfFirst { normalizeUri(it.uri) == key }
+    }
 
     /** 首次加载时把仓库列表合并进内存（保留加载失败期间手动扫描的条目）。 */
     private fun loadPlaylist() {
@@ -217,7 +219,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private val playerListener = object : Player.Listener {
-        override fun onMediaItemTransition(mediaItem: M3MediaItem?, reason: Int) {
+        override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
             syncAdapterPlayingState()
             fullscreenPip.refreshInfoBarContent()
             // 自动连播 / 跨条目 seek 的断点续播由 PlayerService 在本地完成：
@@ -263,11 +265,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     /** 把内部模型转换为 Media3 的 MediaItem。 */
-    private fun buildMediaItem(item: MediaItemData): M3MediaItem =
-        M3MediaItem.Builder()
+    private fun buildMediaItem(item: MediaItemData): MediaItem =
+        MediaItem.Builder()
             .setUri(item.uri)
             .setMediaMetadata(
-                M3MediaMetadata.Builder().setTitle(item.name).build()
+                MediaMetadata.Builder().setTitle(item.name).build()
             )
             .build()
 
@@ -298,7 +300,12 @@ class MainActivity : AppCompatActivity() {
      * 只有当前播放项被移除（或差分无法安全落地）时才整体重建。
      */
     private fun rebuildQueueIfNeeded(ctrl: MediaController) {
-        if (playlist.isEmpty() || queueMatchesPlaylist(ctrl)) return
+        if (queueMatchesPlaylist(ctrl)) return
+        // 列表被清空时必须显式清空队列，否则播放器仍保留旧条目
+        if (playlist.isEmpty()) {
+            ctrl.setMediaItems(emptyList())
+            return
+        }
 
         val currentItem = ctrl.currentMediaItem
         val curUri = currentItem.uriString
@@ -330,12 +337,28 @@ class MainActivity : AppCompatActivity() {
         }
 
         // 下标由 planQueueDiff 按“执行到该步时”的队列状态计算，必须顺序执行。
-        for (edit in plan.edits) {
-            when (edit) {
-                is QueueEdit.Add -> ctrl.addMediaItem(edit.index, buildMediaItem(playlist[edit.index]))
-                is QueueEdit.Remove -> ctrl.removeMediaItem(edit.index)
-                is QueueEdit.Move -> ctrl.moveMediaItem(edit.fromIndex, edit.toIndex)
-                is QueueEdit.Replace -> ctrl.replaceMediaItem(edit.index, buildMediaItem(playlist[edit.index]))
+        // 连续插入合并为一次 addMediaItems，避免逐条插入触发多次队列回调。
+        var cursor = 0
+        while (cursor < plan.edits.size) {
+            val edit = plan.edits[cursor]
+            if (edit is QueueEdit.Add) {
+                val startIndex = edit.index
+                val items = mutableListOf<MediaItem>()
+                while (cursor < plan.edits.size) {
+                    val add = plan.edits[cursor] as? QueueEdit.Add ?: break
+                    items += buildMediaItem(playlist[add.index])
+                    cursor++
+                }
+                ctrl.addMediaItems(startIndex, items)
+            } else {
+                when (edit) {
+                    is QueueEdit.Remove -> ctrl.removeMediaItem(edit.index)
+                    is QueueEdit.Move -> ctrl.moveMediaItem(edit.fromIndex, edit.toIndex)
+                    is QueueEdit.Replace -> ctrl.replaceMediaItem(edit.index, buildMediaItem(playlist[edit.index]))
+                    // Add 已在上面的合并分支处理；这里仅用于保证 when 穷尽，正常不会执行
+                    is QueueEdit.Add -> error("队列插入已在上面的合并分支处理")
+                }
+                cursor++
             }
         }
     }
@@ -536,7 +559,7 @@ class MainActivity : AppCompatActivity() {
             silent = silent,
         )
         val changed = result.playlist != playlist
-        if (!changed && result.removedCount == 0) {
+        if (!changed) {
             if (!silent) {
                 toast(R.string.toast_no_new_media)
             }
@@ -547,15 +570,8 @@ class MainActivity : AppCompatActivity() {
         if (result.removedCount > 0) syncAdapterPlayingState()
         refreshPlaylist()
         savePlaylist()
-        controller?.let { ctrl ->
-            if (playlist.isEmpty() && result.removedCount > 0) {
-                // 列表被清空：rebuildQueueIfNeeded 对空列表直接返回，这里显式清空队列
-                ctrl.clearMediaItems()
-                if (queueMatchesPlaylist(ctrl)) PlayerService.clearAllPendingDrops()
-            } else {
-                rebuildQueueAndClearPending(ctrl)
-            }
-        }
+        // 空列表同样由 rebuildQueueIfNeeded 的 setMediaItems(emptyList()) 处理
+        controller?.let(::rebuildQueueAndClearPending)
         if (!silent) {
             val parts = mutableListOf<String>()
             if (result.removedCount > 0) {
@@ -675,7 +691,7 @@ class MainActivity : AppCompatActivity() {
     /** 重置本地数据前的二次确认。 */
     private fun confirmResetLocalData() {
         AlertDialog.Builder(this)
-            .setTitle(R.string.reset_data_title)
+            .setTitle(R.string.reset_local_data)
             .setMessage(R.string.reset_data_message)
             .setPositiveButton(R.string.reset_data_confirm) { _, _ -> resetLocalData() }
             .setNegativeButton(R.string.cancel, null)
@@ -687,17 +703,24 @@ class MainActivity : AppCompatActivity() {
         // 取消进行中的扫描与待保存任务，避免它们把旧列表写回新库
         cancelScans()
         mainHandler.removeCallbacks(savePlaylistRunnable)
-        // 先停掉播放并清空队列/进度缓存，避免重置期间旧进度再次写库
+        // 重置期间禁止服务侧写进度并清空待写缓存，避免 stop/clear 的回调把旧进度写回
+        PlayerService.beginReset()
         controller?.stop()
         controller?.clearMediaItems()
-        PlayerService.clearProgressCache()
         lifecycleScope.launch {
-            val ok = PlayerRepository.resetAllData(this@MainActivity)
+            val ok = try {
+                PlayerRepository.resetAllData(this@MainActivity)
+            } finally {
+                // 无论成功与否都恢复落盘，否则之后的正常播放进度会一直丢
+                PlayerService.endReset()
+            }
             if (isFinishing || isDestroyed) return@launch
             if (!ok) {
                 toastLong(R.string.reset_data_failed)
                 return@launch
             }
+            // 重置期间到达的播放器回调可能已重新填充队列，这里再清一次
+            controller?.clearMediaItems()
             playlist.clear()
             playlistLoaded = true
             refreshPlaylist()

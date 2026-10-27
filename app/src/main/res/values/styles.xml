@@ -1,4 +1,14 @@
 <resources>
+    <!-- 全屏顶部信息条文字：三处共用同一套字体与阴影，避免逐项重复 -->
+    <style name="FullscreenInfoText">
+        <item name="android:textColor">@color/text_primary</item>
+        <item name="android:textSize">13sp</item>
+        <item name="android:shadowColor">@color/fullscreen_info_shadow</item>
+        <item name="android:shadowDx">0</item>
+        <item name="android:shadowDy">1</item>
+        <item name="android:shadowRadius">3</item>
+    </style>
+
     <!-- 顶部工具栏操作按钮：等宽平分、单行不换行，保证窄屏下文字完整可见 -->
     <style name="ToolbarActionButton">
         <item name="android:layout_width">0dp</item>

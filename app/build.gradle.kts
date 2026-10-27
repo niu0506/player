@@ -83,7 +83,6 @@ dependencies {
     implementation(libs.lifecycle.runtime.ktx)
     implementation(libs.material)
     implementation(libs.coroutines.android)
-    implementation(libs.listenablefuture)
     testImplementation(libs.junit)
     testImplementation(libs.json)
 

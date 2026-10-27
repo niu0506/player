@@ -147,7 +147,6 @@ class FullscreenPipHelper(
     /** 系统 PiP 模式切换回调：退出 PiP 且非全屏时恢复系统栏。 */
     fun onPipModeChanged(isInPictureInPictureMode: Boolean) {
         isInPipMode = isInPictureInPictureMode
-        pipPreparing = false
         if (!isInPictureInPictureMode && !isFullscreen) {
             showSystemBars()
         }
@@ -180,6 +179,14 @@ class FullscreenPipHelper(
             infoTickerRunning = false
             infoHandler.removeCallbacks(infoTick)
         }
+    }
+
+    /** 按当前状态刷新顶部信息条：仅全屏、非 PiP 且控制栏完整可见时显示。 */
+    private fun refreshInfoBar() {
+        applyInfoBar(
+            isFullscreen && !isInPipMode && !pipPreparing &&
+                binding.playerView.isControllerFullyVisible
+        )
     }
 
     /** 刷新顶部信息：文件名、系统时间与电量。 */
@@ -219,7 +226,7 @@ class FullscreenPipHelper(
         setChromeVisible(!pipLike && !isFullscreen)
         setFullscreenBackVisible(isFullscreen && !pipLike)
         binding.playerView.useController = !pipLike
-        applyInfoBar(isFullscreen && !pipLike && binding.playerView.isControllerFullyVisible)
+        refreshInfoBar()
         requestContentInsets()
         when {
             // PiP（或进入前的过渡态）：按真实比例缩放铺满小窗
@@ -366,9 +373,7 @@ class FullscreenPipHelper(
         if (isFullscreen && !isInPipMode) {
             hideSystemBars()
         }
-        applyInfoBar(
-            isFullscreen && !isInPipMode && binding.playerView.isControllerFullyVisible
-        )
+        refreshInfoBar()
         requestContentInsets()
     }
 
@@ -620,6 +625,9 @@ class MediaListAdapter(
     /** 局部刷新 payload：仅更新进度，不重绑整个条目。 */
     private val progressPayload = Any()
 
+    /** 局部刷新 payload：仅更新序号（列表增删后后续条目的序号会变化）。 */
+    private val indexPayload = Any()
+
     /** 当前列表；internal 便于单元测试直接注入（生产代码只经 [submitList] 更新）。 */
     internal val items = mutableListOf<MediaItemData>()
 
@@ -656,6 +664,11 @@ class MediaListAdapter(
                 items.clear()
                 items.addAll(list)
                 diff.dispatchUpdatesTo(this@MediaListAdapter)
+                // DiffUtil 只刷新增删/移动的条目，后续条目的序号会整体前移/后移，
+                // 这里用 payload 再刷一遍序号，避免显示旧下标。
+                if (items.isNotEmpty()) {
+                    notifyItemRangeChanged(0, items.size, indexPayload)
+                }
             }
         }
     }
@@ -668,7 +681,7 @@ class MediaListAdapter(
 
     /** 单条更新（如播放器回填时长）；返回 false 表示列表尚未包含该条，需整表提交。 */
     fun updateItem(item: MediaItemData): Boolean {
-        val index = items.indexOfFirst { it.uri == item.uri }
+        val index = indexOfUri(item.uri.toString())
         if (index < 0) return false
         items[index] = item
         notifyItemChanged(index)
@@ -710,8 +723,7 @@ class MediaListAdapter(
     override fun onBindViewHolder(holder: VH, position: Int) {
         val item = items[position]
         val context = holder.itemView.context
-        holder.binding.tvIndex.text =
-            context.getString(R.string.list_item_index, position + 1)
+        bindIndex(holder, position)
         holder.binding.tvName.text = item.name
         bindDuration(holder, item)
         val active = isItemActive(item)
@@ -725,16 +737,24 @@ class MediaListAdapter(
         bindProgress(holder, item, active)
     }
 
+    /** 只更新序号文案；播放中条目仍保持隐藏，不影响其他状态。 */
+    private fun bindIndex(holder: VH, position: Int) {
+        holder.binding.tvIndex.text =
+            holder.itemView.context.getString(R.string.list_item_index, position + 1)
+    }
+
     /** 当前条目是否正在播放（列表高亮与进度文案共用）。 */
     private fun isItemActive(item: MediaItemData): Boolean =
         item.uri.toString() == currentPlayingUri && isPlaying
 
-    /** 带 payload 的绑定：仅进度局部刷新走快路径，其余（含时长变化）走默认重绑。 */
+    /** 带 payload 的绑定：仅进度 / 仅序号走快路径，其余（含时长变化）走默认重绑。 */
     override fun onBindViewHolder(holder: VH, position: Int, payloads: MutableList<Any>) {
         val item = items[position]
         when {
             payloads.isNotEmpty() && payloads.all { it === progressPayload } ->
                 bindProgress(holder, item, isItemActive(item))
+            payloads.isNotEmpty() && payloads.all { it === indexPayload } ->
+                bindIndex(holder, position)
             else -> super.onBindViewHolder(holder, position, payloads)
         }
     }
