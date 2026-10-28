@@ -1,7 +1,4 @@
-/**
- * 后台播放前台服务：托管 ExoPlayer 与 MediaSession，负责进度落盘、
- * 播放错误自动跳项，并拒绝不可信控制器。播放参数由服务侧持有。
- */
+/** 后台播放服务：托管 ExoPlayer 与 MediaSession。 */
 package io.github.niu0506.player
 
 import android.app.PendingIntent
@@ -25,7 +22,6 @@ import com.google.common.util.concurrent.ListenableFuture
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 
-/** MediaItem 的字符串 URI；无 localConfiguration 时返回 null。 */
 internal val MediaItem?.uriString: String?
     get() = this?.localConfiguration?.uri?.toString()
 
@@ -33,7 +29,6 @@ class PlayerService : MediaSessionService() {
 
     private var mediaSession: MediaSession? = null
 
-    /** 会话托管的播放器；未创建或已销毁时为 null。 */
     private val player: Player?
         get() = mediaSession?.player
 
@@ -41,23 +36,19 @@ class PlayerService : MediaSessionService() {
 
     private var destroyed = false
 
-    /** 连续播放错误次数：用于判断是否整份列表都播放失败。 */
     private var consecutiveErrorCount = 0
 
-    /** 待落盘的进度缓存；把时间线事件与写库裁决收在一个可单测的状态对象里。 */
     private val progress = ProgressCache()
 
-    /** 当前媒体项的 uri，用于自动切歌时处理上一首的完成标记。 */
+    /** 上一媒体项 uri，用于标记已看完。 */
     private var lastPlayedUri: String? = null
 
-    /** 当前媒体项时长；自动连播时用于把上一项标记为已看完。 */
     private var lastPlayedDurationMs = C.TIME_UNSET
 
     private val playerEventListener = object : Player.Listener {
         override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
             if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO) {
-                // 自动连播：上一首视为自然播完，保留 100% 完成标记而不是清除记录，
-                // 否则列表里会像从未播放过一样。
+                // 自动连播视为自然播完
                 val finishedUri = lastPlayedUri
                 val finishedDuration = lastPlayedDurationMs
                 if (finishedUri != null && finishedDuration > 0) {
@@ -70,8 +61,7 @@ class PlayerService : MediaSessionService() {
                 ?.takeIf { it > 0 }
                 ?: C.TIME_UNSET
             lastPlayedUri?.let { PlayerRepository.setLastItem(it) }
-            // 自动连播、错误跳过和跨条目 seek 都在服务侧续播：界面退到后台时
-            // 控制器会释放，只靠界面监听切歌会漏掉恢复，下一项便从头播放。
+            // 在服务侧续播：界面退后台会释放控制器
             if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO ||
                 reason == Player.MEDIA_ITEM_TRANSITION_REASON_SEEK
             ) {
@@ -82,7 +72,7 @@ class PlayerService : MediaSessionService() {
 
         override fun onIsPlayingChanged(isPlaying: Boolean) {
             if (!isPlaying) {
-                // 暂停：立即落盘，ticker 不再续排
+                // 暂停立即落盘，ticker 不再续排
                 persistProgress()
             } else {
                 consecutiveErrorCount = 0
@@ -93,7 +83,7 @@ class PlayerService : MediaSessionService() {
         override fun onPlaybackStateChanged(playbackState: Int) {
             if (playbackState != Player.STATE_ENDED) return
             val player = this@PlayerService.player ?: return
-            // 顺序播放到末尾后主动暂停，避免停在 ENDED 状态
+            // 顺序播放到末尾后主动暂停
             if (player.repeatMode == Player.REPEAT_MODE_OFF) player.pause()
         }
 
@@ -110,8 +100,7 @@ class PlayerService : MediaSessionService() {
                     newPosition.positionMs
                 )
             ) {
-                // 用户把当前条目拖回开头：显式删除旧断点。
-                // 普通位置 0 仍走 decideProgressWrite 的 Skip，避免初始位置/队列重建误清。
+                // 拖回开头：清除旧断点
                 this@PlayerService.player
                     ?.currentMediaItem
                     ?.localConfiguration
@@ -119,17 +108,13 @@ class PlayerService : MediaSessionService() {
                     ?.toString()
                     ?.let(progress::clear)
             }
-            when {
-                // 跨条目 seek：先补记旧条目的位置，再统一落盘
-                reason == Player.DISCONTINUITY_REASON_SEEK && !sameItem -> {
-                    cacheOldPosition(oldPosition)
-                    persistProgress()
-                }
-                reason == Player.DISCONTINUITY_REASON_SEEK -> persistProgress()
-                !sameItem -> persistProgress()
-                // 同条目、非 seek 的位置变化不产生有效进度
-                else -> return
+            // 跨条目 seek：先补记旧条目
+            if (reason == Player.DISCONTINUITY_REASON_SEEK && !sameItem) {
+                cacheOldPosition(oldPosition)
             }
+            // 同条目非 seek 的位置变化不产生进度
+            if (reason != Player.DISCONTINUITY_REASON_SEEK && sameItem) return
+            persistProgress()
         }
 
         override fun onPlayerError(error: PlaybackException) {
@@ -139,13 +124,12 @@ class PlayerService : MediaSessionService() {
             if (error.errorCode == PlaybackException.ERROR_CODE_IO_FILE_NOT_FOUND &&
                 errorUri != null
             ) {
-                // 在这里登记而不是在界面收集器里：界面退到后台后仍要记录缺失，
-                // 供扫描宽限期判定使用。
+                // 后台也记录缺失，供扫描宽限期判定
                 PlayerRepository.recordMissing(errorUri)
             }
 
             consecutiveErrorCount++
-            // 队列非空且错误次数不小于队列长度，视为整份列表都播放失败
+            // 错误次数达到队列长度，视为整份列表都失败
             val exhausted = player.mediaItemCount in 1..consecutiveErrorCount
             val hasNext = !exhausted && player.hasNextMediaItem()
 
@@ -165,7 +149,6 @@ class PlayerService : MediaSessionService() {
 
     private var tickerScheduled = false
 
-    /** 周期落盘任务：播放中或仍有待删除项时，每次执行后重新排期。 */
     private val progressTicker = Runnable {
         tickerScheduled = false
         if (resetting) return@Runnable
@@ -175,7 +158,6 @@ class PlayerService : MediaSessionService() {
         }
     }
 
-    /** 排期下一次周期落盘（幂等，已排期时不重复）。 */
     private fun scheduleProgressTicker() {
         if (destroyed || resetting || mediaSession == null) return
         if (tickerScheduled) return
@@ -183,14 +165,12 @@ class PlayerService : MediaSessionService() {
         mainHandler.postDelayed(progressTicker, PROGRESS_TICKER_INTERVAL_MS)
     }
 
-    /** 取消已排期的周期落盘。 */
     private fun cancelProgressTicker() {
         if (!tickerScheduled) return
         tickerScheduled = false
         mainHandler.removeCallbacks(progressTicker)
     }
 
-    /** 重置本地数据时清空进度缓存与当前项记忆，避免旧进度被自动连播重新写回。 */
     private fun clearProgressForReset() {
         cancelProgressTicker()
         progress.clearAll()
@@ -211,9 +191,9 @@ class PlayerService : MediaSessionService() {
                     .build(),
                 true
             )
-            // 本地媒体播放期间保持 CPU 唤醒；只持有本地唤醒锁，不需要 Wi-Fi 锁
+            // 本地播放期间保持 CPU 唤醒（无需 Wi-Fi 锁）
             .setWakeMode(C.WAKE_MODE_LOCAL)
-            // 拔掉耳机（音频路由变为 noisy）时自动暂停
+            // 拔出耳机时自动暂停
             .setHandleAudioBecomingNoisy(true)
             .setSeekBackIncrementMs(15_000)
             .setSeekForwardIncrementMs(15_000)
@@ -222,11 +202,10 @@ class PlayerService : MediaSessionService() {
         mediaSession = buildMediaSession(player)
     }
 
-    /** 构建媒体会话：只允许可信控制器连接，避免第三方应用读取媒体信息。 */
     @OptIn(UnstableApi::class)
     private fun buildMediaSession(player: Player): MediaSession =
         MediaSession.Builder(this, player)
-            // 通知栏 / 锁屏 / 系统媒体控件的点击都依赖 session activity 才能回到界面
+            // 点击通知 / 锁屏控件时回到界面
             .setSessionActivity(
                 PendingIntent.getActivity(
                     this,
@@ -259,14 +238,13 @@ class PlayerService : MediaSessionService() {
 
     override fun onTaskRemoved(rootIntent: Intent?) {
         persistProgress()
-        // 从最近任务划掉且没有播放意图（playWhenReady=false）时结束服务
+        // 无播放意图时结束服务
         val player = this.player
         if (player == null || !player.playWhenReady) {
             stopSelf()
         }
     }
 
-    /** 缓存当前播放位置，并记住当前项时长供自动连播时标记完成。 */
     private fun cacheCurrentPosition(player: Player) {
         val duration = player.duration
         if (duration > 0) lastPlayedDurationMs = duration
@@ -277,18 +255,11 @@ class PlayerService : MediaSessionService() {
         )
     }
 
-    /**
-     * 切到新条目后按断点续播；没有记录或已看完时保持从头播放。
-     *
-     * 只有跨条目 SEEK 需要保留“界面已经定位过”的检查；自动连播时
-     * onMediaItemTransition 会经主线程派发，回调执行时新条目可能已经播了
-     * 一秒以上，不能再因此跳过续播。
-     */
     private fun restoreResumePosition(mediaItem: MediaItem?, reason: Int) {
         val player = this.player ?: return
         if (!shouldRestoreResume(reason, player.currentPosition, RESUME_START_TOLERANCE_MS)) return
         val uri = mediaItem.uriString ?: return
-        // 刚切歌时新条目尚未 READY，优先用列表里扫描到的时长判定「已看完」
+        // 新条目尚未 READY，优先用扫描到的时长判断已看完
         val playlistDuration = PlayerRepository.getPlaylist()
             .firstOrNull { it.uri.toString() == uri }
             ?.duration
@@ -300,7 +271,6 @@ class PlayerService : MediaSessionService() {
         player.seekTo(player.currentMediaItemIndex, position)
     }
 
-    /** 缓存某个旧条目的位置（已切走后仍能补记其进度）。 */
     private fun cacheOldPosition(oldPosition: Player.PositionInfo) {
         val player = this.player ?: return
         if (oldPosition.mediaItemIndex !in 0 until player.currentTimeline.windowCount) return
@@ -313,12 +283,11 @@ class PlayerService : MediaSessionService() {
         )
     }
 
-    /** 收集当前变更并落盘（无变化则跳过写库）。 */
     private fun persistProgress() {
-        // 重置期间不写库：此时数据库即将被删除重建，旧进度不能回写
+        // 重置期间不写库
         if (resetting) return
         val player = this.player ?: return
-        // URI 已真正离开播放队列后解除抑制，避免集合无限增长
+        // URI 离开队列后解除抑制，避免集合无限增长
         if (progress.hasPendingDrops()) {
             val present = (0 until player.mediaItemCount)
                 .mapNotNull { player.getMediaItemAt(it).uriString }
@@ -332,17 +301,16 @@ class PlayerService : MediaSessionService() {
         writeToDisk(writes, removals)
     }
 
-    /** 提交一次数据库写入；成功更新快照，失败则保留待写数据并重新排期。 */
     private fun writeToDisk(writes: Map<String, Long>, removals: Set<String>) {
         val snapshot = progress.snapshot()
         PlayerRepository.applyProgressUpdates(writes, removals) { persisted ->
             mainHandler.post {
-                // 重置已开始：本次回调属于旧数据，既不能更新快照也不能重新排期
+                // 重置已开始，不再更新
                 if (resetting) return@post
                 if (persisted) {
                     progress.markPersisted(snapshot, removals)
                 } else {
-                    progress.markFailed(removals)
+                    progress.markFailed()
                     if (!destroyed) scheduleProgressTicker()
                 }
             }
@@ -351,7 +319,6 @@ class PlayerService : MediaSessionService() {
 
     override fun onTrimMemory(level: Int) {
         super.onTrimMemory(level)
-        // 内存吃紧：尽快落盘
         persistProgress()
     }
 
@@ -372,26 +339,17 @@ class PlayerService : MediaSessionService() {
     companion object {
         private const val TAG = "PlayerService"
 
-        /** 周期落盘间隔：5 秒。 */
         private const val PROGRESS_TICKER_INTERVAL_MS = 5000L
 
-        /** 切歌后位置仍在开头附近才自动续播，避免覆盖界面已指定的位置。 */
         private const val RESUME_START_TOLERANCE_MS = 1_000L
 
         @Volatile
         private var instance: PlayerService? = null
 
-        /** 本地数据重置进行中：期间禁止任何进度写库，避免旧进度写回新库。 */
+        /** 重置进行中：禁止进度写库。 */
         @Volatile
         private var resetting = false
 
-        /**
-         * 播放错误事件。
-         * @property uri 出错的媒体 uri
-         * @property exhausted 是否整份列表都失败（已停止自动跳过）
-         * @property hasNext 出错后是否已自动跳到下一项
-         * @property errorCode Media3 的错误码
-         */
         data class PlaybackErrorEvent(
             val uri: String?,
             val exhausted: Boolean,
@@ -404,53 +362,40 @@ class PlayerService : MediaSessionService() {
         )
         val errorEvents: SharedFlow<PlaybackErrorEvent> = errorEventsInternal
 
-        /** 用户主动点播时重置错误计数，恢复自动跳过能力。 */
         fun resetErrorCount() {
             instance?.consecutiveErrorCount = 0
         }
 
-        /** 批量删除进度：仓库立即删一次，服务侧缓存与快照同步清理（扫描清理已消失文件时用）。 */
         fun dropProgress(uris: Collection<String>) {
             if (uris.isEmpty()) return
             val keys = uris.toSet()
             PlayerRepository.applyProgressUpdates(emptyMap(), keys)
             val svc = instance ?: return
-            // 只有当前播放项会被 ticker 的 cacheCurrentPosition 重新缓存；
-            // 非当前项删除后不需要长期抑制，避免它被重新加入列表后进度一直不写入。
+            // 只有当前项会被 ticker 重新缓存
             val currentUri = svc.player
                 ?.currentMediaItem
                 ?.localConfiguration
                 ?.uri
                 ?.toString()
-            // 连快照一并移除，避免下一轮落盘按旧快照重复提交；当前项还会进入
-            // pendingDrops，直到播放器真正把它移出队列才允许重新缓存进度。
+            // 当前项进入 pendingDrops，离开队列后才允许重新缓存
             svc.progress.drop(keys, currentUri)
         }
 
-        /** 删除单条进度。 */
         fun dropProgress(uri: String) = dropProgress(listOf(uri))
 
-        /** 队列与列表已一致时清空全部抑制项（用于条目在控制器未连接时被删除的兜底）。 */
         fun clearAllPendingDrops() {
             instance?.progress?.clearAllPendingDrops()
         }
 
-        /** 立即把当前播放位置落盘（暂停 / 切后台 / 点播前调用）。 */
         fun flushCurrentPosition() {
-            if (resetting) return
             instance?.persistProgress()
         }
 
-        /**
-         * 开始重置本地数据：停止周期落盘并清空进度缓存。
-         * 之后到达的播放器回调只更新内存缓存，不再写库，直到 [endReset]。
-         */
         fun beginReset() {
             resetting = true
             instance?.clearProgressForReset()
         }
 
-        /** 结束重置：再清一次缓存（重置期间的回调可能重新缓存），然后恢复落盘。 */
         fun endReset() {
             instance?.clearProgressForReset()
             resetting = false
@@ -458,25 +403,18 @@ class PlayerService : MediaSessionService() {
     }
 }
 
-/** 进度内存状态：待写位置、待删除 URI、删除抑制与落盘快照（纯逻辑，便于测试）。 */
+/** 待落盘进度的内存状态（纯逻辑，便于测试）。 */
 internal class ProgressCache {
 
-    /** 待落盘位置（uri → 毫秒）。 */
     private val cached = mutableMapOf<String, Long>()
 
-    /** 需要从数据库删除进度的 uri。 */
     private val removals = mutableSetOf<String>()
 
-    /**
-     * 已删除但播放器时间线里可能还存在的 uri。
-     * 在它真正离开队列前，ticker 不得把旧位置重新缓存回来。
-     */
+    /** 已删除但仍在队列中的 uri，不得重新缓存。 */
     private val pendingDrops = mutableSetOf<String>()
 
-    /** 上一次成功落盘时的缓存快照，用于跳过无变化的写入。 */
     private var lastPersisted: Map<String, Long> = emptyMap()
 
-    /** 按末尾容差裁决缓存一个位置；[uri] 为 null 时忽略。 */
     fun cache(uri: String?, positionMs: Long, durationMs: Long) {
         if (uri == null || uri in pendingDrops) return
         when (val decision = decideProgressWrite(positionMs, durationMs)) {
@@ -485,16 +423,14 @@ internal class ProgressCache {
         }
     }
 
-    /** 显式清除某条进度（seek 回 0、删除条目时）。 */
     fun clear(uri: String?) {
         if (uri == null) return
         cached.remove(uri)
-        // 删除请求可能先于旧快照落盘回调，先从快照移除，避免进度被“复活”
+        // 先从快照移除，避免落盘回调把进度复活
         lastPersisted = lastPersisted - uri
         removals.add(uri)
     }
 
-    /** 删除条目时清理缓存；当前播放项需进入 pendingDrops，防止 ticker 回写。 */
     fun drop(uris: Collection<String>, currentUri: String?) {
         for (key in uris) {
             cached.remove(key)
@@ -503,7 +439,7 @@ internal class ProgressCache {
         }
     }
 
-    /** URI 真正离开播放队列后解除删除抑制。 */
+    /** 解除已离开队列的抑制项。 */
     fun retainPending(present: Set<String>) {
         pendingDrops.retainAll(present)
     }
@@ -514,23 +450,19 @@ internal class ProgressCache {
 
     fun pendingRemovals(): Set<String> = removals.toSet()
 
-    /** 只返回相对上次成功落盘有变化的写入。 */
     fun writes(): Map<String, Long> =
         cached.filter { (uri, position) -> lastPersisted[uri] != position }
 
     fun snapshot(): Map<String, Long> = cached.toMap()
 
-    /** 落盘成功：更新快照并移除本次已提交的删除项。 */
     fun markPersisted(snapshot: Map<String, Long>, writtenRemovals: Set<String>) {
         removals.removeAll(writtenRemovals)
-        // 写入飞行期间被 clear/drop 的 key 已不在 cached 中，
-        // 不能再借旧快照复活到 lastPersisted。
+        // 不借旧快照复活写入期间被 clear/drop 的 key。
         lastPersisted = snapshot.filterKeys { it in cached }
     }
 
-    /** 落盘失败：保留本次删除项并清空快照，下一轮重写全部内容。 */
-    fun markFailed(writtenRemovals: Set<String>) {
-        removals.addAll(writtenRemovals)
+    /** 落盘失败：保留删除项并清空快照，下轮全量重写。 */
+    fun markFailed() {
         lastPersisted = emptyMap()
     }
 
@@ -538,7 +470,6 @@ internal class ProgressCache {
         pendingDrops.clear()
     }
 
-    /** 清空全部内存状态（重置本地数据时使用）。 */
     fun clearAll() {
         cached.clear()
         removals.clear()
@@ -547,7 +478,7 @@ internal class ProgressCache {
     }
 }
 
-/** 是否为当前条目从非零位置显式 seek 回 0（只有这种情况清除旧断点）。 */
+/** 是否显式 seek 回 0（仅此时清除断点）。 */
 internal fun isExplicitSeekToZero(
     reason: Int,
     sameItem: Boolean,
@@ -558,12 +489,6 @@ internal fun isExplicitSeekToZero(
     oldPositionMs > 0L &&
     newPositionMs == 0L
 
-/**
- * 是否需要按断点续播。
- *
- * 自动连播必须恢复：事件经主线程派发，回调执行时新条目可能已经播了一段，
- * 不能用“当前位置已离开开头”来推断界面已经 seek 过。只有跨条目 SEEK 才做这个检查。
- */
 internal fun shouldRestoreResume(
     reason: Int,
     currentPositionMs: Long,

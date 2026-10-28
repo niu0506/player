@@ -201,6 +201,25 @@
             android:textColor="@color/text_secondary"
             android:textSize="14sp"
             android:visibility="gone" />
+
+        <!-- 静默扫描发现新增时的轻提示：不弹 Toast，只在列表顶部短暂显示 -->
+        <TextView
+            android:id="@+id/tv_scan_notice"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="top|center_horizontal"
+            android:layout_marginTop="8dp"
+            android:paddingStart="14dp"
+            android:paddingEnd="14dp"
+            android:paddingTop="6dp"
+            android:paddingBottom="6dp"
+            android:background="@drawable/bg_pill_button"
+            android:elevation="4dp"
+            android:clickable="true"
+            android:focusable="true"
+            android:textColor="@color/text_primary"
+            android:textSize="12sp"
+            android:visibility="gone" />
     </FrameLayout>
 
 </LinearLayout>

@@ -1,8 +1,4 @@
-/**
- * 本地 JVM 单元测试（不依赖设备环境）：
- * 扫描对账与元数据合并、进度状态机、安装包完整性校验、
- * 缺失记录序列化、文件夹分组键与集数自然序等。
- */
+/** 本地 JVM 单元测试：扫描对账、进度状态机、更新校验、排序等纯逻辑。 */
 package io.github.niu0506.player
 
 import android.net.FakeUri
@@ -20,10 +16,12 @@ import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 
-/** SHA-256("abc")：更新校验相关测试共用的已知向量。 */
+/** SHA-256("abc") 的已知向量。 */
 private const val SHA256_ABC = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
 
-/** 时长格式化：分秒 / 时分秒、毫秒截断等。 */
+/** 仅用于比较 URI 的列表条目。 */
+private fun item(uri: String): MediaItemData = MediaItemData(FakeUri(uri), uri)
+
 class FormatTimeTest {
 
     @Test
@@ -52,7 +50,6 @@ class FormatTimeTest {
     }
 }
 
-/** 进度合并语义：0 值不覆盖、删除优先级、写删并存等。 */
 class PlaybackProgressTest {
 
     @Test
@@ -105,7 +102,6 @@ class PlaybackProgressTest {
     }
 }
 
-/** 进度写入裁决：末尾容差、已看完清除、0 跳过、时长未知等。 */
 class ProgressDecisionTest {
 
     private val duration = 180_000L
@@ -179,7 +175,6 @@ class ProgressDecisionTest {
     }
 }
 
-/** 适配器「当前播放项」更新：越界防护、仅刷新受影响条目。 */
 class MediaListAdapterCurrentPlayingTest {
 
     private class RecordingObserver : RecyclerView.AdapterDataObserver() {
@@ -188,8 +183,6 @@ class MediaListAdapterCurrentPlayingTest {
             repeat(itemCount) { changedPositions.add(positionStart + it) }
         }
     }
-
-    private fun item(s: String) = MediaItemData(FakeUri(s), s)
 
     private lateinit var adapter: MediaListAdapter
     private lateinit var observer: RecordingObserver
@@ -201,13 +194,7 @@ class MediaListAdapterCurrentPlayingTest {
         attachObserver(adapter, observer)
     }
 
-    /**
-     * 把观察者挂到 adapter 上。
-     *
-     * 不能用 `registerAdapterDataObserver`：它最终写入框架类 `android.database.Observable.mObservers`，
-     * 而单元测试运行在桩化的 android.jar 上（`isReturnDefaultValues = true`），框架构造器为空，
-     * `mObservers` 恒为 null，notify 时直接 NPE。这里显式初始化该字段再挂上观察者。
-     */
+    /** 挂载观察者；桩化 android.jar 下 `Observable.mObservers` 恒为 null，需手动初始化。 */
     @Suppress("UNCHECKED_CAST")
     private fun attachObserver(adapter: MediaListAdapter, observer: RecordingObserver) {
         val observableField = RecyclerView.Adapter::class.java.getDeclaredField("mObservable")
@@ -298,7 +285,6 @@ class MediaListAdapterCurrentPlayingTest {
     }
 }
 
-/** 缺失文件记录的序列化与解析容错。 */
 class MissingRecordsTest {
 
     @Test
@@ -344,7 +330,6 @@ class MissingRecordsTest {
     }
 }
 
-/** SHA-256 解析与十六进制编码。 */
 class UpdateIntegrityTest {
 
     private val hex64 = SHA256_ABC
@@ -392,7 +377,37 @@ class UpdateIntegrityTest {
     }
 }
 
-/** 安装包校验结论：缺失 / 匹配 / 不匹配。 */
+class ReleaseNotesFilterTest {
+
+    @Test
+    fun `checksum line appended by CI is removed`() {
+        val raw = "修复若干问题\n\nSHA-256: $SHA256_ABC"
+        assertEquals("修复若干问题", filterReleaseNotes(raw))
+    }
+
+    @Test
+    fun `list style full width colon and bare hash lines are removed`() {
+        val raw = "- SHA-256：$SHA256_ABC\n- $SHA256_ABC"
+        assertEquals("", filterReleaseNotes(raw))
+    }
+
+    @Test
+    fun `bold marker around checksum is still removed`() {
+        assertEquals("正文", filterReleaseNotes("正文\n\n**SHA-256**: $SHA256_ABC"))
+    }
+
+    @Test
+    fun `normal notes are preserved`() {
+        val raw = "1.6.5：修复重置数据后旧播放进度回写\n- 新增字幕选择"
+        assertEquals(raw, filterReleaseNotes(raw))
+    }
+
+    @Test
+    fun `blank input stays empty`() {
+        assertEquals("", filterReleaseNotes("  \n\n"))
+    }
+}
+
 class ApkValidationTest {
 
     private val hex64 = SHA256_ABC
@@ -420,7 +435,6 @@ class ApkValidationTest {
     }
 }
 
-/** 已下载版本是否已安装（用于区分「下载失败」与「安装完成」）。 */
 class DownloadedVersionInstalledTest {
 
     @Test
@@ -444,7 +458,6 @@ class DownloadedVersionInstalledTest {
     }
 }
 
-/** 版本号比较规则。 */
 class UpdateCheckerTest {
 
     @Test
@@ -485,7 +498,6 @@ class UpdateCheckerTest {
     }
 }
 
-/** 文件夹分组键提取：相对路径 / 绝对路径 / 不同存储卷。 */
 class FolderKeyTest {
 
     private val root = "/storage/emulated/0"
@@ -541,7 +553,6 @@ class FolderKeyTest {
 
 }
 
-/** 自然排序：集数按数值、前导零、大小写、超长数字段的确定性。 */
 class NaturalOrderTest {
 
     private val comparator = Comparator<String> { a, b -> naturalCompare(a, b) }
@@ -632,7 +643,6 @@ class NaturalOrderTest {
     }
 }
 
-/** 播放列表排序：同目录相邻、未分组置后、排序幂等。 */
 class PlaylistSortTest {
 
     private fun item(name: String, folder: String = "") =
@@ -695,7 +705,6 @@ class PlaylistSortTest {
     }
 }
 
-/** 扫描元数据合并：文件名 / 时长 / 文件夹刷新，缺失字段不覆盖。 */
 class ScannedMetadataMergeTest {
 
     private fun item(
@@ -770,10 +779,7 @@ class ScannedMetadataMergeTest {
     }
 }
 
-/** 首次加载合并：数据库顺序优先、扫描独有条目追加、按归一化 URI 去重。 */
 class PlaylistLoadMergeTest {
-
-    private fun item(uri: String) = MediaItemData(FakeUri(uri), uri)
 
     @Test
     fun `stored order wins and duplicates are dropped`() {
@@ -802,7 +808,6 @@ class PlaylistLoadMergeTest {
     }
 }
 
-/** 缺失记录状态迁移：首次、累加、恢复与删除优先级。 */
 class MissingRecordsMergeTest {
 
     private val now = 1_700_000_000_000L
@@ -845,7 +850,6 @@ class MissingRecordsMergeTest {
     }
 }
 
-/** 显式 seek 回 0 的判定：只清当前条目从非零位置回到 0 的断点。 */
 class SeekToZeroTest {
 
     @Test
@@ -877,7 +881,6 @@ class SeekToZeroTest {
     }
 }
 
-/** 落盘重试必须在锁内等待，后续写入不能越过失败重试。 */
 class OrderedRetryTest {
 
     @Test
@@ -910,7 +913,6 @@ class OrderedRetryTest {
     }
 }
 
-/** 系统亮度归一化：0..255 映射到 0..1，未知值回退 0.5。 */
 class BrightnessFractionTest {
 
     @Test
@@ -931,7 +933,6 @@ class BrightnessFractionTest {
     }
 }
 
-/** 扫描对账纯函数：新增、删除、元数据刷新、静默模式与排序。 */
 class ScanReconcileTest {
 
     private fun item(
@@ -949,7 +950,7 @@ class ScanReconcileTest {
             item("content://video/2", "第2集.mp4", 10_000, "剧A"),
         )
 
-        val result = reconcilePlaylist(current, scanned, null, emptySet(), silent = false)
+        val result = reconcilePlaylist(current, scanned, null, emptySet())
 
         assertEquals(1, result.addedCount)
         assertEquals(0, result.removedCount)
@@ -961,25 +962,25 @@ class ScanReconcileTest {
     fun `short clips are not imported`() {
         val scanned = listOf(item("content://video/short", "提示音.mp4", 4_999))
 
-        val result = reconcilePlaylist(emptyList(), scanned, null, emptySet(), silent = false)
+        val result = reconcilePlaylist(emptyList(), scanned, null, emptySet())
 
         assertEquals(0, result.addedCount)
         assertTrue(result.playlist.isEmpty())
     }
 
     @Test
-    fun `silent scan never appends files`() {
+    fun `scan appends new files without manual trigger`() {
         val current = listOf(item("content://video/1", "第1集.mp4"))
         val scanned = listOf(
             item("content://video/1", "第1集.mp4"),
             item("content://video/2", "第2集.mp4"),
         )
 
-        val result = reconcilePlaylist(current, scanned, null, emptySet(), silent = true)
+        val result = reconcilePlaylist(current, scanned, null, emptySet())
 
-        assertEquals(0, result.addedCount)
-        assertEquals(1, result.playlist.size)
-        assertEquals("content://video/1", result.playlist.single().uri.toString())
+        assertEquals(1, result.addedCount)
+        assertEquals(2, result.playlist.size)
+        assertTrue(result.playlist.any { it.uri.toString() == "content://video/2" })
     }
 
     @Test
@@ -995,7 +996,6 @@ class ScanReconcileTest {
             scanned,
             null,
             removedUris = setOf("content://video/1"),
-            silent = true,
         )
 
         assertEquals(1, result.removedCount)
@@ -1009,7 +1009,7 @@ class ScanReconcileTest {
             item("content://video/1", "第1集.mp4"),
         )
 
-        val result = reconcilePlaylist(emptyList(), scanned, null, emptySet(), silent = false)
+        val result = reconcilePlaylist(emptyList(), scanned, null, emptySet())
 
         assertEquals(1, result.addedCount)
         assertEquals(1, result.playlist.size)
@@ -1020,7 +1020,7 @@ class ScanReconcileTest {
         val current = listOf(item("content://video/1", "旧名.mp4", 10_000, "剧A"))
         val scanned = listOf(item("content://video/1", "新名.mp4", 20_000, "剧A"))
 
-        val result = reconcilePlaylist(current, scanned, null, emptySet(), silent = true)
+        val result = reconcilePlaylist(current, scanned, null, emptySet())
 
         assertEquals("新名.mp4", result.playlist.single().name)
         assertEquals(20_000L, result.playlist.single().duration)
@@ -1039,7 +1039,7 @@ class ScanReconcileTest {
             item("content://video/2", "A.mp4", 10_000, "Movies"),
         )
 
-        val result = reconcilePlaylist(current, scanned, null, emptySet(), silent = true)
+        val result = reconcilePlaylist(current, scanned, null, emptySet())
 
         assertEquals(listOf("A.mp4", "Z.mp4"), result.playlist.map { it.name })
         assertTrue(result.orderChanged)
@@ -1050,21 +1050,22 @@ class ScanReconcileTest {
         val current = listOf(item("content://video/9", "离线.mp4", 10_000, "剧A"))
         val scanned = listOf(item("content://video/1", "在线.mp4", 10_000, "剧A"))
 
-        val result = reconcilePlaylist(current, scanned, null, emptySet(), silent = true)
+        val result = reconcilePlaylist(current, scanned, null, emptySet())
 
-        assertEquals("离线.mp4", result.playlist.single().name)
-        assertEquals("剧A", result.playlist.single().folderKey)
+        val offline = result.playlist.first { it.uri.toString() == "content://video/9" }
+        assertEquals("离线.mp4", offline.name)
+        assertEquals("剧A", offline.folderKey)
+        // 新扫描到的文件照常导入，不再因为静默扫描而丢弃
+        assertEquals(1, result.addedCount)
+        assertEquals(2, result.playlist.size)
     }
 }
 
-/** 缺失文件删除裁决：权限、卷状态、确认查询与 24 小时宽限期。 */
 class PruneDecisionTest {
 
     private val videoPrefix = "content://media/external/video/media/"
     private val audioPrefix = "content://media/external/audio/media/"
     private val graceMs = 24 * 60 * 60 * 1000L
-
-    private fun item(uri: String) = MediaItemData(FakeUri(uri), uri)
 
     private fun key(uri: String): String = normalizeUri(FakeUri(uri))
 
@@ -1227,7 +1228,6 @@ class PruneDecisionTest {
     }
 }
 
-/** 进度缓存状态机：末尾裁决、删除抑制、快照与失败重试。 */
 class ProgressCacheTest {
 
     private fun newCache(uri: String = "u", position: Long = 10_000, duration: Long = 60_000) =
@@ -1305,7 +1305,7 @@ class ProgressCacheTest {
         val progress = newCache()
         progress.clear("u")
 
-        progress.markFailed(progress.pendingRemovals())
+        progress.markFailed()
 
         assertEquals(setOf("u"), progress.pendingRemovals())
     }
@@ -1369,7 +1369,6 @@ class ProgressCacheTest {
     }
 }
 
-/** 扫描行解析与音频类型过滤。 */
 class MediaScanFilterTest {
 
     @Test
@@ -1416,7 +1415,6 @@ class MediaScanFilterTest {
     }
 }
 
-/** 队列项按 URI 定位：覆盖列表与队列错位时的删除路径。 */
 class MediaQueueLookupTest {
 
     @Test
@@ -1448,7 +1446,6 @@ class MediaQueueLookupTest {
     }
 }
 
-/** 数据库自愈判定：只对明确的损坏/迁移异常清库。 */
 class DatabaseSelfHealTest {
 
     @Test
@@ -1499,7 +1496,6 @@ class DatabaseSelfHealTest {
     }
 }
 
-/** 播放队列差分计划：验证增删移换能按顺序把旧队列变成目标队列。 */
 class QueueDiffTest {
 
     private fun snap(uri: String, title: String = uri) = QueueItemSnapshot(uri, title)

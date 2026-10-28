@@ -19,16 +19,22 @@
         android:orientation="horizontal"
         android:gravity="center_vertical">
 
-        <!-- 同一位置叠放「序号」与「正在播放」图标，播放时显示图标隐藏序号 -->
+        <!-- 同一位置叠放「序号」与「正在播放」图标，播放时显示图标隐藏序号。
+             宽度随文字增长，1000+ 条目的序号不会被裁剪 -->
         <FrameLayout
-            android:layout_width="24dp"
-            android:layout_height="24dp">
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:minWidth="28dp"
+            android:minHeight="24dp">
 
             <TextView
                 android:id="@+id/tv_index"
-                android:layout_width="match_parent"
-                android:layout_height="match_parent"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_gravity="center"
                 android:gravity="center"
+                android:minWidth="28dp"
+                android:minHeight="24dp"
                 android:textSize="13sp"
                 android:fontFamily="sans-serif-medium"
                 android:textColor="@color/text_secondary" />
@@ -64,10 +70,11 @@
 
         <ImageView
             android:id="@+id/btn_delete"
-            android:layout_width="32dp"
-            android:layout_height="32dp"
-            android:layout_marginStart="6dp"
-            android:padding="7dp"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:layout_marginStart="2dp"
+            android:padding="12dp"
+            android:scaleType="fitCenter"
             android:src="@drawable/ic_delete"
             android:background="?selectableItemBackgroundBorderless"
             android:contentDescription="@string/delete" />
@@ -81,7 +88,7 @@
         android:orientation="horizontal"
         android:gravity="center_vertical"
         android:layout_marginTop="9dp"
-        android:layout_marginStart="34dp">
+        android:layout_marginStart="38dp">
 
         <ProgressBar
             android:id="@+id/pb_item"

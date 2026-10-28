@@ -1,7 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- FileProvider 只暴露已校验更新包所在的私有目录 -->
+<!-- FileProvider 只暴露已校验更新包所在的目录 -->
 <paths>
+    <!-- 新版本：下载即落到应用专属外部目录，校验与安装共用这一份 -->
+    <external-files-path
+        name="updates_external"
+        path="updates/" />
+    <!-- 兼容旧版本留在内部 filesDir 的已校验副本 -->
     <files-path
-        name="updates"
+        name="updates_internal"
         path="updates/" />
 </paths>

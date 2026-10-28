@@ -30,6 +30,8 @@
     
     <string name="delete">删除</string>
     
+    <string name="undo">撤销</string>
+
     <string name="playing_indicator">正在播放</string>
     
     <string name="playing_progress">播放中 %1$s</string>
@@ -53,6 +55,7 @@
     <string name="toast_scan_reordered">已按文件夹整理</string>
     <string name="toast_scan_removed">删除 %1$d 个已消失文件</string>
     <string name="toast_scan_added">添加 %1$d 个文件</string>
+    <string name="toast_scan_added_silent">新增 %1$d 项</string>
     <string name="toast_scan_updated">已更新文件信息</string>
 
     <string name="toast_file_unreadable">无法读取「%1$s」</string>
@@ -69,6 +72,9 @@
     <string name="track_subtitle">字幕</string>
     <string name="track_select_audio_title">选择音轨</string>
     <string name="track_select_subtitle_title">选择字幕</string>
+    <string name="track_auto">自动</string>
+    <string name="track_off">关闭字幕</string>
+    <string name="track_fallback">轨道 %1$d</string>
     <string name="toast_player_not_connected">播放器未连接</string>
     <string name="toast_no_tracks">当前视频没有可选的轨道</string>
     <string name="speed_dialog_title">倍速播放</string>

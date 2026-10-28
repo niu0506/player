@@ -43,15 +43,33 @@
         android:supportsRtl="false"
         android:theme="@style/Theme.Player">
 
-        <!-- 唯一 Activity：播放器界面；支持画中画，自行处理配置变化避免旋转重建 -->
+        <!-- 唯一 Activity：播放器界面；支持画中画，自行处理配置变化避免旋转重建。
+             singleTask 让文件管理器的「用影音盒打开」复用当前实例，走 onNewIntent 入队播放 -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
+            android:launchMode="singleTask"
             android:supportsPictureInPicture="true"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            <!-- 文件管理器 / 其他应用「打开方式」：视频与音频 -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="video/*" />
+                <data android:mimeType="audio/*" />
+            </intent-filter>
+
+            <!-- 分享菜单：直接分享音视频文件 -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="video/*" />
+                <data android:mimeType="audio/*" />
             </intent-filter>
         </activity>
 

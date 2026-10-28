@@ -9,15 +9,17 @@
         <item name="android:shadowRadius">3</item>
     </style>
 
-    <!-- 顶部工具栏操作按钮：等宽平分、单行不换行，保证窄屏下文字完整可见 -->
+    <!-- 顶部工具栏操作按钮：等宽平分、单行不换行；高度随字体缩放，触控目标不小于 48dp -->
     <style name="ToolbarActionButton">
         <item name="android:layout_width">0dp</item>
         <item name="android:layout_weight">1</item>
-        <item name="android:layout_height">38dp</item>
+        <item name="android:layout_height">wrap_content</item>
         <item name="android:minWidth">0dp</item>
-        <item name="android:minHeight">0dp</item>
+        <item name="android:minHeight">48dp</item>
         <item name="android:paddingStart">4dp</item>
         <item name="android:paddingEnd">4dp</item>
+        <item name="android:paddingTop">12dp</item>
+        <item name="android:paddingBottom">12dp</item>
         <item name="android:insetTop">0dp</item>
         <item name="android:insetBottom">0dp</item>
         <item name="android:stateListAnimator">@null</item>

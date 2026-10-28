@@ -1,9 +1,20 @@
+import groovy.json.JsonSlurper
 import java.util.Properties
 
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.ksp)
 }
+
+// version.json 是版本号与更新说明的唯一来源（CI 校验 tag / notes / versionName 一致）
+val versionInfo = JsonSlurper().parseText(
+    rootProject.file("version.json").readText()
+) as Map<*, *>
+val appVersionCode = (versionInfo["versionCode"] as? Number)?.toInt()
+    ?: error("version.json 缺少有效的 versionCode")
+val appVersionName = (versionInfo["versionName"] as? String)?.takeIf { it.isNotBlank() }
+    ?: error("version.json 缺少有效的 versionName")
+require(appVersionCode > 0) { "version.json 的 versionCode 必须大于 0" }
 
 // 本地签名配置（keystore.properties 已被 .gitignore 忽略，CI 经环境变量注入）。
 val keystoreProperties = Properties().apply {
@@ -24,8 +35,8 @@ android {
         minSdk = 24
         // 目标最新的稳定版本；compileSdk 37 亦满足 media3 1.11 的传递依赖要求
         targetSdk = 37
-        versionCode = 64
-        versionName = "1.6.5"
+        versionCode = appVersionCode
+        versionName = appVersionName
     }
 
     signingConfigs {

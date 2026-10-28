@@ -28,14 +28,29 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v6
 
-      - name: Validate tag matches versionName
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Validate version.json
         run: |
-          VERSION_NAME=$(sed -n 's/^[[:space:]]*versionName[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' app/build.gradle.kts | head -n 1)
-          TAG_VERSION="${GITHUB_REF_NAME#v}"
-          if [ "$TAG_VERSION" != "$VERSION_NAME" ]; then
-            echo "::error::tag ${GITHUB_REF_NAME} 与 versionName ${VERSION_NAME} 不一致"
+          VERSION_NAME=$(jq -r '.versionName // empty' version.json)
+          VERSION_CODE=$(jq -r '.versionCode // empty' version.json)
+          NOTES=$(jq -r '.notes // empty' version.json)
+          if [ -z "$VERSION_NAME" ] || ! [[ "$VERSION_CODE" =~ ^[0-9]+$ ]] || [ "$VERSION_CODE" -le 0 ]; then
+            echo "::error::version.json 需要有效的 versionName 与 versionCode"
             exit 1
+          fi
+          if [ -z "$NOTES" ]; then
+            echo "::error::version.json 缺少更新说明 notes"
+            exit 1
+          fi
+          if echo "$NOTES" | grep -Eiq 'sha-?256'; then
+            echo "::error::version.json 的 notes 不应包含 SHA-256（校验和由 .sha256 附件提供）"
+            exit 1
+          fi
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            TAG_VERSION="${GITHUB_REF_NAME#v}"
+            if [ "$TAG_VERSION" != "$VERSION_NAME" ]; then
+              echo "::error::tag ${GITHUB_REF_NAME} 与 version.json 的 versionName ${VERSION_NAME} 不一致"
+              exit 1
+            fi
           fi
 
       - name: Decode keystore
@@ -85,7 +100,7 @@ jobs:
 
       - name: Rename APK
         run: |
-          VERSION=$(sed -n 's/^[[:space:]]*versionName[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' app/build.gradle.kts | head -n 1)
+          VERSION=$(jq -r '.versionName' version.json)
           APK=$(find app/build/outputs/apk/release -maxdepth 1 -name '*.apk' | head -n 1)
           if [[ "$GITHUB_REF" == refs/tags/v* && "$APK" == *unsigned* ]]; then
             echo "::error::tag 构建产出了未签名 APK"
@@ -93,6 +108,20 @@ jobs:
           fi
           cp "$APK" "player-v${VERSION}-release.apk"
           echo "APK_NAME=player-v${VERSION}-release.apk" >> "$GITHUB_ENV"
+
+      - name: Verify APK versionName
+        run: |
+          AAPT2=$(find "${ANDROID_HOME:-$ANDROID_SDK_ROOT}/build-tools" -type f -name aapt2 | sort -V | tail -n 1)
+          test -n "$AAPT2" || {
+            echo "::error::找不到 aapt2"
+            exit 1
+          }
+          EXPECTED=$(jq -r '.versionName' version.json)
+          ACTUAL=$("$AAPT2" dump badging "$APK_NAME" | sed -n "s/.*versionName='\([^']*\)'.*/\1/p")
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "::error::APK versionName ${ACTUAL} 与 version.json ${EXPECTED} 不一致"
+            exit 1
+          fi
 
       - name: Verify APK signature
         if: startsWith(github.ref, 'refs/tags/v')
@@ -135,9 +164,8 @@ jobs:
 
       - name: Extract release notes
         run: |
+          # 更新说明只取结构化 notes；校验和放在 .sha256 附件里，不写进展示正文
           jq -r '.notes' version.json > release-notes.txt
-          SHA=$(cat apk/player-*-release.apk.sha256)
-          printf '\n\nSHA-256: %s\n' "$SHA" >> release-notes.txt
 
       - name: Create Release
         uses: softprops/action-gh-release@v3
