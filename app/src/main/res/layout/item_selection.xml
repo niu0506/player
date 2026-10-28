@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 
-<!-- 底部面板的单选行：整行可点击，高度不小于 48dp 且随字体缩放；选中标记用右侧 compound drawable -->
+<!-- 选择面板的单选行：整行可点击，高度不小于 48dp 且随字体缩放；选中标记用右侧 compound drawable -->
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"

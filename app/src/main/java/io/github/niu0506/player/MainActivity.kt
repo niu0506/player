@@ -440,11 +440,12 @@ class MainActivity : AppCompatActivity() {
 
     private fun showSpeedSelection() {
         val ctrl = controller ?: return
-        showSelectionSheet(
+        showSelectionPanel(
             activity = this,
             title = getString(R.string.speed_dialog_title),
             options = speedLevels.map(::formatSpeed),
             selectedIndex = speedsIndex(ctrl.playbackParameters.speed),
+            immersive = fullscreenPip.isFullscreen && !fullscreenPip.isInPipMode,
         ) { which ->
             controller?.setPlaybackSpeed(speedLevels[which])
         }
@@ -455,7 +456,7 @@ class MainActivity : AppCompatActivity() {
         return if (speed % 1f == 0f) "${speed.toInt()}x" else "${speed}x"
     }
 
-    /** 底部面板中的一项：自动 / 关闭 / 具体轨道。 */
+    /** 选择面板中的一项：自动 / 关闭 / 具体轨道。 */
     private data class TrackSheetOption(
         val label: String,
         val override: TrackSelectionOverride? = null,
@@ -507,11 +508,12 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        showSelectionSheet(
+        showSelectionPanel(
             activity = this,
             title = getString(titleRes),
             options = options.map { it.label },
             selectedIndex = selectedIndex,
+            immersive = fullscreenPip.isFullscreen && !fullscreenPip.isInPipMode,
         ) { index ->
             val option = options[index]
             val newParams = params.buildUpon().apply {

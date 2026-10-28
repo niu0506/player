@@ -3,11 +3,13 @@ package io.github.niu0506.player
 
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.app.Dialog
 import android.app.PictureInPictureParams
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ActivityInfo
+import android.content.res.Configuration
 import android.graphics.Rect
 import android.media.AudioManager
 import android.os.BatteryManager
@@ -16,18 +18,22 @@ import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
 import android.text.format.DateFormat
+import android.util.DisplayMetrics
 import android.util.Rational
 import android.view.GestureDetector
+import android.view.Gravity
 import android.view.LayoutInflater
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowManager
 import android.widget.TextView
 import android.widget.Toast
 import androidx.annotation.OptIn
 import androidx.annotation.RequiresApi
 import androidx.annotation.StringRes
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.util.Consumer
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -40,12 +46,11 @@ import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 import androidx.recyclerview.widget.DiffUtil
 import androidx.recyclerview.widget.RecyclerView
-import com.google.android.material.bottomsheet.BottomSheetDialog
 import com.google.android.material.snackbar.Snackbar
 import io.github.niu0506.player.databinding.ActivityMainBinding
+import io.github.niu0506.player.databinding.DialogSelectionBinding
 import io.github.niu0506.player.databinding.ItemMediaBinding
 import io.github.niu0506.player.databinding.ItemSelectionBinding
-import io.github.niu0506.player.databinding.SheetSelectionBinding
 import java.util.Date
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -56,6 +61,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlin.math.abs
 import kotlin.math.max
+import kotlin.math.min
 import androidx.core.content.edit
 
 /** 统一的短提示入口（Material Snackbar）。 */
@@ -80,24 +86,48 @@ internal fun Activity.snackMessage(message: CharSequence, long: Boolean = false)
     Snackbar.make(root, message, if (long) Snackbar.LENGTH_LONG else Snackbar.LENGTH_SHORT).show()
 }
 
+/** 居中面板宽度：左右各留 24dp，宽屏（横屏 / 平板）上限 480dp。 */
+private fun selectionPanelWidth(metrics: DisplayMetrics): Int = min(
+    metrics.widthPixels - (48 * metrics.density).toInt(),
+    (480 * metrics.density).toInt(),
+)
+
 /**
- * 单选底部面板：倍速 / 音轨 / 字幕共用，高亮当前选中项。
+ * 倍速 / 音轨 / 字幕共用的居中面板：圆角卡片 + 单选列表，高亮当前选中项。
  * 每次打开都重建选项，避免轨道在播放过程中变化导致显示过期状态。
+ *
+ * @param immersive 全屏播放中打开时为 true，面板窗口保持沉浸，
+ *   避免系统栏重新出现把画面顶动，也让卡片在可视区域里真正居中。
  */
-internal fun showSelectionSheet(
+internal fun showSelectionPanel(
     activity: AppCompatActivity,
     title: String,
     options: List<String>,
     selectedIndex: Int,
+    immersive: Boolean,
     onSelected: (Int) -> Unit,
 ) {
     if (options.isEmpty()) return
-    val sheet = BottomSheetDialog(activity)
-    val binding = SheetSelectionBinding.inflate(activity.layoutInflater)
-    binding.tvSheetTitle.text = title
+    val density = activity.resources.displayMetrics.density
+    val panelWidth = selectionPanelWidth(activity.resources.displayMetrics)
+
+    val dialog = Dialog(activity, R.style.Theme_Player_SelectionDialog)
+    // 内容按对话框主题创建，卡片背景才不会叠加 Activity 的 elevation 着色
+    val panelInflater = LayoutInflater.from(dialog.context)
+    val binding = DialogSelectionBinding.inflate(panelInflater)
+    binding.tvPanelTitle.text = title
+    // 高度必须显式 wrap_content：卡片按内容收拢后窗口才能在屏幕中间悬浮
+    dialog.setContentView(
+        binding.root,
+        ViewGroup.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        ),
+    )
+
     options.forEachIndexed { index, label ->
         val row = ItemSelectionBinding.inflate(
-            activity.layoutInflater, binding.optionsContainer, false
+            panelInflater, binding.optionsContainer, false
         )
         val selected = index == selectedIndex
         row.tvOption.text = label
@@ -110,13 +140,60 @@ internal fun showSelectionSheet(
         )
         row.root.isSelected = selected
         row.root.setOnClickListener {
-            sheet.dismiss()
+            dialog.dismiss()
             onSelected(index)
         }
         binding.optionsContainer.addView(row.root)
     }
-    sheet.setContentView(binding.root)
-    sheet.show()
+
+    // 量出列表的自然高度；旋转 / 分屏时只需按新的屏幕尺寸重算上限
+    binding.optionsContainer.measure(
+        View.MeasureSpec.makeMeasureSpec(panelWidth - (24 * density).toInt(), View.MeasureSpec.AT_MOST),
+        View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED),
+    )
+    val listContentHeight = binding.optionsContainer.measuredHeight
+
+    dialog.window?.apply {
+        setGravity(Gravity.CENTER)
+        // 与 Activity 的 enableEdgeToEdge 保持一致：横屏刘海下不让窗口被整体挤到一侧
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            attributes = attributes.apply {
+                layoutInDisplayCutoutMode =
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                        WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+                    } else {
+                        WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                    }
+            }
+        }
+        if (immersive) {
+            WindowInsetsControllerCompat(this, decorView).apply {
+                hide(WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout())
+                systemBarsBehavior =
+                    WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            }
+        }
+    }
+
+    // 选项过多时在卡片内部滚动，让卡片始终完整居中
+    fun applyPanelWindow() {
+        val metrics = activity.resources.displayMetrics
+        binding.optionsScroll.layoutParams = binding.optionsScroll.layoutParams.apply {
+            height = listContentHeight.coerceAtMost((metrics.heightPixels * 0.6f).toInt())
+        }
+        dialog.window?.setLayout(
+            selectionPanelWidth(metrics),
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        )
+    }
+    applyPanelWindow()
+    // 面板打开期间旋转 / 分屏：按新尺寸重新布局，避免用旧宽度顶出屏幕
+    val configListener = Consumer<Configuration> { applyPanelWindow() }
+    activity.addOnConfigurationChangedListener(configListener)
+    dialog.setOnDismissListener {
+        activity.removeOnConfigurationChangedListener(configListener)
+    }
+    dialog.show()
 }
 
 internal fun VideoSize?.hasVideo(): Boolean =

@@ -9,4 +9,14 @@
         <!-- 系统栏颜色由 enableEdgeToEdge 统一管理，避免 Android 15+ 上的弃用属性 -->
         <item name="android:windowBackground">@color/bg_dark</item>
     </style>
+
+    <!-- 倍速 / 音轨 / 字幕的居中面板：窗口只负责遮罩与定位，背景和圆角由卡片提供 -->
+    <style name="Theme.Player.SelectionDialog" parent="Theme.Material3.Dark.Dialog">
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:windowIsFloating">true</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:backgroundDimAmount">0.6</item>
+        <!-- 卡片保持 @color/surface_1 纯色，不叠加 M3 的 elevation 着色 -->
+        <item name="elevationOverlayEnabled">false</item>
+    </style>
 </resources>
