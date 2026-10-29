@@ -419,7 +419,6 @@ class MediaStoreScanner(private val context: Context) {
         isRecording = cursor.getIntOrZero(MediaStore.Audio.Media.IS_RECORDING),
     )
 
-    /** 读取整型列；列缺失或为 NULL 返回 0。 */
     private fun Cursor.getIntOrZero(column: String): Int {
         val index = getColumnIndex(column)
         return if (index >= 0 && !isNull(index)) getInt(index) else 0

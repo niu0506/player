@@ -100,7 +100,6 @@ class PlayerService : MediaSessionService() {
                     newPosition.positionMs
                 )
             ) {
-                // 拖回开头：清除旧断点
                 this@PlayerService.player
                     ?.currentMediaItem
                     ?.localConfiguration
@@ -439,7 +438,6 @@ internal class ProgressCache {
         }
     }
 
-    /** 解除已离开队列的抑制项。 */
     fun retainPending(present: Set<String>) {
         pendingDrops.retainAll(present)
     }

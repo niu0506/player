@@ -69,7 +69,6 @@ internal fun Activity.snack(@StringRes resId: Int, vararg args: Any?) {
     snackMessage(getString(resId, *args))
 }
 
-/** 统一的长提示入口。 */
 internal fun Activity.snackLong(@StringRes resId: Int, vararg args: Any?) {
     snackMessage(getString(resId, *args), long = true)
 }
@@ -672,7 +671,6 @@ class GestureController(
         }
     }
 
-    /** 手势结束：seek 落到目标位置，亮度才持久化。 */
     private fun endGesture() {
         when (gestureMode) {
             Gesture.SEEK -> controllerProvider()?.seekTo(seekTargetPosition)
@@ -691,7 +689,6 @@ class GestureController(
         return systemBrightnessToFraction(systemValue)
     }
 
-    /** 应用亮度（2%~100%）。 */
     private fun applyBrightness(value: Float, persist: Boolean) {
         val lp = activity.window.attributes
         lp.screenBrightness = value.coerceIn(0.02f, 1f)
@@ -822,7 +819,6 @@ class MediaListAdapter(
         holder.binding.tvName.text = item.name
         bindDuration(holder, item)
         val active = isItemActive(item)
-        // 播放中隐藏序号、显示图标并高亮名称
         holder.binding.imgPlaying.visibility = if (active) View.VISIBLE else View.GONE
         holder.binding.tvIndex.visibility = if (active) View.GONE else View.VISIBLE
         holder.binding.tvName.setTextColor(

@@ -69,7 +69,6 @@ class MainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
     private lateinit var adapter: MediaListAdapter
 
-    /** 当前展示的播放列表，保存时写回仓库。 */
     private val playlist = mutableListOf<MediaItemData>()
 
     private var controllerFuture: ListenableFuture<MediaController>? = null
@@ -91,7 +90,6 @@ class MainActivity : AppCompatActivity() {
 
         const val MEDIA_CHANGE_DEBOUNCE_MS = 800L
 
-        /** 静默扫描新增提示的停留时间。 */
         const val SCAN_NOTICE_HIDE_MS = 4_000L
 
         const val MENU_CHECK_UPDATE = 1
@@ -123,7 +121,6 @@ class MainActivity : AppCompatActivity() {
         ActivityResultContracts.RequestMultiplePermissions()
     ) { _ ->
         if (hasStoragePermission()) {
-            // 授权成功后直接首次扫描
             startScan(silent = false)
         } else {
             snack(R.string.toast_permission_denied)
@@ -183,7 +180,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 撤销窗口结束：清理该条目已保存的播放进度。 */
     private fun commitPendingDeletion() {
         val pending = pendingDeletion ?: return
         pendingDeletion = null
@@ -277,7 +273,6 @@ class MainActivity : AppCompatActivity() {
         }
 
         override fun onPlaybackSuppressionReasonChanged(playbackSuppressionReason: Int) {
-            // 音频焦点被暂时抢占
             if (playbackSuppressionReason == Player.PLAYBACK_SUPPRESSION_REASON_TRANSIENT_AUDIO_FOCUS_LOSS) {
                 snack(R.string.toast_playback_interrupted)
             }
@@ -324,7 +319,6 @@ class MainActivity : AppCompatActivity() {
     /** 差分更新队列，避免整体重建导致断音；必要时才整体重建。 */
     private fun rebuildQueueIfNeeded(ctrl: MediaController) {
         if (queueMatchesPlaylist(ctrl)) return
-        // 列表清空时也要显式清空队列
         if (playlist.isEmpty()) {
             ctrl.setMediaItems(emptyList())
             return
@@ -377,7 +371,6 @@ class MainActivity : AppCompatActivity() {
                     is QueueEdit.Remove -> ctrl.removeMediaItem(edit.index)
                     is QueueEdit.Move -> ctrl.moveMediaItem(edit.fromIndex, edit.toIndex)
                     is QueueEdit.Replace -> ctrl.replaceMediaItem(edit.index, buildMediaItem(playlist[edit.index]))
-                    // Add 已在上面批量处理，这里仅为穷尽 when
                     is QueueEdit.Add -> error("队列插入已在上面的合并分支处理")
                 }
                 cursor++
@@ -423,7 +416,6 @@ class MainActivity : AppCompatActivity() {
         binding.playerView.findViewById<View>(R.id.btn_subtitle)?.setOnClickListener {
             showTrackSelection(C.TRACK_TYPE_TEXT, R.string.track_select_subtitle_title)
         }
-        // 全屏左上角返回键
         binding.playerView.findViewById<View>(R.id.btn_fullscreen_back)?.setOnClickListener {
             fullscreenPip.setFullscreen(false)
         }
@@ -451,7 +443,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 整数倍速不带小数。 */
     private fun formatSpeed(speed: Float): String {
         return if (speed % 1f == 0f) "${speed.toInt()}x" else "${speed}x"
     }
@@ -526,7 +517,6 @@ class MainActivity : AppCompatActivity() {
                         setTrackTypeDisabled(trackType, false)
                         setOverrideForType(option.override)
                     }
-                    // 自动：清除覆盖并重新启用该类型
                     else -> {
                         clearOverridesOfType(trackType)
                         setTrackTypeDisabled(trackType, false)
@@ -622,7 +612,6 @@ class MainActivity : AppCompatActivity() {
             }
             return
         }
-        // 清理已删除条目的进度
         PlayerService.dropProgress(prune.removedUris)
         val result = reconcilePlaylist(
             current = playlist,
@@ -836,7 +825,6 @@ class MainActivity : AppCompatActivity() {
         // 仅在界面可见时收集提示事件；文件缺失登记已在 PlayerService
         lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
-                // 监听仓库写失败并限频提示
                 launch {
                     var lastShownMs = 0L
                     PlayerRepository.writeFailures.collect {
@@ -847,7 +835,6 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
 
-                // 按「是否已跳过 / 是否全部失败」给出不同提示
                 launch {
                     PlayerService.errorEvents.collect { event ->
                         val isFileGone =
@@ -1100,7 +1087,6 @@ class MainActivity : AppCompatActivity() {
 
     override fun onPause() {
         super.onPause()
-        // 切后台先把当前位置落盘
         PlayerService.flushCurrentPosition()
     }
 
