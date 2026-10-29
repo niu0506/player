@@ -12,7 +12,6 @@ import android.os.Environment
 import android.provider.BaseColumns
 import android.provider.MediaStore
 import android.util.Log
-import android.util.LruCache
 import androidx.core.content.ContextCompat
 import androidx.core.net.toUri
 import androidx.room.ColumnInfo
@@ -309,19 +308,14 @@ internal fun decidePruneCandidates(
     return PruneCandidates(missingNow, observedNow, removedUris)
 }
 
-private val timeFormatCache = LruCache<Long, String>(512)
-
 /** 格式化为 `mm:ss` 或 `h:mm:ss`。 */
 fun formatTime(ms: Long): String {
-    timeFormatCache.get(ms)?.let { return it }
     val totalSec = ms / 1000
     val h = totalSec / 3600
     val m = totalSec % 3600 / 60
     val s = totalSec % 60
-    val result = if (h > 0) String.format(Locale.US, "%d:%02d:%02d", h, m, s)
+    return if (h > 0) String.format(Locale.US, "%d:%02d:%02d", h, m, s)
     else String.format(Locale.US, "%02d:%02d", m, s)
-    timeFormatCache.put(ms, result)
-    return result
 }
 
 /** MediaStore 扫描器：API 29+ 用 RELATIVE_PATH 分组，低版本用 DATA 父目录。 */

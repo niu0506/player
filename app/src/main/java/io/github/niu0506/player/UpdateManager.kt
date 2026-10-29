@@ -8,8 +8,6 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.os.Build
-import android.os.Environment
-import android.provider.MediaStore
 import android.provider.Settings
 import android.util.Log
 import androidx.annotation.StringRes
@@ -79,7 +77,7 @@ object UpdateChecker {
             Release(
                 version = version,
                 apkUrl = apkUrl,
-                notes = filterReleaseNotes(obj.text("body")),
+                notes = obj.text("body").trim(),
                 sha256 = parseSha256Digest(asset?.text("digest")),
             )
         } catch (_: Exception) {
@@ -124,22 +122,6 @@ internal fun parseSha256Digest(raw: String?): String? {
     return hex.takeIf { it.length == 64 && it.all { c -> c in '0'..'9' || c in 'a'..'f' } }
 }
 
-/**
- * 过滤 CI 写入 release body 的校验和行（旧版本发布记录里仍有）。
- * 兼容 `SHA-256: <hex>`、`- SHA256：<hex>` 与单独的 64 位 hex 行。
- */
-internal fun filterReleaseNotes(raw: String): String {
-    val checksumLine = Regex("^[`*_\\-\\s]*sha-?256[`*_\\s]*[:：].*$", RegexOption.IGNORE_CASE)
-    val bareHashLine = Regex("^[`*_\\-\\s]*[0-9a-fA-F]{64}[`*_\\s]*$")
-    return raw.lineSequence()
-        .filterNot { line ->
-            val trimmed = line.trim()
-            checksumLine.matches(trimmed) || bareHashLine.matches(trimmed)
-        }
-        .joinToString("\n")
-        .trim()
-}
-
 internal fun toHex(bytes: ByteArray): String {
     val sb = StringBuilder(bytes.size * 2)
     for (b in bytes) {
@@ -150,13 +132,6 @@ internal fun toHex(bytes: ByteArray): String {
 }
 
 private const val HEX_DIGITS = "0123456789abcdef"
-
-private inline fun ignoreFailure(block: () -> Unit) {
-    try {
-        block()
-    } catch (_: Exception) {
-    }
-}
 
 internal enum class ApkValidation {
     OK,
@@ -202,30 +177,7 @@ class UpdateManager(private val activity: AppCompatActivity) {
         /** 应用专属外部目录：DownloadManager 可直接写入，校验与安装都用这一份。 */
         private fun updateDir(context: Context): File? = context.getExternalFilesDir(VERIFIED_APK_DIR)
 
-        fun cleanupUpdateApks(context: Context) {
-            // 兼容旧版本：可能曾在公共「下载」目录留下安装包
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                ignoreFailure {
-                    context.contentResolver.delete(
-                        MediaStore.Downloads.EXTERNAL_CONTENT_URI,
-                        "${MediaStore.MediaColumns.DISPLAY_NAME} LIKE ?",
-                        arrayOf("$APK_NAME_PREFIX%$APK_NAME_SUFFIX")
-                    )
-                }
-            } else {
-                ignoreFailure {
-                    @Suppress("DEPRECATION")
-                    val downloads =
-                        Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-                    downloads.listFiles()
-                        ?.filter {
-                            it.name.startsWith(APK_NAME_PREFIX) && it.name.endsWith(APK_NAME_SUFFIX)
-                        }
-                        ?.forEach { it.delete() }
-                }
-            }
-            clearUpdateApkDirs(context)
-        }
+        fun cleanupUpdateApks(context: Context) = clearUpdateApkDirs(context)
 
         /** 清理下载目录；旧版本校验后的副本在内部 filesDir，一并删除。 */
         private fun clearUpdateApkDirs(context: Context) {
@@ -315,7 +267,10 @@ class UpdateManager(private val activity: AppCompatActivity) {
     }
 
     fun unregisterReceivers() {
-        ignoreFailure { activity.unregisterReceiver(downloadCompleteReceiver) }
+        try {
+            activity.unregisterReceiver(downloadCompleteReceiver)
+        } catch (_: Exception) {
+        }
     }
 
     fun resumePendingDownload() {

@@ -1158,13 +1158,13 @@ internal data class QueueItemSnapshot(val uri: String, val title: String?)
 
 /** 队列差异操作；索引均为执行该操作时的实时下标。 */
 internal sealed interface QueueEdit {
-    data class Add(val index: Int, val uri: String) : QueueEdit
+    data class Add(val index: Int) : QueueEdit
 
-    data class Remove(val index: Int, val uri: String) : QueueEdit
+    data class Remove(val index: Int) : QueueEdit
 
-    data class Move(val fromIndex: Int, val toIndex: Int, val uri: String) : QueueEdit
+    data class Move(val fromIndex: Int, val toIndex: Int) : QueueEdit
 
-    data class Replace(val index: Int, val uri: String) : QueueEdit
+    data class Replace(val index: Int) : QueueEdit
 }
 
 /** [requiresFullReset] 为 true 时应整体重建。 */
@@ -1195,8 +1195,8 @@ internal fun planQueueDiff(
     // 从后往前删除目标中不存在的项，避免下标漂移
     for (index in working.indices.reversed()) {
         if (working[index].uri !in targetUriSet) {
-            val removed = working.removeAt(index)
-            edits += QueueEdit.Remove(index, removed.uri)
+            working.removeAt(index)
+            edits += QueueEdit.Remove(index)
         }
     }
 
@@ -1209,17 +1209,17 @@ internal fun planQueueDiff(
         if (found != null) {
             val moved = working.removeAt(found)
             working.add(index, moved)
-            edits += QueueEdit.Move(found, index, moved.uri)
+            edits += QueueEdit.Move(found, index)
         } else {
             working.add(index, target[index])
-            edits += QueueEdit.Add(index, target[index].uri)
+            edits += QueueEdit.Add(index)
         }
     }
 
     while (working.size > target.size) {
         val index = working.lastIndex
-        val removed = working.removeAt(index)
-        edits += QueueEdit.Remove(index, removed.uri)
+        working.removeAt(index)
+        edits += QueueEdit.Remove(index)
     }
 
     if (working.map { it.uri } != targetUris) {
@@ -1231,7 +1231,7 @@ internal fun planQueueDiff(
     for (index in target.indices) {
         if (working[index].title != target[index].title) {
             working[index] = target[index]
-            edits += QueueEdit.Replace(index, target[index].uri)
+            edits += QueueEdit.Replace(index)
         }
     }
 

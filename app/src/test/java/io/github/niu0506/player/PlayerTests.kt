@@ -377,37 +377,6 @@ class UpdateIntegrityTest {
     }
 }
 
-class ReleaseNotesFilterTest {
-
-    @Test
-    fun `checksum line appended by CI is removed`() {
-        val raw = "修复若干问题\n\nSHA-256: $SHA256_ABC"
-        assertEquals("修复若干问题", filterReleaseNotes(raw))
-    }
-
-    @Test
-    fun `list style full width colon and bare hash lines are removed`() {
-        val raw = "- SHA-256：$SHA256_ABC\n- $SHA256_ABC"
-        assertEquals("", filterReleaseNotes(raw))
-    }
-
-    @Test
-    fun `bold marker around checksum is still removed`() {
-        assertEquals("正文", filterReleaseNotes("正文\n\n**SHA-256**: $SHA256_ABC"))
-    }
-
-    @Test
-    fun `normal notes are preserved`() {
-        val raw = "1.6.5：修复重置数据后旧播放进度回写\n- 新增字幕选择"
-        assertEquals(raw, filterReleaseNotes(raw))
-    }
-
-    @Test
-    fun `blank input stays empty`() {
-        assertEquals("", filterReleaseNotes("  \n\n"))
-    }
-}
-
 class ApkValidationTest {
 
     private val hex64 = SHA256_ABC
@@ -1508,22 +1477,10 @@ class QueueDiffTest {
         val working = current.toMutableList()
         for (edit in edits) {
             when (edit) {
-                is QueueEdit.Add -> {
-                    assertEquals(edit.uri, target[edit.index].uri)
-                    working.add(edit.index, target[edit.index])
-                }
-                is QueueEdit.Remove -> {
-                    assertEquals(edit.uri, working.removeAt(edit.index).uri)
-                }
-                is QueueEdit.Move -> {
-                    val moved = working.removeAt(edit.fromIndex)
-                    assertEquals(edit.uri, moved.uri)
-                    working.add(edit.toIndex, moved)
-                }
-                is QueueEdit.Replace -> {
-                    assertEquals(edit.uri, target[edit.index].uri)
-                    working[edit.index] = target[edit.index]
-                }
+                is QueueEdit.Add -> working.add(edit.index, target[edit.index])
+                is QueueEdit.Remove -> working.removeAt(edit.index)
+                is QueueEdit.Move -> working.add(edit.toIndex, working.removeAt(edit.fromIndex))
+                is QueueEdit.Replace -> working[edit.index] = target[edit.index]
             }
         }
         return working
@@ -1584,7 +1541,7 @@ class QueueDiffTest {
         )
 
         assertFalse(plan.requiresFullReset)
-        assertEquals(listOf(QueueEdit.Add(0, "x")), plan.edits)
+        assertEquals(listOf(QueueEdit.Add(0)), plan.edits)
     }
 
     @Test
@@ -1596,7 +1553,7 @@ class QueueDiffTest {
         )
 
         assertFalse(plan.requiresFullReset)
-        assertEquals(listOf(QueueEdit.Replace(0, "a")), plan.edits)
+        assertEquals(listOf(QueueEdit.Replace(0)), plan.edits)
     }
 
     @Test
