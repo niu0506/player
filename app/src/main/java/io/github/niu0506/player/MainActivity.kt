@@ -13,7 +13,6 @@ import android.os.Bundle
 import android.os.Environment
 import android.os.Handler
 import android.os.Looper
-import android.os.SystemClock
 import android.os.storage.StorageManager
 import android.provider.BaseColumns
 import android.provider.MediaStore
@@ -27,6 +26,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.OptIn
 import androidx.annotation.StringRes
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.widget.PopupMenu
 import androidx.core.content.ContextCompat
@@ -50,7 +50,6 @@ import androidx.media3.session.SessionToken
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.SimpleItemAnimator
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
-import com.google.android.material.snackbar.Snackbar
 import com.google.common.util.concurrent.ListenableFuture
 import io.github.niu0506.player.databinding.ActivityMainBinding
 import kotlinx.coroutines.Dispatchers
@@ -84,13 +83,14 @@ class MainActivity : AppCompatActivity() {
     private lateinit var fullscreenPip: FullscreenPipHelper
 
     private companion object {
-        const val WRITE_FAILURE_TOAST_MIN_INTERVAL_MS = 15_000L
-
         const val SAVE_PLAYLIST_DEBOUNCE_MS = 2_000L
 
         const val MEDIA_CHANGE_DEBOUNCE_MS = 800L
 
         const val SCAN_NOTICE_HIDE_MS = 4_000L
+
+        /** 按钮内联状态的显示时长。 */
+        const val INLINE_STATE_MS = 2_000L
 
         const val MENU_CHECK_UPDATE = 1
         const val MENU_BRIGHTNESS_SYSTEM = 2
@@ -106,7 +106,14 @@ class MainActivity : AppCompatActivity() {
 
     private var pendingDeletion: PendingDeletion? = null
 
-    private var deleteSnackbar: Snackbar? = null
+    private var deleteHint: HintHandle? = null
+
+    /** 播放列表全部失败时的阻断提示；同时只保留一个。 */
+    private var playbackFailedDialog: AlertDialog? = null
+
+    private val restoreScanButton = Runnable { binding.btnScan.setText(R.string.scan_local) }
+
+    private val restoreMoreButton = Runnable { binding.btnMore.setText(R.string.more) }
 
     /** 由 ACTION_VIEW / ACTION_SEND 带入、等待控制器就绪后入队播放的媒体。 */
     private var pendingOpenUri: Uri? = null
@@ -123,14 +130,14 @@ class MainActivity : AppCompatActivity() {
         if (hasStoragePermission()) {
             startScan(silent = false)
         } else {
-            snack(R.string.toast_permission_denied)
+            snackError(R.string.toast_permission_denied)
         }
     }
 
     private fun removeItemFromPlaylist(index: Int) {
         if (index !in playlist.indices) return
         // 上一笔删除先落定，避免撤销窗口叠加
-        deleteSnackbar?.dismiss()
+        deleteHint?.dismiss()
         commitPendingDeletion()
         val item = playlist[index]
 
@@ -151,20 +158,14 @@ class MainActivity : AppCompatActivity() {
         savePlaylist()
         // 进度延后清理：撤销窗口内仍可恢复，窗口结束才真正删除
         pendingDeletion = PendingDeletion(item, index)
-        val bar = Snackbar.make(
-            binding.root,
-            getString(R.string.toast_deleted),
-            Snackbar.LENGTH_LONG
+        deleteHint = showHint(
+            message = getString(R.string.toast_deleted),
+            long = true,
+            kind = HintKind.SUCCESS,
+            actionLabel = getString(R.string.undo),
+            onAction = { undoDelete() },
+            onDismissed = { commitPendingDeletion() },
         )
-            .setAction(R.string.undo) { undoDelete() }
-            .addCallback(object : Snackbar.Callback() {
-                override fun onDismissed(transientBottomBar: Snackbar?, event: Int) {
-                    if (deleteSnackbar === transientBottomBar) deleteSnackbar = null
-                    commitPendingDeletion()
-                }
-            })
-        deleteSnackbar = bar
-        bar.show()
     }
 
     private fun undoDelete() {
@@ -201,6 +202,33 @@ class MainActivity : AppCompatActivity() {
     private fun updateKeepScreenOn() {
         val ctrl = controller
         binding.playerView.keepScreenOn = ctrl.isPlayingVideo()
+    }
+
+    /** 没有加载视频时禁用小窗按钮，替代一次性提示；暂停状态下仍可进入小窗。 */
+    private fun updatePipButtonState() {
+        val videoSize = controller?.videoSize
+        val enabled = videoSize.hasVideo()
+        binding.btnPip.isEnabled = enabled
+        binding.btnPip.alpha = if (enabled) 1f else 0.45f
+    }
+
+    /** 全部文件都无法播放：用弹窗给出明确出路，而不是一条转瞬即逝的提示。 */
+    private fun showPlaybackAllFailedDialog() {
+        if (isFinishing || isDestroyed) return
+        if (playbackFailedDialog?.isShowing == true) return
+        val dialog = MaterialAlertDialogBuilder(this)
+            .setTitle(R.string.playback_all_failed_title)
+            .setMessage(R.string.toast_playback_error_all_failed)
+            .setPositiveButton(R.string.scan_local) { _, _ ->
+                if (hasStoragePermission()) startScan(silent = false) else requestStoragePermission()
+            }
+            .setNegativeButton(R.string.cancel, null)
+            .create()
+        dialog.setOnDismissListener {
+            if (playbackFailedDialog === dialog) playbackFailedDialog = null
+        }
+        playbackFailedDialog = dialog
+        dialog.show()
     }
 
     private fun syncAdapterPlayingState() {
@@ -248,6 +276,7 @@ class MainActivity : AppCompatActivity() {
     private val playerListener = object : Player.Listener {
         override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
             syncAdapterPlayingState()
+            updatePipButtonState()
             fullscreenPip.refreshInfoBarContent()
             // 断点续播由 PlayerService 完成：界面退后台会释放控制器
         }
@@ -255,6 +284,7 @@ class MainActivity : AppCompatActivity() {
         override fun onIsPlayingChanged(isPlaying: Boolean) {
             syncAdapterPlayingState()
             updateKeepScreenOn()
+            updatePipButtonState()
             fullscreenPip.refreshPipParams()
             if (!isPlaying) {
                 // 服务侧已落盘，这里只刷新界面
@@ -272,12 +302,6 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        override fun onPlaybackSuppressionReasonChanged(playbackSuppressionReason: Int) {
-            if (playbackSuppressionReason == Player.PLAYBACK_SUPPRESSION_REASON_TRANSIENT_AUDIO_FOCUS_LOSS) {
-                snack(R.string.toast_playback_interrupted)
-            }
-        }
-
         override fun onPlaybackParametersChanged(playbackParameters: PlaybackParameters) {
             // 倍速由服务侧持有，重连后同步按钮文案
             syncSpeedLabel()
@@ -285,6 +309,7 @@ class MainActivity : AppCompatActivity() {
 
         override fun onVideoSizeChanged(videoSize: VideoSize) {
             updateKeepScreenOn()
+            updatePipButtonState()
             fullscreenPip.refreshPipParams()
         }
     }
@@ -438,9 +463,8 @@ class MainActivity : AppCompatActivity() {
             options = speedLevels.map(::formatSpeed),
             selectedIndex = speedsIndex(ctrl.playbackParameters.speed),
             immersive = fullscreenPip.isFullscreen && !fullscreenPip.isInPipMode,
-        ) { which ->
-            controller?.setPlaybackSpeed(speedLevels[which])
-        }
+            onSelected = { which -> controller?.setPlaybackSpeed(speedLevels[which]) },
+        )
     }
 
     private fun formatSpeed(speed: Float): String {
@@ -456,10 +480,7 @@ class MainActivity : AppCompatActivity() {
 
     @OptIn(UnstableApi::class)
     private fun showTrackSelection(trackType: Int, @StringRes titleRes: Int) {
-        val ctrl = controller ?: run {
-            snack(R.string.toast_player_not_connected)
-            return
-        }
+        val ctrl = controller ?: return
         val params = ctrl.trackSelectionParameters
         val disabled = params.disabledTrackTypes.contains(trackType)
         val override = params.overrides.values.firstOrNull { it.type == trackType }
@@ -495,7 +516,16 @@ class MainActivity : AppCompatActivity() {
             }
         }
         if (concreteCount == 0) {
-            snack(R.string.toast_no_tracks)
+            // 没有可选轨道：在面板内显示空态，不用底部提示打断
+            showSelectionPanel(
+                activity = this,
+                title = getString(titleRes),
+                options = emptyList(),
+                selectedIndex = 0,
+                immersive = fullscreenPip.isFullscreen && !fullscreenPip.isInPipMode,
+                onSelected = {},
+                emptyHint = getString(R.string.track_empty_hint),
+            )
             return
         }
 
@@ -505,26 +535,27 @@ class MainActivity : AppCompatActivity() {
             options = options.map { it.label },
             selectedIndex = selectedIndex,
             immersive = fullscreenPip.isFullscreen && !fullscreenPip.isInPipMode,
-        ) { index ->
-            val option = options[index]
-            val newParams = params.buildUpon().apply {
-                when {
-                    option.disabled -> {
-                        clearOverridesOfType(trackType)
-                        setTrackTypeDisabled(trackType, true)
+            onSelected = { index ->
+                val option = options[index]
+                val newParams = params.buildUpon().apply {
+                    when {
+                        option.disabled -> {
+                            clearOverridesOfType(trackType)
+                            setTrackTypeDisabled(trackType, true)
+                        }
+                        option.override != null -> {
+                            setTrackTypeDisabled(trackType, false)
+                            setOverrideForType(option.override)
+                        }
+                        else -> {
+                            clearOverridesOfType(trackType)
+                            setTrackTypeDisabled(trackType, false)
+                        }
                     }
-                    option.override != null -> {
-                        setTrackTypeDisabled(trackType, false)
-                        setOverrideForType(option.override)
-                    }
-                    else -> {
-                        clearOverridesOfType(trackType)
-                        setTrackTypeDisabled(trackType, false)
-                    }
-                }
-            }.build()
-            controller?.trackSelectionParameters = newParams
-        }
+                }.build()
+                controller?.trackSelectionParameters = newParams
+            },
+        )
     }
 
     /** 轨道名称：优先用媒体自带的标签 / 语言，其次编码与 MIME。 */
@@ -608,7 +639,7 @@ class MainActivity : AppCompatActivity() {
     ) {
         if (scannedVideos == null && scannedAudios == null) {
             if (!silent) {
-                snack(R.string.toast_scan_failed)
+                snackError(R.string.toast_scan_failed)
             }
             return
         }
@@ -622,7 +653,8 @@ class MainActivity : AppCompatActivity() {
         val changed = result.playlist != playlist
         if (!changed) {
             if (!silent) {
-                snack(R.string.toast_no_new_media)
+                // 结果内联到扫描按钮，避免为「没有变化」再弹一条提示
+                flashScanButton(R.string.scan_no_new_media)
             }
             return
         }
@@ -639,6 +671,7 @@ class MainActivity : AppCompatActivity() {
                 showScanNotice(getString(R.string.toast_scan_added_silent, result.addedCount))
             }
         } else {
+            // 扫描结果统一走列表顶部内联提示，合并成一条，不再弹底部提示
             val parts = mutableListOf<String>()
             if (result.removedCount > 0) {
                 parts.add(getString(R.string.toast_scan_removed, result.removedCount))
@@ -646,22 +679,34 @@ class MainActivity : AppCompatActivity() {
             if (result.addedCount > 0) {
                 parts.add(getString(R.string.toast_scan_added, result.addedCount))
             }
-            if (result.orderChanged) parts.add(getString(R.string.toast_scan_reordered))
-            if (parts.isEmpty()) parts.add(getString(R.string.toast_scan_updated))
-            snackMessage(parts.joinToString("，"))
+            if (parts.isNotEmpty()) showScanNotice(parts.joinToString("，"))
         }
+    }
+
+    /** 扫描按钮短暂显示状态文案，随后恢复为「扫描」。 */
+    private fun flashScanButton(@StringRes resId: Int) {
+        binding.btnScan.setText(resId)
+        mainHandler.removeCallbacks(restoreScanButton)
+        mainHandler.postDelayed(restoreScanButton, INLINE_STATE_MS)
+    }
+
+    /** 更多按钮短暂显示状态文案，随后恢复为「更多」。 */
+    private fun flashMoreButton(@StringRes resId: Int) {
+        binding.btnMore.setText(resId)
+        mainHandler.removeCallbacks(restoreMoreButton)
+        mainHandler.postDelayed(restoreMoreButton, INLINE_STATE_MS)
     }
 
     private val hideScanNoticeRunnable = Runnable {
         binding.tvScanNotice.visibility = View.GONE
     }
 
-    /** 列表顶部的轻提示：静默扫描新增文件时短暂显示，不弹 Toast。 */
-    private fun showScanNotice(text: CharSequence) {
+    /** 列表顶部的轻提示：扫描结果、数据加载失败等状态内联显示，不弹底部提示。 */
+    private fun showScanNotice(text: CharSequence, durationMs: Long = SCAN_NOTICE_HIDE_MS) {
         binding.tvScanNotice.text = text
         binding.tvScanNotice.visibility = View.VISIBLE
         mainHandler.removeCallbacks(hideScanNoticeRunnable)
-        mainHandler.postDelayed(hideScanNoticeRunnable, SCAN_NOTICE_HIDE_MS)
+        mainHandler.postDelayed(hideScanNoticeRunnable, durationMs)
     }
 
     private fun hideScanNotice() {
@@ -752,8 +797,8 @@ class MainActivity : AppCompatActivity() {
                     true
                 }
                 MENU_BRIGHTNESS_SYSTEM -> {
+                    // 亮度变化由手势浮层即时反馈，不再额外弹提示
                     gestures.resetBrightnessToSystem()
-                    snack(R.string.toast_brightness_follow_system)
                     true
                 }
                 MENU_RESET_DATA -> {
@@ -780,7 +825,7 @@ class MainActivity : AppCompatActivity() {
         cancelScans()
         mainHandler.removeCallbacks(savePlaylistRunnable)
         // 待撤销的删除随重置一并作废
-        deleteSnackbar?.dismiss()
+        deleteHint?.dismiss()
         pendingDeletion = null
         hideScanNotice()
         // 重置期间禁止服务侧写进度，避免旧进度写回
@@ -796,7 +841,7 @@ class MainActivity : AppCompatActivity() {
             }
             if (isFinishing || isDestroyed) return@launch
             if (!ok) {
-                snackLong(R.string.reset_data_failed)
+                snackErrorLong(R.string.reset_data_failed)
                 return@launch
             }
             // 重置期间的回调可能重新填充队列，再清一次
@@ -804,7 +849,7 @@ class MainActivity : AppCompatActivity() {
             playlist.clear()
             playlistLoaded = true
             refreshPlaylist()
-            snack(R.string.reset_data_done)
+            snackSuccess(R.string.reset_data_done)
             if (hasStoragePermission()) {
                 startScan(silent = false)
             } else {
@@ -826,43 +871,44 @@ class MainActivity : AppCompatActivity() {
         lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
                 launch {
-                    var lastShownMs = 0L
+                    // 保存失败由仓库自动重试，界面只记录日志，不再打扰用户
                     PlayerRepository.writeFailures.collect {
-                        val now = SystemClock.elapsedRealtime()
-                        if (now - lastShownMs < WRITE_FAILURE_TOAST_MIN_INTERVAL_MS) return@collect
-                        lastShownMs = now
-                        snackLong(R.string.toast_repository_write_failed)
+                        Log.w(TAG, "本地数据保存失败，稍后自动重试")
                     }
                 }
 
                 launch {
                     PlayerService.errorEvents.collect { event ->
-                        val isFileGone =
-                            event.errorCode == PlaybackException.ERROR_CODE_IO_FILE_NOT_FOUND
-                        val name = event.uri?.let { playlist.getOrNull(indexOfUri(it)) }?.name
-                            ?: getString(R.string.unknown_file)
-                        val message = when {
-                            event.exhausted -> getString(R.string.toast_playback_error_all_failed)
-                            isFileGone -> getString(
-                                if (event.hasNext) R.string.toast_file_unreadable
-                                else R.string.toast_file_unreadable_last,
-                                name
-                            )
-                            else -> getString(
-                                if (event.hasNext) R.string.toast_playback_error
-                                else R.string.toast_playback_error_last,
-                                name
-                            )
+                        when {
+                            // 全部失败：升级为阻断弹窗，引导重新扫描
+                            event.exhausted -> showPlaybackAllFailedDialog()
+                            // 还能自动跳过：静默处理，不逐条打断
+                            event.hasNext -> Unit
+                            else -> {
+                                val isFileGone = event.errorCode ==
+                                    PlaybackException.ERROR_CODE_IO_FILE_NOT_FOUND
+                                val name = event.uri
+                                    ?.let { playlist.getOrNull(indexOfUri(it)) }?.name
+                                    ?: getString(R.string.unknown_file)
+                                val res = if (isFileGone) {
+                                    R.string.toast_file_unreadable_last
+                                } else {
+                                    R.string.toast_playback_error_last
+                                }
+                                snackMessage(getString(res, name), kind = HintKind.ERROR)
+                            }
                         }
-                        snackMessage(message)
                     }
                 }
             }
         }
 
-        updateManager = UpdateManager(this)
+        updateManager = UpdateManager(this) {
+            flashMoreButton(R.string.update_up_to_date_short)
+        }
         gestures = GestureController(this, binding.playerView, binding.gestureOverlay) { controller }
         fullscreenPip = FullscreenPipHelper(this, binding) { controller }
+        updatePipButtonState()
 
         adapter = MediaListAdapter(
             onClick = { uri ->
@@ -1016,10 +1062,8 @@ class MainActivity : AppCompatActivity() {
             val ctrl = try {
                 future.get()
             } catch (e: Exception) {
+                // 连接失败属于内部异常：记日志并等待下次 onStart 重连，不打断用户
                 Log.e(TAG, "连接播放服务失败", e)
-                if (controllerFuture === future) {
-                    snackLong(R.string.toast_player_not_connected)
-                }
                 return@addListener
             }
             controller = ctrl
@@ -1029,6 +1073,7 @@ class MainActivity : AppCompatActivity() {
             syncSpeedLabel()
             syncAdapterPlayingState()
             updateKeepScreenOn()
+            updatePipButtonState()
             fullscreenPip.refreshPipParams()
             lifecycleScope.launch {
 
@@ -1037,7 +1082,11 @@ class MainActivity : AppCompatActivity() {
                 if (!isCurrentController(future, ctrl)) return@launch
                 when {
 
-                    !loaded -> snackLong(R.string.toast_repository_load_failed)
+                    // 仓库会自动重试：用顶部内联提示说明状态，不弹底部提示
+                    !loaded -> showScanNotice(
+                        getString(R.string.toast_repository_load_failed),
+                        durationMs = 8_000L,
+                    )
 
                     !playlistLoaded -> {
                         loadPlaylist()
@@ -1072,8 +1121,13 @@ class MainActivity : AppCompatActivity() {
         mainHandler.removeCallbacks(savePlaylistRunnable)
         savePlaylistNow()
         // 离开界面即视为确认删除，撤销窗口不再保留
-        deleteSnackbar?.dismiss()
+        deleteHint?.dismiss()
         commitPendingDeletion()
+        // 取消内联状态回调时立即还原文案，避免回到前台仍显示「无新增」「已是最新」
+        mainHandler.removeCallbacks(restoreScanButton)
+        restoreScanButton.run()
+        mainHandler.removeCallbacks(restoreMoreButton)
+        restoreMoreButton.run()
         hideScanNotice()
         fullscreenPip.onStopped()
         gestures.cancelPendingHide()
@@ -1083,6 +1137,12 @@ class MainActivity : AppCompatActivity() {
         controllerFuture?.let { MediaController.releaseFuture(it) }
         controllerFuture = null
         super.onStop()
+    }
+
+    override fun onDestroy() {
+        // 提示宿主持有 Activity，销毁时移出弱引用表并停掉待执行动画
+        clearHintHost()
+        super.onDestroy()
     }
 
     override fun onPause() {

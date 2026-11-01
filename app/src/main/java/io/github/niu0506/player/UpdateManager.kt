@@ -154,7 +154,11 @@ internal fun verifyApkChecksum(expected: String?, actual: String): ApkValidation
 internal fun isDownloadedVersionInstalled(downloaded: String, installed: String?): Boolean =
     installed != null && !UpdateChecker.isNewer(downloaded, installed)
 
-class UpdateManager(private val activity: AppCompatActivity) {
+/** @param onUpToDate 手动检查且已是最新版本时的内联反馈（更新入口本身） */
+class UpdateManager(
+    private val activity: AppCompatActivity,
+    private val onUpToDate: (() -> Unit)? = null,
+) {
 
     companion object {
         private const val TAG = "UpdateManager"
@@ -205,6 +209,9 @@ class UpdateManager(private val activity: AppCompatActivity) {
 
     private var downloadBusy = false
 
+    /** 校验下载产物进行中；与发起下载的忙碌状态分开，避免极速完成时被丢弃。 */
+    private var validatingDownload = false
+
     private var installPermissionDialog: AlertDialog? = null
 
     private var shownUpdateDialog: AlertDialog? = null
@@ -240,17 +247,16 @@ class UpdateManager(private val activity: AppCompatActivity) {
         when (withContext(Dispatchers.IO) { queryDownloadStatus(id) }) {
             DownloadManager.STATUS_FAILED -> failDownload()
             DownloadManager.STATUS_SUCCESSFUL -> {
-                if (downloadBusy) return
-                downloadBusy = true
+                if (validatingDownload) return
+                validatingDownload = true
                 try {
                     when (withContext(Dispatchers.IO) { validateDownloadedApk(pending) }) {
                         ApkValidation.OK -> installVerifiedApk()
-                        ApkValidation.MISSING_CHECKSUM ->
-                            failDownload(R.string.update_unverified, long = true)
+                        ApkValidation.MISSING_CHECKSUM -> showUnverifiedDialog()
                         ApkValidation.INVALID -> failDownload()
                     }
                 } finally {
-                    downloadBusy = false
+                    validatingDownload = false
                 }
             }
             else -> Unit
@@ -299,10 +305,12 @@ class UpdateManager(private val activity: AppCompatActivity) {
                 val current = installedVersionName()
                 when {
                     current == null || release == null -> if (manual) {
-                        activity.snack(R.string.update_check_failed)
+                        activity.snackError(R.string.update_check_failed)
                     }
                     !UpdateChecker.isNewer(release.version, current) -> if (manual) {
-                        activity.snack(R.string.update_up_to_date, current)
+                        // 结果内联到「更多」入口，不再弹底部提示
+                        onUpToDate?.invoke()
+                            ?: activity.snack(R.string.update_up_to_date_short)
                     }
                     else -> showUpdateWhenResumed(release)
                 }
@@ -356,24 +364,18 @@ class UpdateManager(private val activity: AppCompatActivity) {
             dialog.show()
         } catch (e: Exception) {
             Log.w(TAG, "显示更新提示失败", e)
-            activity.snack(R.string.update_check_failed)
+            activity.snackError(R.string.update_check_failed)
         }
     }
 
     private fun downloadApk(release: UpdateChecker.Release) {
-        if (downloadBusy) {
-            activity.snack(R.string.update_download_in_progress)
-            return
-        }
+        // 正在下载/已排队时不重复提示：系统下载通知会持续显示进度
+        if (downloadBusy) return
         downloadBusy = true
         activity.lifecycleScope.launch {
             try {
-                if (withContext(Dispatchers.IO) { hasActiveDownload() }) {
-                    activity.snack(R.string.update_download_in_progress)
-                    return@launch
-                }
+                if (withContext(Dispatchers.IO) { hasActiveDownload() }) return@launch
                 enqueueDownload(release.apkUrl, release.version, release.sha256)
-                activity.snack(R.string.update_download_started)
             } catch (e: Exception) {
                 Log.w(TAG, "发起更新下载失败", e)
                 failDownload()
@@ -437,10 +439,39 @@ class UpdateManager(private val activity: AppCompatActivity) {
 
     private fun failDownload(
         @StringRes messageRes: Int = R.string.update_download_failed,
-        long: Boolean = false,
     ) {
-        if (long) activity.snackLong(messageRes) else activity.snack(messageRes)
+        activity.snackError(messageRes)
         clearPersistedDownload()
+    }
+
+    /** 缺少校验和的更新包按失败处理，并用弹窗说明原因（不能用一闪而过的提示）。 */
+    private fun showUnverifiedDialog() {
+        clearPersistedDownload()
+        whenResumed {
+            if (activity.isFinishing || activity.isDestroyed) return@whenResumed
+            MaterialAlertDialogBuilder(activity)
+                .setTitle(R.string.update_unverified_title)
+                .setMessage(R.string.update_unverified)
+                .setPositiveButton(R.string.confirm, null)
+                .show()
+        }
+    }
+
+    /** 无法调起系统安装器时给出可执行出路：跳到系统下载列表手动安装。 */
+    private fun showInstallFailedDialog() {
+        whenResumed {
+            if (activity.isFinishing || activity.isDestroyed) return@whenResumed
+            MaterialAlertDialogBuilder(activity)
+                .setTitle(R.string.update_install_failed_title)
+                .setMessage(R.string.update_install_failed)
+                .setPositiveButton(R.string.update_install_failed_action) { _, _ ->
+                    runCatching {
+                        activity.startActivity(Intent(DownloadManager.ACTION_VIEW_DOWNLOADS))
+                    }
+                }
+                .setNegativeButton(R.string.cancel, null)
+                .show()
+        }
     }
 
     /** 校验下载产物（包名 / 版本 / SHA-256）；不再复制，直接校验最终位置的文件。 */
@@ -515,7 +546,7 @@ class UpdateManager(private val activity: AppCompatActivity) {
             )
         } catch (e: Exception) {
             Log.w(TAG, "生成安装包 URI 失败", e)
-            activity.snackLong(R.string.update_install_failed)
+            showInstallFailedDialog()
             return
         }
         val intent = Intent(Intent.ACTION_VIEW).apply {
@@ -529,7 +560,7 @@ class UpdateManager(private val activity: AppCompatActivity) {
             clearPersistedDownload()
         } catch (e: Exception) {
             Log.w(TAG, "打开系统安装器失败", e)
-            activity.snackLong(R.string.update_install_failed)
+            showInstallFailedDialog()
         }
     }
 
@@ -554,8 +585,8 @@ class UpdateManager(private val activity: AppCompatActivity) {
             installPermissionDialog = dialog
             dialog.show()
         } catch (e: Exception) {
+            // 弹窗失败是内部异常，交给日志；下次回前台会重新尝试
             Log.w(TAG, "显示安装权限提示失败", e)
-            activity.snackLong(R.string.update_install_permission_message)
         }
     }
 
@@ -570,7 +601,7 @@ class UpdateManager(private val activity: AppCompatActivity) {
             )
         } catch (e: Exception) {
             Log.w(TAG, "打开安装未知应用设置失败", e)
-            activity.snackLong(R.string.update_install_failed)
+            showInstallFailedDialog()
         }
     }
 

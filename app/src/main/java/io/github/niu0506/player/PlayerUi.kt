@@ -16,6 +16,7 @@ import android.os.BatteryManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.provider.Settings
 import android.text.format.DateFormat
 import android.util.DisplayMetrics
@@ -27,6 +28,8 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
+import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.annotation.OptIn
@@ -46,12 +49,12 @@ import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 import androidx.recyclerview.widget.DiffUtil
 import androidx.recyclerview.widget.RecyclerView
-import com.google.android.material.snackbar.Snackbar
 import io.github.niu0506.player.databinding.ActivityMainBinding
 import io.github.niu0506.player.databinding.DialogSelectionBinding
 import io.github.niu0506.player.databinding.ItemMediaBinding
 import io.github.niu0506.player.databinding.ItemSelectionBinding
 import java.util.Date
+import java.util.WeakHashMap
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -64,25 +67,257 @@ import kotlin.math.max
 import kotlin.math.min
 import androidx.core.content.edit
 
-/** 统一的短提示入口（Material Snackbar）。 */
+/** 提示语义：决定图标与强调色。 */
+internal enum class HintKind { INFO, SUCCESS, ERROR }
+
+/** 可主动关闭的提示句柄（删除撤销需要在窗口结束时落定）。 */
+internal class HintHandle {
+    internal var dismisser: (() -> Unit)? = null
+
+    fun dismiss() {
+        dismisser?.invoke()
+    }
+}
+
+private class HintRequest(
+    val message: CharSequence,
+    val long: Boolean,
+    val kind: HintKind,
+    val actionLabel: CharSequence?,
+    val onAction: (() -> Unit)?,
+    val onDismissed: (() -> Unit)?,
+)
+
+private val hintHosts = WeakHashMap<Activity, HintHost>()
+
+/** 界面销毁时释放提示宿主；宿主反向引用 Activity，不主动移除条目会常驻内存。 */
+internal fun Activity.clearHintHost() {
+    hintHosts.remove(this)?.release()
+}
+
+/** 统一的短提示入口：底部深色胶囊，串行排队、重复文案去重。 */
 internal fun Activity.snack(@StringRes resId: Int, vararg args: Any?) {
     snackMessage(getString(resId, *args))
 }
 
-internal fun Activity.snackLong(@StringRes resId: Int, vararg args: Any?) {
-    snackMessage(getString(resId, *args), long = true)
+internal fun Activity.snackError(@StringRes resId: Int, vararg args: Any?) {
+    snackMessage(getString(resId, *args), kind = HintKind.ERROR)
+}
+
+internal fun Activity.snackErrorLong(@StringRes resId: Int, vararg args: Any?) {
+    snackMessage(getString(resId, *args), long = true, kind = HintKind.ERROR)
+}
+
+internal fun Activity.snackSuccess(@StringRes resId: Int, vararg args: Any?) {
+    snackMessage(getString(resId, *args), kind = HintKind.SUCCESS)
 }
 
 /** 已拼好的文案直接提示；界面已销毁时静默忽略。 */
-internal fun Activity.snackMessage(message: CharSequence, long: Boolean = false) {
-    if (isFinishing || isDestroyed) return
-    // 小窗下界面不可见，Snackbar 会被窗口裁剪，退回系统 Toast
-    if (isInPictureInPictureMode) {
-        Toast.makeText(this, message, if (long) Toast.LENGTH_LONG else Toast.LENGTH_SHORT).show()
-        return
+internal fun Activity.snackMessage(
+    message: CharSequence,
+    long: Boolean = false,
+    kind: HintKind = HintKind.INFO,
+) {
+    showHint(message, long = long, kind = kind)
+}
+
+/**
+ * 显示一条底部胶囊提示。
+ *
+ * @param actionLabel 可操作文案（如「撤销」）
+ * @param onDismissed 提示关闭后回调；用于撤销窗口结束后的清理
+ */
+internal fun Activity.showHint(
+    message: CharSequence,
+    long: Boolean = false,
+    kind: HintKind = HintKind.INFO,
+    actionLabel: CharSequence? = null,
+    onAction: (() -> Unit)? = null,
+    onDismissed: (() -> Unit)? = null,
+): HintHandle? {
+    val host = hintHosts.getOrPut(this) { HintHost(this) }
+    val request = HintRequest(message, long, kind, actionLabel, onAction, onDismissed)
+    val handle = HintHandle()
+    handle.dismisser = { host.dismiss(request) }
+    return host.enqueue(request, handle)
+}
+
+private class HintHost(private val activity: Activity) {
+    private companion object {
+        const val DEDUPE_MS = 1_200L
+        const val SHORT_MS = 2_000L
+        const val LONG_MS = 3_500L
+        const val ACTION_MS = 6_000L
+        const val ANIM_IN_MS = 180L
+        const val ANIM_OUT_MS = 150L
     }
-    val root = findViewById<View>(android.R.id.content) ?: return
-    Snackbar.make(root, message, if (long) Snackbar.LENGTH_LONG else Snackbar.LENGTH_SHORT).show()
+
+    private val content: ViewGroup? = activity.findViewById(android.R.id.content)
+    private val handler = Handler(Looper.getMainLooper())
+    private val queue = java.util.ArrayDeque<HintRequest>()
+    private var current: HintRequest? = null
+    private var currentView: View? = null
+
+    /** 上一条正在淡出：此时不再立刻显示下一条，避免两个胶囊重叠。 */
+    private var animatingOut = false
+    private var lastMessage: CharSequence? = null
+    private var lastShownAt = 0L
+
+    private val hideRunnable = Runnable { finishCurrent() }
+
+    fun enqueue(request: HintRequest, handle: HintHandle): HintHandle? {
+        if (activity.isFinishing || activity.isDestroyed) {
+            request.onDismissed?.invoke()
+            return null
+        }
+        if (activity.isInPictureInPictureMode) {
+            // 小窗下胶囊会被窗口裁剪，退回系统 Toast
+            Toast.makeText(
+                activity, request.message,
+                if (request.long) Toast.LENGTH_LONG else Toast.LENGTH_SHORT
+            ).show()
+            request.onDismissed?.invoke()
+            return null
+        }
+        // 只对纯提示去重；带操作或关闭回调的提示必须逐条执行
+        val dedupe = request.actionLabel == null && request.onDismissed == null
+        if (dedupe) {
+            val now = SystemClock.uptimeMillis()
+            val sameShowing = current?.message == request.message
+            val sameQueued = queue.any { it.message == request.message }
+            if (sameShowing || sameQueued ||
+                (request.message == lastMessage && now - lastShownAt < DEDUPE_MS)
+            ) {
+                return null
+            }
+        }
+        queue.addLast(request)
+        if (current == null && !animatingOut) showNext()
+        return handle
+    }
+
+    fun dismiss(request: HintRequest) {
+        if (current !== request) {
+            // 还在排队就被撤销：同样要执行关闭回调，避免撤销窗口悬空
+            if (queue.remove(request)) request.onDismissed?.invoke()
+            return
+        }
+        handler.removeCallbacks(hideRunnable)
+        finishCurrent()
+    }
+
+    private fun showNext() {
+        if (current != null || animatingOut) return
+        val request = queue.pollFirst() ?: return
+        val root = content
+        if (root == null) {
+            request.onDismissed?.invoke()
+            showNext()
+            return
+        }
+        val view = LayoutInflater.from(activity).inflate(R.layout.view_hint_pill, root, false)
+        val text = view.findViewById<TextView>(R.id.tv_hint_text)
+        val icon = view.findViewById<ImageView>(R.id.iv_hint_icon)
+        val action = view.findViewById<TextView>(R.id.tv_hint_action)
+        val tint = activity.getColor(
+            if (request.kind == HintKind.ERROR) R.color.hint_danger else R.color.accent
+        )
+        text.text = request.message
+        icon.setImageResource(
+            when (request.kind) {
+                HintKind.ERROR -> R.drawable.ic_hint_error
+                HintKind.SUCCESS -> R.drawable.ic_check
+                HintKind.INFO -> R.drawable.ic_hint_info
+            }
+        )
+        icon.setColorFilter(tint)
+        request.actionLabel?.let { label ->
+            action.visibility = View.VISIBLE
+            action.text = label
+            action.setOnClickListener {
+                request.onAction?.invoke()
+                dismiss(request)
+            }
+        }
+        view.setOnClickListener { dismiss(request) }
+
+        val lp = FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        ).apply {
+            gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+            marginStart = dp(24)
+            marginEnd = dp(24)
+            bottomMargin = bottomInset() + dp(16)
+        }
+        root.addView(view, lp)
+        view.alpha = 0f
+        view.translationY = dp(12).toFloat()
+        view.animate()
+            .alpha(1f)
+            .translationY(0f)
+            .setDuration(ANIM_IN_MS)
+            .start()
+
+        current = request
+        currentView = view
+        lastMessage = request.message
+        lastShownAt = SystemClock.uptimeMillis()
+        val duration = when {
+            request.actionLabel != null -> ACTION_MS
+            request.long -> LONG_MS
+            else -> SHORT_MS
+        }
+        handler.postDelayed(hideRunnable, duration)
+    }
+
+    private fun finishCurrent() {
+        val request = current ?: return
+        val view = currentView
+        handler.removeCallbacks(hideRunnable)
+        current = null
+        currentView = null
+        animatingOut = true
+        if (view == null) {
+            animatingOut = false
+            request.onDismissed?.invoke()
+            showNext()
+            return
+        }
+        view.animate()
+            .alpha(0f)
+            .translationY(dp(8).toFloat())
+            .setDuration(ANIM_OUT_MS)
+            .withEndAction {
+                (view.parent as? ViewGroup)?.removeView(view)
+                animatingOut = false
+                request.onDismissed?.invoke()
+                showNext()
+            }
+            .start()
+    }
+
+    /** Activity 销毁时清空待执行回调与残留视图，不再触发关闭回调。 */
+    fun release() {
+        handler.removeCallbacksAndMessages(null)
+        queue.clear()
+        val view = currentView
+        if (view != null) {
+            (view.parent as? ViewGroup)?.removeView(view)
+        }
+        current = null
+        currentView = null
+        animatingOut = false
+    }
+
+    private fun bottomInset(): Int {
+        val root = content ?: return 0
+        val insets = ViewCompat.getRootWindowInsets(root) ?: return 0
+        return insets.getInsets(WindowInsetsCompat.Type.navigationBars()).bottom
+    }
+
+    private fun dp(value: Int): Int =
+        (value * activity.resources.displayMetrics.density).toInt()
 }
 
 /** 居中面板宽度：左右各留 24dp，宽屏（横屏 / 平板）上限 480dp。 */
@@ -97,6 +332,7 @@ private fun selectionPanelWidth(metrics: DisplayMetrics): Int = min(
  *
  * @param immersive 全屏播放中打开时为 true，面板窗口保持沉浸，
  *   避免系统栏重新出现把画面顶动，也让卡片在可视区域里真正居中。
+ * @param emptyHint 选项为空时在面板内显示的占位文案
  */
 internal fun showSelectionPanel(
     activity: AppCompatActivity,
@@ -105,8 +341,9 @@ internal fun showSelectionPanel(
     selectedIndex: Int,
     immersive: Boolean,
     onSelected: (Int) -> Unit,
+    emptyHint: CharSequence? = null,
 ) {
-    if (options.isEmpty()) return
+    if (options.isEmpty() && emptyHint == null) return
     val density = activity.resources.displayMetrics.density
     val panelWidth = selectionPanelWidth(activity.resources.displayMetrics)
 
@@ -123,6 +360,22 @@ internal fun showSelectionPanel(
             ViewGroup.LayoutParams.WRAP_CONTENT,
         ),
     )
+
+    if (options.isEmpty()) {
+        val hint = TextView(dialog.context).apply {
+            text = emptyHint
+            setTextColor(activity.getColor(R.color.text_secondary))
+            textSize = 14f
+            gravity = Gravity.CENTER
+            setPadding(
+                (24 * density).toInt(),
+                (8 * density).toInt(),
+                (24 * density).toInt(),
+                (20 * density).toInt(),
+            )
+        }
+        binding.optionsContainer.addView(hint)
+    }
 
     options.forEachIndexed { index, label ->
         val row = ItemSelectionBinding.inflate(
@@ -402,10 +655,8 @@ class FullscreenPipHelper(
             return false
         }
         val vs = controllerProvider()?.videoSize
-        if (vs == null || !vs.hasVideo()) {
-            if (showError) activity.snack(R.string.toast_pip_no_video)
-            return false
-        }
+        // 无视频时小窗按钮已禁用，这里只静默拒绝
+        if (vs == null || !vs.hasVideo()) return false
         val wasFullscreen = isFullscreen
         if (wasFullscreen) setFullscreen(false)
         applyVisualState(preparing = true)

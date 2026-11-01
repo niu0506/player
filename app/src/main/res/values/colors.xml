@@ -15,4 +15,8 @@
 
     <!-- 全屏信息条文字阴影 -->
     <color name="fullscreen_info_shadow">#99000000</color>
+
+    <!-- 底部提示胶囊：强调色描边与错误态 -->
+    <color name="hint_border">#33A78BFA</color>
+    <color name="hint_danger">#FFFF6B6B</color>
 </resources>
