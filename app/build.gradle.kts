@@ -55,10 +55,7 @@ android {
             // 开启混淆与资源压缩
             isMinifyEnabled = true
             isShrinkResources = true
-            proguardFiles(
-                getDefaultProguardFile("proguard-android-optimize.txt"),
-                "proguard-rules.pro"
-            )
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"))
             signingConfig = signingConfigs.getByName("release")
 
             // 无签名信息时回退为无签名构建（*-unsigned.apk），不使构建失败

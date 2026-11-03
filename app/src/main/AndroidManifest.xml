@@ -31,7 +31,8 @@
     <uses-permission android:name="android.permission.INTERNET" />
 
     <!-- Android 8+ 校验通过后直接调起系统安装器 -->
-    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"
+        tools:ignore="RequestInstallPackagesPolicy" />
 
     <application
         android:name=".PlayerApp"
