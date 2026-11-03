@@ -10,7 +10,6 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.provider.Settings
 import android.util.Log
-import androidx.annotation.StringRes
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
@@ -312,7 +311,7 @@ class UpdateManager(
                         onUpToDate?.invoke()
                             ?: activity.snack(R.string.update_up_to_date_short)
                     }
-                    else -> showUpdateWhenResumed(release)
+                    else -> whenResumed { presentUpdateDialog(release) }
                 }
             }
         }
@@ -332,9 +331,6 @@ class UpdateManager(
     } catch (_: Exception) {
         null
     }
-
-    private fun showUpdateWhenResumed(release: UpdateChecker.Release) =
-        whenResumed { presentUpdateDialog(release) }
 
     /** 界面回到 RESUMED 后再执行，避免在后台弹窗。 */
     private fun whenResumed(block: () -> Unit) {
@@ -437,10 +433,8 @@ class UpdateManager(
         }
     }
 
-    private fun failDownload(
-        @StringRes messageRes: Int = R.string.update_download_failed,
-    ) {
-        activity.snackError(messageRes)
+    private fun failDownload() {
+        activity.snackError(R.string.update_download_failed)
         clearPersistedDownload()
     }
 

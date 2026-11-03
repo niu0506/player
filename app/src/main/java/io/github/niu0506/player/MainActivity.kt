@@ -462,7 +462,7 @@ class MainActivity : AppCompatActivity() {
             title = getString(R.string.speed_dialog_title),
             options = speedLevels.map(::formatSpeed),
             selectedIndex = speedsIndex(ctrl.playbackParameters.speed),
-            immersive = fullscreenPip.isFullscreen && !fullscreenPip.isInPipMode,
+            immersive = isImmersiveSelection,
             onSelected = { which -> controller?.setPlaybackSpeed(speedLevels[which]) },
         )
     }
@@ -522,7 +522,7 @@ class MainActivity : AppCompatActivity() {
                 title = getString(titleRes),
                 options = emptyList(),
                 selectedIndex = 0,
-                immersive = fullscreenPip.isFullscreen && !fullscreenPip.isInPipMode,
+                immersive = isImmersiveSelection,
                 onSelected = {},
                 emptyHint = getString(R.string.track_empty_hint),
             )
@@ -534,7 +534,7 @@ class MainActivity : AppCompatActivity() {
             title = getString(titleRes),
             options = options.map { it.label },
             selectedIndex = selectedIndex,
-            immersive = fullscreenPip.isFullscreen && !fullscreenPip.isInPipMode,
+            immersive = isImmersiveSelection,
             onSelected = { index ->
                 val option = options[index]
                 val newParams = params.buildUpon().apply {
@@ -654,7 +654,7 @@ class MainActivity : AppCompatActivity() {
         if (!changed) {
             if (!silent) {
                 // 结果内联到扫描按钮，避免为「没有变化」再弹一条提示
-                flashScanButton(R.string.scan_no_new_media)
+                flashButton(binding.btnScan, restoreScanButton, R.string.scan_no_new_media)
             }
             return
         }
@@ -683,19 +683,16 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 扫描按钮短暂显示状态文案，随后恢复为「扫描」。 */
-    private fun flashScanButton(@StringRes resId: Int) {
-        binding.btnScan.setText(resId)
-        mainHandler.removeCallbacks(restoreScanButton)
-        mainHandler.postDelayed(restoreScanButton, INLINE_STATE_MS)
+    /** 按钮短暂显示状态文案，随后恢复到原本文案。 */
+    private fun flashButton(button: TextView, restore: Runnable, @StringRes resId: Int) {
+        button.setText(resId)
+        mainHandler.removeCallbacks(restore)
+        mainHandler.postDelayed(restore, INLINE_STATE_MS)
     }
 
-    /** 更多按钮短暂显示状态文案，随后恢复为「更多」。 */
-    private fun flashMoreButton(@StringRes resId: Int) {
-        binding.btnMore.setText(resId)
-        mainHandler.removeCallbacks(restoreMoreButton)
-        mainHandler.postDelayed(restoreMoreButton, INLINE_STATE_MS)
-    }
+    /** 全屏沉浸时选择面板不弹底部提示。 */
+    private val isImmersiveSelection: Boolean
+        get() = fullscreenPip.isFullscreen && !fullscreenPip.isInPipMode
 
     private val hideScanNoticeRunnable = Runnable {
         binding.tvScanNotice.visibility = View.GONE
@@ -904,7 +901,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         updateManager = UpdateManager(this) {
-            flashMoreButton(R.string.update_up_to_date_short)
+            flashButton(binding.btnMore, restoreMoreButton, R.string.update_up_to_date_short)
         }
         gestures = GestureController(this, binding.playerView, binding.gestureOverlay) { controller }
         fullscreenPip = FullscreenPipHelper(this, binding) { controller }
@@ -1120,10 +1117,8 @@ class MainActivity : AppCompatActivity() {
         cancelScans()
         mainHandler.removeCallbacks(savePlaylistRunnable)
         savePlaylistNow()
-        // 离开界面即视为确认删除，撤销窗口不再保留
         deleteHint?.dismiss()
         commitPendingDeletion()
-        // 取消内联状态回调时立即还原文案，避免回到前台仍显示「无新增」「已是最新」
         mainHandler.removeCallbacks(restoreScanButton)
         restoreScanButton.run()
         mainHandler.removeCallbacks(restoreMoreButton)

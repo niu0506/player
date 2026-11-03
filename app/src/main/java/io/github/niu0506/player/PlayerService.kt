@@ -371,11 +371,7 @@ class PlayerService : MediaSessionService() {
             PlayerRepository.applyProgressUpdates(emptyMap(), keys)
             val svc = instance ?: return
             // 只有当前项会被 ticker 重新缓存
-            val currentUri = svc.player
-                ?.currentMediaItem
-                ?.localConfiguration
-                ?.uri
-                ?.toString()
+            val currentUri = svc.player?.currentMediaItem?.uriString
             // 当前项进入 pendingDrops，离开队列后才允许重新缓存
             svc.progress.drop(keys, currentUri)
         }

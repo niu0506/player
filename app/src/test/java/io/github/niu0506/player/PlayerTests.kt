@@ -22,6 +22,10 @@ private const val SHA256_ABC = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9c
 /** 仅用于比较 URI 的列表条目。 */
 private fun item(uri: String): MediaItemData = MediaItemData(FakeUri(uri), uri)
 
+/** 构造带元数据的列表条目。 */
+private fun item(uri: String, name: String, duration: Long = 0L, folder: String = "") =
+    MediaItemData(FakeUri(uri), name, duration, folder)
+
 class FormatTimeTest {
 
     @Test
@@ -379,28 +383,29 @@ class UpdateIntegrityTest {
 
 class ApkValidationTest {
 
-    private val hex64 = SHA256_ABC
-
     @Test
     fun `missing expected checksum is rejected`() {
-        assertEquals(ApkValidation.MISSING_CHECKSUM, verifyApkChecksum(null, hex64))
-        assertEquals(ApkValidation.MISSING_CHECKSUM, verifyApkChecksum("", hex64))
+        assertEquals(ApkValidation.MISSING_CHECKSUM, verifyApkChecksum(null, SHA256_ABC))
+        assertEquals(ApkValidation.MISSING_CHECKSUM, verifyApkChecksum("", SHA256_ABC))
     }
 
     @Test
     fun `matching checksum is accepted`() {
-        assertEquals(ApkValidation.OK, verifyApkChecksum(hex64, hex64))
+        assertEquals(ApkValidation.OK, verifyApkChecksum(SHA256_ABC, SHA256_ABC))
     }
 
     @Test
     fun `checksum comparison ignores case`() {
-        assertEquals(ApkValidation.OK, verifyApkChecksum(hex64.uppercase(), hex64))
-        assertEquals(ApkValidation.OK, verifyApkChecksum(hex64, hex64.uppercase()))
+        assertEquals(ApkValidation.OK, verifyApkChecksum(SHA256_ABC.uppercase(), SHA256_ABC))
+        assertEquals(ApkValidation.OK, verifyApkChecksum(SHA256_ABC, SHA256_ABC.uppercase()))
     }
 
     @Test
     fun `mismatched checksum is flagged`() {
-        assertEquals(ApkValidation.INVALID, verifyApkChecksum(hex64.dropLast(1) + "0", hex64))
+        assertEquals(
+            ApkValidation.INVALID,
+            verifyApkChecksum(SHA256_ABC.dropLast(1) + "0", SHA256_ABC)
+        )
     }
 }
 
@@ -614,17 +619,17 @@ class NaturalOrderTest {
 
 class PlaylistSortTest {
 
-    private fun item(name: String, folder: String = "") =
+    private fun episode(name: String, folder: String = "") =
         MediaItemData(FakeUri("content://video/$folder/$name"), name, 0L, folder)
 
     @Test
     fun `episodes of one folder stay together and naturally ordered`() {
         val items = listOf(
-            item("第10集.mp4", "Movies/剧B"),
-            item("第2集.mp4", "Movies/剧A"),
-            item("第1集.mp4", "Movies/剧B"),
-            item("第10集.mp4", "Movies/剧A"),
-            item("第1集.mp4", "Movies/剧A")
+            episode("第10集.mp4", "Movies/剧B"),
+            episode("第2集.mp4", "Movies/剧A"),
+            episode("第1集.mp4", "Movies/剧B"),
+            episode("第10集.mp4", "Movies/剧A"),
+            episode("第1集.mp4", "Movies/剧A")
         )
         assertEquals(
             listOf(
@@ -641,10 +646,10 @@ class PlaylistSortTest {
     @Test
     fun `ungrouped items are placed last`() {
         val items = listOf(
-            item("散2.mp4"),
-            item("第1集.mp4", "Movies/剧A"),
-            item("散1.mp4"),
-            item("第2集.mp4", "Movies/剧A")
+            episode("散2.mp4"),
+            episode("第1集.mp4", "Movies/剧A"),
+            episode("散1.mp4"),
+            episode("第2集.mp4", "Movies/剧A")
         )
         val sorted = sortPlaylist(items)
         assertEquals("Movies/剧A", sorted[0].folderKey)
@@ -655,10 +660,10 @@ class PlaylistSortTest {
     @Test
     fun `sorting is independent of input order and idempotent`() {
         val items = listOf(
-            item("第3集.mp4", "Movies/剧A"),
-            item("第1集.mp4", "Movies/剧A"),
-            item("第10集.mp4", "Movies/剧B"),
-            item("第2集.mp4", "Movies/剧B")
+            episode("第3集.mp4", "Movies/剧A"),
+            episode("第1集.mp4", "Movies/剧A"),
+            episode("第10集.mp4", "Movies/剧B"),
+            episode("第2集.mp4", "Movies/剧B")
         )
         val sorted = sortPlaylist(items)
         assertEquals(sorted, sortPlaylist(items.reversed()))
@@ -675,13 +680,6 @@ class PlaylistSortTest {
 }
 
 class ScannedMetadataMergeTest {
-
-    private fun item(
-        uri: String,
-        name: String,
-        duration: Long = 0L,
-        folder: String = "",
-    ) = MediaItemData(FakeUri(uri), name, duration, folder)
 
     @Test
     fun `existing item metadata is refreshed from scan`() {
@@ -904,13 +902,6 @@ class BrightnessFractionTest {
 
 class ScanReconcileTest {
 
-    private fun item(
-        uri: String,
-        name: String,
-        duration: Long = 10_000L,
-        folder: String = "",
-    ) = MediaItemData(FakeUri(uri), name, duration, folder)
-
     @Test
     fun `manual scan appends new items that are long enough`() {
         val current = listOf(item("content://video/1", "第1集.mp4", 10_000, "剧A"))
@@ -939,10 +930,10 @@ class ScanReconcileTest {
 
     @Test
     fun `scan appends new files without manual trigger`() {
-        val current = listOf(item("content://video/1", "第1集.mp4"))
+        val current = listOf(item("content://video/1", "第1集.mp4", 10_000))
         val scanned = listOf(
-            item("content://video/1", "第1集.mp4"),
-            item("content://video/2", "第2集.mp4"),
+            item("content://video/1", "第1集.mp4", 10_000),
+            item("content://video/2", "第2集.mp4", 10_000),
         )
 
         val result = reconcilePlaylist(current, scanned, null, emptySet())
@@ -955,10 +946,10 @@ class ScanReconcileTest {
     @Test
     fun `removed uris are pruned and counted`() {
         val current = listOf(
-            item("content://video/1", "第1集.mp4"),
-            item("content://video/2", "第2集.mp4"),
+            item("content://video/1", "第1集.mp4", 10_000),
+            item("content://video/2", "第2集.mp4", 10_000),
         )
-        val scanned = listOf(item("content://video/2", "第2集.mp4"))
+        val scanned = listOf(item("content://video/2", "第2集.mp4", 10_000))
 
         val result = reconcilePlaylist(
             current,
@@ -974,8 +965,8 @@ class ScanReconcileTest {
     @Test
     fun `duplicate scan entries are added once`() {
         val scanned = listOf(
-            item("content://video/1", "第1集.mp4"),
-            item("content://video/1", "第1集.mp4"),
+            item("content://video/1", "第1集.mp4", 10_000),
+            item("content://video/1", "第1集.mp4", 10_000),
         )
 
         val result = reconcilePlaylist(emptyList(), scanned, null, emptySet())
