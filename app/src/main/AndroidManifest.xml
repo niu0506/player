@@ -26,6 +26,10 @@
     <!-- Android 12 及以下的存储读取权限 -->
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
         android:maxSdkVersion="32" />
+
+    <!-- Android 9 及以下删除媒体文件需要写权限；Android 10+ 统一走系统删除确认 -->
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28" />
     
     <!-- 检查更新 / 下载更新包 -->
     <uses-permission android:name="android.permission.INTERNET" />

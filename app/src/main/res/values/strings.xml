@@ -39,12 +39,17 @@
     
     <string name="progress_finished">已看完</string>
 
-    <string name="delete_dialog_title">删除条目</string>
+    <string name="delete_dialog_title">删除文件</string>
     
-    <string name="delete_dialog_message">确定从播放列表中删除「%1$s」吗？\n该文件的播放进度也会被清除。</string>
+    <string name="delete_dialog_message">确定删除「%1$s」吗？\n文件将从设备中永久删除，播放进度也会被清除。</string>
+
+    <string name="delete_dialog_message_external">确定从播放列表中移除「%1$s」吗？\n该文件来自外部来源，不会删除设备上的原文件。</string>
 
     <!-- 提示信息 -->
     <string name="toast_deleted">已删除</string>
+    <string name="delete_file_cancelled">已取消删除</string>
+    <string name="delete_file_failed">删除文件失败，条目保留在播放列表</string>
+    <string name="delete_file_permission_denied">未授予存储写入权限，无法删除文件</string>
     <string name="unknown_file">未知文件</string>
     <string name="toast_permission_denied">未授予媒体权限，无法扫描</string>
     <string name="toast_scan_failed">扫描失败，请稍后重试</string>

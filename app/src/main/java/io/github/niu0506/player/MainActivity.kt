@@ -2,8 +2,11 @@
 package io.github.niu0506.player
 
 import android.app.Application
+import android.app.RecoverableSecurityException
 import android.content.ComponentName
 import android.content.Intent
+import android.content.IntentSender
+import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.database.ContentObserver
 import android.graphics.Color
@@ -23,14 +26,17 @@ import android.widget.TextView
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.SystemBarStyle
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.OptIn
+import androidx.annotation.RequiresApi
 import androidx.annotation.StringRes
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.widget.PopupMenu
 import androidx.core.content.ContextCompat
 import androidx.core.content.IntentCompat
+import androidx.core.net.toUri
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
@@ -134,7 +140,40 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun removeItemFromPlaylist(index: Int) {
+    /** 等待系统删除确认或写入授权的文件；授权返回后继续删除。 */
+    private var pendingFileDeleteUri: Uri? = null
+
+    private val fileDeleteLauncher = registerForActivityResult(
+        ActivityResultContracts.StartIntentSenderForResult()
+    ) { result ->
+        val uri = pendingFileDeleteUri
+        pendingFileDeleteUri = null
+        if (uri == null) return@registerForActivityResult
+        if (result.resultCode == RESULT_OK) {
+            onFileDeleteApproved(uri)
+        } else {
+            snackMessage(getString(R.string.delete_file_cancelled))
+        }
+    }
+
+    /** API 28 及以下删除公共存储文件所需的写权限。 */
+    private val writeStoragePermission = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        val uri = pendingFileDeleteUri
+        pendingFileDeleteUri = null
+        when {
+            !granted -> snackErrorLong(R.string.delete_file_permission_denied)
+            uri != null -> deleteFileOnLegacy(uri)
+        }
+    }
+
+    /**
+     * 删除条目，并从播放列表与队列中移除。
+     *
+     * [undoable] 为 false 时表示文件已被真正删除：立即清理进度，不再提供撤销。
+     */
+    private fun removeItemFromPlaylist(index: Int, undoable: Boolean = true) {
         if (index !in playlist.indices) return
         // 上一笔删除先落定，避免撤销窗口叠加
         deleteHint?.dismiss()
@@ -156,6 +195,14 @@ class MainActivity : AppCompatActivity() {
         syncAdapterPlayingState()
         refreshPlaylist()
         savePlaylist()
+        if (!undoable) {
+            // 文件已删除，撤销无法恢复，直接清理进度
+            deleteHint = null
+            pendingDeletion = null
+            PlayerService.dropProgress(item.uri.toString())
+            snackSuccess(R.string.toast_deleted)
+            return
+        }
         // 进度延后清理：撤销窗口内仍可恢复，窗口结束才真正删除
         pendingDeletion = PendingDeletion(item, index)
         deleteHint = showHint(
@@ -185,6 +232,114 @@ class MainActivity : AppCompatActivity() {
         val pending = pendingDeletion ?: return
         pendingDeletion = null
         PlayerService.dropProgress(pending.item.uri.toString())
+    }
+
+    /** 删除媒体文件：Android 11+ 统一弹系统删除确认，低版本按各自规则取得授权。 */
+    private fun deleteMediaFile(uri: Uri) {
+        when {
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.R -> {
+                val request = runCatching {
+                    MediaStore.createDeleteRequest(contentResolver, listOf(uri)).intentSender
+                }.getOrElse {
+                    // 非媒体库 URI 无法走系统删除，保留条目并提示失败
+                    snackErrorLong(R.string.delete_file_failed)
+                    return
+                }
+                launchDeleteRequest(uri, request)
+            }
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q -> deleteFileOnQ(uri, allowConsent = true)
+            else -> {
+                if (hasLegacyWritePermission()) {
+                    deleteFileOnLegacy(uri)
+                } else {
+                    pendingFileDeleteUri = uri
+                    writeStoragePermission.launch(
+                        android.Manifest.permission.WRITE_EXTERNAL_STORAGE
+                    )
+                }
+            }
+        }
+    }
+
+    private fun launchDeleteRequest(uri: Uri, intentSender: IntentSender) {
+        pendingFileDeleteUri = uri
+        fileDeleteLauncher.launch(IntentSenderRequest.Builder(intentSender).build())
+    }
+
+    /** Android 10：先直接删除，系统要求确认时抛出可恢复异常并复用同一确认流程。 */
+    @RequiresApi(Build.VERSION_CODES.Q)
+    private fun deleteFileOnQ(uri: Uri, allowConsent: Boolean) {
+        lifecycleScope.launch {
+            val outcome = withContext(Dispatchers.IO) {
+                try {
+                    if (contentResolver.delete(uri, null, null) > 0) {
+                        FileDeletion.Done
+                    } else {
+                        FileDeletion.Failed
+                    }
+                } catch (e: RecoverableSecurityException) {
+                    if (allowConsent) {
+                        FileDeletion.NeedsConsent(e.userAction.actionIntent.intentSender)
+                    } else {
+                        FileDeletion.Failed
+                    }
+                } catch (_: SecurityException) {
+                    FileDeletion.Failed
+                }
+            }
+            when (outcome) {
+                FileDeletion.Done -> onFileDeleted(uri)
+                is FileDeletion.NeedsConsent -> launchDeleteRequest(uri, outcome.intentSender)
+                FileDeletion.Failed -> snackErrorLong(R.string.delete_file_failed)
+            }
+        }
+    }
+
+    /** Android 9 及以下：写权限已授予，直接删除。 */
+    private fun deleteFileOnLegacy(uri: Uri) {
+        lifecycleScope.launch {
+            val deleted = withContext(Dispatchers.IO) {
+                runCatching { contentResolver.delete(uri, null, null) > 0 }.getOrDefault(false)
+            }
+            if (deleted) onFileDeleted(uri) else snackErrorLong(R.string.delete_file_failed)
+        }
+    }
+
+    /** 系统删除确认通过后继续：Android 10 还需按授权重试一次删除。 */
+    private fun onFileDeleteApproved(uri: Uri) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+                deleteFileOnQ(uri, allowConsent = false)
+                return
+            }
+        }
+        // Android 11+ 的系统删除请求已完成实际删除
+        onFileDeleted(uri)
+    }
+
+    /** 文件已删除：同步移除列表条目与播放进度，撤销窗口不再生效。 */
+    private fun onFileDeleted(uri: Uri) {
+        val index = indexOfUri(uri.toString())
+        if (index >= 0) {
+            removeItemFromPlaylist(index, undoable = false)
+        } else {
+            PlayerService.dropProgress(uri.toString())
+            snackSuccess(R.string.toast_deleted)
+        }
+    }
+
+    private fun hasLegacyWritePermission(): Boolean =
+        ContextCompat.checkSelfPermission(
+            this, android.Manifest.permission.WRITE_EXTERNAL_STORAGE
+        ) == PackageManager.PERMISSION_GRANTED
+
+    /** 删除结果：成功、需用户授权（携带授权入口）或失败。 */
+    private sealed interface FileDeletion {
+        data object Done : FileDeletion
+
+        class NeedsConsent(val intentSender: IntentSender) : FileDeletion
+
+        data object Failed : FileDeletion
     }
 
     private fun submitPlaylist() {
@@ -920,12 +1075,26 @@ class MainActivity : AppCompatActivity() {
             onDelete = { uri ->
                 val index = indexOfUri(uri)
                 val item = playlist.getOrNull(index) ?: return@MediaListAdapter
+                // 外部来源（文件管理器分享等）不在媒体库中，只能从列表移除
+                val deleteFile = isMediaStoreMediaUri(uri)
                 MaterialAlertDialogBuilder(this)
                     .setTitle(R.string.delete_dialog_title)
-                    .setMessage(getString(R.string.delete_dialog_message, item.name))
+                    .setMessage(
+                        getString(
+                            if (deleteFile) R.string.delete_dialog_message
+                            else R.string.delete_dialog_message_external,
+                            item.name,
+                        )
+                    )
                     .setPositiveButton(R.string.delete) { _, _ ->
                         // 弹窗期间列表可能已变化，按 uri 重新定位一次
-                        indexOfUri(uri).takeIf { it >= 0 }?.let { removeItemFromPlaylist(it) }
+                        indexOfUri(uri).takeIf { it >= 0 }?.let {
+                            if (deleteFile) {
+                                deleteMediaFile(uri.toUri())
+                            } else {
+                                removeItemFromPlaylist(it)
+                            }
+                        }
                     }
                     .setNegativeButton(R.string.cancel, null)
                     .show()
@@ -1194,6 +1363,10 @@ internal fun extractPlayableUri(intent: Intent?): Uri? = when (intent?.action) {
         ?: IntentCompat.getParcelableExtra(intent, Intent.EXTRA_STREAM, Uri::class.java)
     else -> null
 }
+
+/** 是否媒体库文件（可通过系统删除请求删除）；外部来源的文件只能从播放列表移除。 */
+internal fun isMediaStoreMediaUri(uri: String): Boolean =
+    uri.startsWith("content://${MediaStore.AUTHORITY}/", ignoreCase = true)
 
 internal data class QueueItemSnapshot(val uri: String, val title: String?)
 

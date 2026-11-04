@@ -1406,6 +1406,22 @@ class MediaQueueLookupTest {
     }
 }
 
+class MediaStoreUriTest {
+
+    @Test
+    fun `media library uris are deletable`() {
+        assertTrue(isMediaStoreMediaUri("content://media/external/video/media/42"))
+        assertTrue(isMediaStoreMediaUri("content://media/external/audio/media/7?x=1"))
+    }
+
+    @Test
+    fun `external provider uris are not deletable`() {
+        assertFalse(isMediaStoreMediaUri("content://com.android.providers.downloads.documents/document/1"))
+        assertFalse(isMediaStoreMediaUri("content://com.example.fileprovider/sdcard/movie.mp4"))
+        assertFalse(isMediaStoreMediaUri("file:///sdcard/movie.mp4"))
+    }
+}
+
 class DatabaseSelfHealTest {
 
     @Test
