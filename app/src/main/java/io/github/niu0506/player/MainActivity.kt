@@ -126,6 +126,9 @@ class MainActivity : AppCompatActivity() {
 
     private var pendingOpenName: String? = null
 
+    /** 控制器重连或启动扫描期间点选的条目；就绪后补播，避免点击被丢弃。 */
+    private var pendingPlayUri: String? = null
+
     private val notifPermission = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { _ -> }
@@ -558,6 +561,40 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * 列表点击播放。
+     *
+     * 启动阶段（控制器重连、仓库加载、静默扫描）界面已可交互，但队列可能尚未就绪：
+     * 此时先暂存点击，等 [onStart] 的初始化流程补齐队列后再播，避免点击丢失或按下标误播。
+     */
+    private fun playSelectedMedia(uri: String) {
+        val ctrl = controller
+        if (ctrl == null || !playlistLoaded) {
+            pendingPlayUri = uri
+            return
+        }
+        val index = indexOfUri(uri)
+        if (index < 0) {
+            pendingPlayUri = null
+            return
+        }
+        pendingPlayUri = null
+        // 队列可能还没与列表对齐（如服务重建后为空），先补齐再按下标 seek
+        rebuildQueueIfNeeded(ctrl)
+        if (index !in 0 until ctrl.mediaItemCount) return
+        PlayerService.resetErrorCount()
+        PlayerService.flushCurrentPosition()
+        seekToResume(index)
+        ctrl.play()
+    }
+
+    /** 初始化流程结束后补播用户在控制器就绪前点选的条目。 */
+    private fun playPendingSelection() {
+        val pending = pendingPlayUri ?: return
+        pendingPlayUri = null
+        playSelectedMedia(pending)
+    }
+
     private fun seekToResume(index: Int) {
         val ctrl = controller ?: return
         val item = playlist.getOrNull(index)
@@ -570,6 +607,8 @@ class MainActivity : AppCompatActivity() {
 
     private fun restoreLastPlayed() {
         val ctrl = controller ?: return
+        // 用户已点选待播条目时不再抢占当前项
+        if (pendingPlayUri != null) return
         if (ctrl.playWhenReady || ctrl.isPlaying) return
         val lastUri = PlayerRepository.getLastItem() ?: return
         val idx = indexOfUri(lastUri)
@@ -1063,15 +1102,7 @@ class MainActivity : AppCompatActivity() {
         updatePipButtonState()
 
         adapter = MediaListAdapter(
-            onClick = { uri ->
-                val index = indexOfUri(uri)
-                if (index >= 0) {
-                    PlayerService.resetErrorCount()
-                    PlayerService.flushCurrentPosition()
-                    seekToResume(index)
-                    controller?.play()
-                }
-            },
+            onClick = { uri -> playSelectedMedia(uri) },
             onDelete = { uri ->
                 val index = indexOfUri(uri)
                 val item = playlist.getOrNull(index) ?: return@MediaListAdapter
@@ -1195,6 +1226,8 @@ class MainActivity : AppCompatActivity() {
         PlayerService.resetErrorCount()
         ctrl.seekTo(index, 0)
         ctrl.play()
+        // 外部打开请求优先于列表点击
+        pendingPlayUri = null
         // 已消费外部意图：避免界面重建（如切换字体大小）时重复播放
         val current = intent
         if (current?.action == Intent.ACTION_VIEW || current?.action == Intent.ACTION_SEND) {
@@ -1269,6 +1302,8 @@ class MainActivity : AppCompatActivity() {
                 restoreLastPlayed()
                 // 外部打开请求优先于「恢复上次播放」
                 openPendingMedia()
+                // 补播控制器就绪前点选的条目，避免与启动扫描/重连互相打断
+                playPendingSelection()
 
                 startScan(silent = true).join()
 
@@ -1281,6 +1316,8 @@ class MainActivity : AppCompatActivity() {
 
     override fun onStop() {
         updateManager.unregisterReceivers()
+        // 退到后台即放弃未执行的点击，下次进入不自动补播
+        pendingPlayUri = null
         contentResolver.unregisterContentObserver(mediaChangeObserver)
         mainHandler.removeCallbacks(debouncedScanRunnable)
         cancelScans()
