@@ -1,5 +1,5 @@
 {
-  "versionCode": 72,
-  "versionName": "1.6.12",
-  "notes": "1.6.12：修复打开 App 后立即点击播放与启动扫描冲突，导致点击无响应或播放条目不正确的问题。"
+  "versionCode": 73,
+  "versionName": "1.6.13",
+  "notes": "1.6.13：内部优化，功能与界面无变化：升级构建工具至 Android Gradle 插件 9.5.1，精简重复的测试辅助代码。"
 }
