@@ -1027,8 +1027,6 @@ class PruneDecisionTest {
     private val audioPrefix = "content://media/external/audio/media/"
     private val graceMs = 24 * 60 * 60 * 1000L
 
-    private fun key(uri: String): String = normalizeUri(FakeUri(uri))
-
     @Test
     fun `confirmed deletion removes the item immediately`() {
         val uri = "${videoPrefix}1"

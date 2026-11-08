@@ -3,6 +3,7 @@
 
 # Gradle 构建缓存
 .gradle/
+.gradle-local/
 
 # 根目录 build 输出
 build/
