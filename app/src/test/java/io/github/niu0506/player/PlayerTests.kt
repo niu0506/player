@@ -177,6 +177,34 @@ class ProgressDecisionTest {
             shouldRestoreResume(Player.MEDIA_ITEM_TRANSITION_REASON_SEEK, 500, 1_000)
         )
     }
+
+    @Test
+    fun `playlist change restores only when the playing item is replaced`() {
+        // 删除正在播放的条目：新条目需要按记忆续播
+        assertTrue(
+            shouldRestoreResumeOnTransition(
+                Player.MEDIA_ITEM_TRANSITION_REASON_PLAYLIST_CHANGED,
+                "content://media/video/1",
+                "content://media/video/2",
+            )
+        )
+        // 启动建队：没有上一项，不能抢占当前项
+        assertFalse(
+            shouldRestoreResumeOnTransition(
+                Player.MEDIA_ITEM_TRANSITION_REASON_PLAYLIST_CHANGED,
+                null,
+                "content://media/video/1",
+            )
+        )
+        // 整体重建但当前项未变：保留当前位置
+        assertFalse(
+            shouldRestoreResumeOnTransition(
+                Player.MEDIA_ITEM_TRANSITION_REASON_PLAYLIST_CHANGED,
+                "content://media/video/1",
+                "content://media/video/1",
+            )
+        )
+    }
 }
 
 class MediaListAdapterCurrentPlayingTest {

@@ -47,12 +47,11 @@ class PlayerService : MediaSessionService() {
 
     private val playerEventListener = object : Player.Listener {
         override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+            val previousUri = lastPlayedUri
             if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO) {
                 // 自动连播视为自然播完
-                val finishedUri = lastPlayedUri
-                val finishedDuration = lastPlayedDurationMs
-                if (finishedUri != null && finishedDuration > 0) {
-                    progress.cache(finishedUri, finishedDuration, finishedDuration)
+                if (previousUri != null && lastPlayedDurationMs > 0) {
+                    progress.cache(previousUri, lastPlayedDurationMs, lastPlayedDurationMs)
                 }
             }
             lastPlayedUri = mediaItem.uriString
@@ -62,9 +61,7 @@ class PlayerService : MediaSessionService() {
                 ?: C.TIME_UNSET
             lastPlayedUri?.let { PlayerRepository.setLastItem(it) }
             // 在服务侧续播：界面退后台会释放控制器
-            if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO ||
-                reason == Player.MEDIA_ITEM_TRANSITION_REASON_SEEK
-            ) {
+            if (shouldRestoreResumeOnTransition(reason, previousUri, mediaItem.uriString)) {
                 restoreResumePosition(mediaItem, reason)
             }
             persistProgress()
@@ -489,3 +486,23 @@ internal fun shouldRestoreResume(
     toleranceMs: Long,
 ): Boolean = reason != Player.MEDIA_ITEM_TRANSITION_REASON_SEEK ||
     currentPositionMs <= toleranceMs
+
+/**
+ * 换项后是否恢复断点。
+ *
+ * 播放列表变化也会产生换项：当前项被删除/替换时新条目需要恢复断点；
+ * 启动建队等场景 [previousUri] 为空或与 [newUri] 相同，保持原位不动。
+ */
+internal fun shouldRestoreResumeOnTransition(
+    reason: Int,
+    previousUri: String?,
+    newUri: String?,
+): Boolean = when (reason) {
+    Player.MEDIA_ITEM_TRANSITION_REASON_AUTO,
+    Player.MEDIA_ITEM_TRANSITION_REASON_SEEK -> true
+
+    Player.MEDIA_ITEM_TRANSITION_REASON_PLAYLIST_CHANGED ->
+        previousUri != null && newUri != null && previousUri != newUri
+
+    else -> false
+}
