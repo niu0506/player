@@ -477,8 +477,6 @@ internal class ProgressCache {
 
     fun hasPendingDrops(): Boolean = pendingDrops.isNotEmpty()
 
-    fun hasPendingRemovals(): Boolean = removals.isNotEmpty()
-
     /** 是否还有未落盘的进度（待删除项或值有变化的写入）。 */
     fun hasPendingChanges(): Boolean = removals.isNotEmpty() || writes().isNotEmpty()
 

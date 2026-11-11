@@ -1585,7 +1585,7 @@ class ProgressCacheTest {
         progress.clearAll()
 
         assertTrue(progress.writes().isEmpty())
-        assertFalse(progress.hasPendingRemovals())
+        assertFalse(progress.hasPendingChanges())
         assertFalse(progress.hasPendingDrops())
 
         progress.cache("u", 10_000, 60_000)
