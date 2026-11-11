@@ -428,18 +428,17 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 列表里显示的进度：正在播放的条目直接用播放器实时位置。
+     * 列表里显示的进度。
      *
-     * 落盘是定时的（5 秒一次），后台还可能被打断；若只读已记录值，回到界面时就会显示
-     * 「旧的播放进度」，与播放器实际位置对不上。
+     * 当前条目的实时位置与已落盘完成标记如何取舍见 [displayedProgressValue]。
      */
     private fun displayedProgress(uri: String): Long {
-        val ctrl = controller
-        if (ctrl != null && ctrl.currentMediaItem?.uriString == uri) {
-            val live = ctrl.currentPosition
-            if (live > 0L) return live
-        }
-        return PlayerRepository.getProgress(uri) ?: 0L
+        val stored = PlayerRepository.getProgress(uri) ?: 0L
+        val ctrl = controller ?: return stored
+        if (ctrl.currentMediaItem?.uriString != uri) return stored
+        val live = ctrl.currentPosition
+        if (live <= 0L) return stored
+        return displayedProgressValue(stored, live, ctrl.duration)
     }
 
     /** 播放中每秒刷新当前条目的进度文本，让它跟着播放器走。 */
@@ -1492,6 +1491,26 @@ internal fun shouldKeepLivePositionOnSelect(
     ended: Boolean,
     livePositionMs: Long,
 ): Boolean = isCurrentItem && !ended && livePositionMs > 0L
+
+/**
+ * 列表里显示的进度值。
+ *
+ * 正在播放的条目以播放器实时位置为准（落盘是定时的，只读记录会显示旧进度）。但播放器
+ * 已经到末尾时要用已落盘的完成标记：列表（扫描）时长与播放器时长口径可能不一致，用实时
+ * 位置会把「已看完」显示成未播完，还会看起来留着续播点。
+ */
+internal fun displayedProgressValue(
+    storedProgressMs: Long,
+    livePositionMs: Long,
+    playerDurationMs: Long,
+): Long = if (livePositionMs > 0L &&
+    playerDurationMs > 0L &&
+    isProgressFinished(livePositionMs, playerDurationMs)
+) {
+    maxOf(livePositionMs, storedProgressMs)
+} else {
+    livePositionMs
+}
 
 internal data class QueueItemSnapshot(val uri: String, val title: String?)
 

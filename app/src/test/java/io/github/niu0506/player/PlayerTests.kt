@@ -133,6 +133,36 @@ class ProgressDecisionTest {
     }
 
     @Test
+    fun `completion marker follows the list duration when the player duration is shorter`() {
+        val playerDuration = 180_000L
+        val playlistDuration = 190_000L
+        // 播放器已到末尾，但列表（扫描）时长更大：标记要按列表时长写，
+        // 读侧（列表进度与续播判定）才认得出「已看完」。
+        assertEquals(
+            ProgressWriteDecision.Store(playlistDuration),
+            decideProgressWrite(playerDuration, playerDuration, playlistDuration)
+        )
+    }
+
+    @Test
+    fun `reaching the list duration also counts as completion`() {
+        val playerDuration = 190_000L
+        val playlistDuration = 180_000L
+        assertEquals(
+            ProgressWriteDecision.Store(playlistDuration),
+            decideProgressWrite(playlistDuration - 1_000, playerDuration, playlistDuration)
+        )
+    }
+
+    @Test
+    fun `mid item position keeps the resume point`() {
+        assertEquals(
+            ProgressWriteDecision.Store(60_000L),
+            decideProgressWrite(60_000, 180_000, 190_000)
+        )
+    }
+
+    @Test
     fun `zero position is skipped rather than cleared`() {
         assertEquals(ProgressWriteDecision.Skip, decideProgressWrite(0, duration))
     }
@@ -204,6 +234,57 @@ class ProgressDecisionTest {
                 "content://media/video/1",
             )
         )
+    }
+}
+
+class CrossItemProgressCacheTest {
+
+    @Test
+    fun `auto advance and user seek both cache the previous item`() {
+        assertTrue(shouldCacheOldItemOnDiscontinuity(Player.DISCONTINUITY_REASON_AUTO_TRANSITION))
+        assertTrue(shouldCacheOldItemOnDiscontinuity(Player.DISCONTINUITY_REASON_SEEK))
+    }
+
+    @Test
+    fun `removal adjustment and internal changes do not write progress`() {
+        assertFalse(shouldCacheOldItemOnDiscontinuity(Player.DISCONTINUITY_REASON_REMOVE))
+        assertFalse(shouldCacheOldItemOnDiscontinuity(Player.DISCONTINUITY_REASON_SEEK_ADJUSTMENT))
+        assertFalse(shouldCacheOldItemOnDiscontinuity(Player.DISCONTINUITY_REASON_INTERNAL))
+        assertFalse(shouldCacheOldItemOnDiscontinuity(Player.DISCONTINUITY_REASON_SILENCE_SKIP))
+    }
+
+    @Test
+    fun `storing the next item duration would read as unfinished`() {
+        val finished = 600_000L
+        // 修复前：换项时把下一项（3 分钟）的时长当成上一项（10 分钟）的完成标记
+        val nextItemDuration = 180_000L
+        assertFalse(isProgressFinished(nextItemDuration, finished))
+        assertEquals(nextItemDuration, resumablePositionMs(nextItemDuration, finished))
+
+        // 上一项自己的时长才是完成标记：读侧认「已看完」且不再留续播点
+        assertTrue(isProgressFinished(finished, finished))
+        assertNull(resumablePositionMs(finished, finished))
+    }
+}
+
+class DisplayedProgressTest {
+
+    @Test
+    fun `playing item follows the live position`() {
+        assertEquals(60_000L, displayedProgressValue(50_000, 60_000, 180_000))
+    }
+
+    @Test
+    fun `live position at the end shows the stored completion marker`() {
+        // 列表时长 190s 大于播放器时长 180s：实时位置在末尾，但必须显示完成标记
+        assertEquals(190_000L, displayedProgressValue(190_000, 180_000, 180_000))
+    }
+
+    @Test
+    fun `missing record or unknown player duration keeps the live position`() {
+        assertEquals(180_000L, displayedProgressValue(0, 180_000, 180_000))
+        assertEquals(180_000L, displayedProgressValue(190_000, 180_000, 0))
+        assertEquals(60_000L, displayedProgressValue(190_000, 60_000, 0))
     }
 }
 
@@ -1356,6 +1437,39 @@ class ProgressCacheTest {
 
         assertEquals(mapOf("u" to 60_000L), progress.writes())
         assertTrue(progress.pendingRemovals().isEmpty())
+    }
+
+    @Test
+    fun `completion marker is cached in list duration units`() {
+        val progress = ProgressCache()
+        progress.cache("u", positionMs = 59_000, durationMs = 60_000, markerDurationMs = 65_000)
+
+        assertEquals(mapOf("u" to 65_000L), progress.writes())
+    }
+
+    @Test
+    fun `pending changes report writes and removals`() {
+        val progress = ProgressCache()
+        progress.cache("u", 10_000, 60_000)
+
+        assertTrue(progress.hasPendingChanges())
+
+        progress.markPersisted(progress.snapshot(), progress.pendingRemovals())
+        assertFalse(progress.hasPendingChanges())
+
+        progress.clear("u")
+        assertTrue(progress.hasPendingChanges())
+    }
+
+    @Test
+    fun `failed persist keeps pending changes for the retry ticker`() {
+        val progress = newCache()
+        progress.markPersisted(progress.snapshot(), emptySet())
+        progress.cache("u", 20_000, 60_000)
+
+        progress.markFailed()
+
+        assertTrue(progress.hasPendingChanges())
     }
 
     @Test

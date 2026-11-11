@@ -40,25 +40,15 @@ class PlayerService : MediaSessionService() {
 
     private val progress = ProgressCache()
 
-    /** 上一媒体项 uri，用于标记已看完。 */
+    /** 上一媒体项 uri，用于恢复断点与选中上次播放的条目。 */
     private var lastPlayedUri: String? = null
-
-    private var lastPlayedDurationMs = C.TIME_UNSET
 
     private val playerEventListener = object : Player.Listener {
         override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
             val previousUri = lastPlayedUri
-            if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO) {
-                // 自动连播视为自然播完
-                if (previousUri != null && lastPlayedDurationMs > 0) {
-                    progress.cache(previousUri, lastPlayedDurationMs, lastPlayedDurationMs)
-                }
-            }
+            // 上一项的完成标记由 onPositionDiscontinuity 按旧条目的位置与时长补记：
+            // 换项回调里播放器已经是新条目，取不到旧条目的时长。
             lastPlayedUri = mediaItem.uriString
-            lastPlayedDurationMs = this@PlayerService.player
-                ?.duration
-                ?.takeIf { it > 0 }
-                ?: C.TIME_UNSET
             lastPlayedUri?.let { PlayerRepository.setLastItem(it) }
             // 在服务侧续播：界面退后台会释放控制器
             if (shouldRestoreResumeOnTransition(reason, previousUri, mediaItem.uriString)) {
@@ -82,6 +72,10 @@ class PlayerService : MediaSessionService() {
             val player = this@PlayerService.player ?: return
             // 顺序播放到末尾后主动暂停
             if (player.repeatMode == Player.REPEAT_MODE_OFF) player.pause()
+            // 播完本身就是完成标记，必须在这里显式落盘：onIsPlayingChanged(false) 只在
+            // isPlaying 真的发生变化时回调（被音频焦点抑制、从缓冲直接到 ENDED 时不会），
+            // 而 pause() 之后 playWhenReady 变 false，5 秒轮询也不再续期。
+            persistProgress()
         }
 
         override fun onPositionDiscontinuity(
@@ -104,8 +98,9 @@ class PlayerService : MediaSessionService() {
                     ?.toString()
                     ?.let(progress::clear)
             }
-            // 跨条目 seek：先补记旧条目
-            if (reason == Player.DISCONTINUITY_REASON_SEEK && !sameItem) {
+            // 跨条目跳变（seek / 自动连播）：先按旧条目的位置与时长补记。
+            // 自动连播时这正是上一项的精确末尾（旧位置已切到新条目），据此写入完成标记。
+            if (!sameItem && shouldCacheOldItemOnDiscontinuity(reason)) {
                 cacheOldPosition(oldPosition)
             }
             // 同条目非 seek 的位置变化不产生进度
@@ -148,9 +143,10 @@ class PlayerService : MediaSessionService() {
     private val progressTicker = Runnable {
         tickerScheduled = false
         if (resetting) return@Runnable
-        // 只要用户还想播就继续轮询。缓冲、音频焦点暂失、小窗/息屏切换都会让 isPlaying
-        // 短暂为 false，用它当条件会让轮询就此停摆，后台播放的进度再也落不了盘。
-        if (player?.playWhenReady == true || progress.hasPendingRemovals()) {
+        // 只要用户还想播、或还有没落盘的进度就继续轮询。缓冲、音频焦点暂失、小窗/息屏
+        // 切换都会让 isPlaying 短暂为 false，用它当条件会让轮询就此停摆，后台播放的进度
+        // 再也落不了盘；保留待落盘项也让暂停/播完后的失败写库能继续重试。
+        if (player?.playWhenReady == true || progress.hasPendingChanges()) {
             persistProgress()
             scheduleProgressTicker()
         }
@@ -173,7 +169,6 @@ class PlayerService : MediaSessionService() {
         cancelProgressTicker()
         progress.clearAll()
         lastPlayedUri = null
-        lastPlayedDurationMs = C.TIME_UNSET
     }
 
     @OptIn(UnstableApi::class)
@@ -244,25 +239,57 @@ class PlayerService : MediaSessionService() {
     }
 
     private fun cacheCurrentPosition(player: Player) {
-        val duration = player.duration
-        if (duration > 0) lastPlayedDurationMs = duration
-        progress.cache(
+        cachePosition(
             player.currentMediaItem.uriString,
             player.currentPosition,
-            duration
+            player.duration
         )
     }
+
+    /**
+     * 缓存一条进度。
+     *
+     * [durationMs] 是播放器解析出的时长；完成标记则按列表（扫描）时长口径写入，
+     * 见 [completionMarkerDurationMs]。
+     */
+    private fun cachePosition(uri: String?, positionMs: Long, durationMs: Long) {
+        val markerDurationMs = completionMarkerDurationMs(uri, positionMs, durationMs)
+        progress.cache(uri, positionMs, durationMs, markerDurationMs)
+    }
+
+    /**
+     * 完成标记写入的时长。
+     *
+     * 播放器解析时长与列表（MediaStore / 扫描）时长可能相差数秒，而读侧一律用列表时长
+     * 判断「已播完」（列表进度、续播判定）。只要任一来源判定播完，标记就按列表时长写入：
+     * 否则后台播完的条目会因为两个时长口径不一致被当成未播完，还留出一个续播点。
+     */
+    private fun completionMarkerDurationMs(
+        uri: String?,
+        positionMs: Long,
+        playerDurationMs: Long,
+    ): Long {
+        val playlistMs = playlistDurationMs(uri)
+        if (playlistMs <= 0) return playerDurationMs
+        val finished = isProgressFinished(positionMs, playerDurationMs) ||
+            isProgressFinished(positionMs, playlistMs)
+        return if (finished) playlistMs else playerDurationMs
+    }
+
+    /** 列表（扫描）时长；没有记录时返回 0。 */
+    private fun playlistDurationMs(uri: String?): Long = uri
+        ?.let { key ->
+            PlayerRepository.getPlaylist().firstOrNull { it.uri.toString() == key }?.duration
+        }
+        ?.takeIf { it > 0 }
+        ?: 0L
 
     private fun restoreResumePosition(mediaItem: MediaItem?, reason: Int) {
         val player = this.player ?: return
         if (!shouldRestoreResume(reason, player.currentPosition, RESUME_START_TOLERANCE_MS)) return
         val uri = mediaItem.uriString ?: return
         // 新条目尚未 READY，优先用扫描到的时长判断已看完
-        val playlistDuration = PlayerRepository.getPlaylist()
-            .firstOrNull { it.uri.toString() == uri }
-            ?.duration
-            ?: 0L
-        val duration = playlistDuration.takeIf { it > 0 }
+        val duration = playlistDurationMs(uri).takeIf { it > 0 }
             ?: player.duration.takeIf { it > 0 }
             ?: 0L
         val position = resumablePositionMs(PlayerRepository.getProgress(uri), duration) ?: return
@@ -274,7 +301,7 @@ class PlayerService : MediaSessionService() {
         if (oldPosition.mediaItemIndex !in 0 until player.currentTimeline.windowCount) return
         val window = Timeline.Window()
         player.currentTimeline.getWindow(oldPosition.mediaItemIndex, window)
-        progress.cache(
+        cachePosition(
             window.mediaItem.uriString,
             oldPosition.positionMs,
             window.durationMs
@@ -409,9 +436,20 @@ internal class ProgressCache {
 
     private var lastPersisted: Map<String, Long> = emptyMap()
 
-    fun cache(uri: String?, positionMs: Long, durationMs: Long) {
+    /**
+     * 缓存一条进度。
+     *
+     * [durationMs] 是播放器解析出的时长，[markerDurationMs] 是已播完时写入的完成标记
+     * 时长（按列表时长口径，见 [decideProgressWrite]），默认与 [durationMs] 相同。
+     */
+    fun cache(
+        uri: String?,
+        positionMs: Long,
+        durationMs: Long,
+        markerDurationMs: Long = durationMs,
+    ) {
         if (uri == null || uri in pendingDrops) return
-        when (val decision = decideProgressWrite(positionMs, durationMs)) {
+        when (val decision = decideProgressWrite(positionMs, durationMs, markerDurationMs)) {
             is ProgressWriteDecision.Store -> cached[uri] = decision.positionMs
             ProgressWriteDecision.Skip -> Unit
         }
@@ -440,6 +478,9 @@ internal class ProgressCache {
     fun hasPendingDrops(): Boolean = pendingDrops.isNotEmpty()
 
     fun hasPendingRemovals(): Boolean = removals.isNotEmpty()
+
+    /** 是否还有未落盘的进度（待删除项或值有变化的写入）。 */
+    fun hasPendingChanges(): Boolean = removals.isNotEmpty() || writes().isNotEmpty()
 
     fun pendingRemovals(): Set<String> = removals.toSet()
 
@@ -481,6 +522,17 @@ internal fun isExplicitSeekToZero(
     sameItem &&
     oldPositionMs > 0L &&
     newPositionMs == 0L
+
+/**
+ * 跨条目位置跳变时是否要按旧条目补记进度。
+ *
+ * 用户 seek 与自动连播都会换到新条目：换项那一刻播放器已经是新条目，旧条目的位置与
+ * 时长只剩 [Player.PositionInfo] 里可靠（自动连播时旧位置正是上一项的精确末尾），
+ * 据此写入上一项的完成标记。
+ */
+internal fun shouldCacheOldItemOnDiscontinuity(reason: Int): Boolean =
+    reason == Player.DISCONTINUITY_REASON_SEEK ||
+        reason == Player.DISCONTINUITY_REASON_AUTO_TRANSITION
 
 internal fun shouldRestoreResume(
     reason: Int,

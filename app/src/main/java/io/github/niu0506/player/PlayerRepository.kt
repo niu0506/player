@@ -1071,9 +1071,23 @@ internal fun resumablePositionMs(positionMs: Long?, durationMs: Long): Long? =
         null
     }
 
-internal fun decideProgressWrite(positionMs: Long, durationMs: Long): ProgressWriteDecision {
-    if (isProgressFinished(positionMs, durationMs)) {
-        return ProgressWriteDecision.Store(durationMs)
+/**
+ * 进度写入裁决。
+ *
+ * [durationMs] 是播放器解析出的时长；[markerDurationMs] 是判定已播完时写入的完成标记
+ * 时长（读侧口径，通常是列表/扫描时长），默认与 [durationMs] 相同。两套时长可能相差
+ * 数秒，只要任一来源判定播完，标记就按读侧口径写入，否则读侧会把它当成未播完并留出
+ * 续播点。位置或时长未知时按位置记录，0 跳过（0 不覆盖旧值）。
+ */
+internal fun decideProgressWrite(
+    positionMs: Long,
+    durationMs: Long,
+    markerDurationMs: Long = durationMs,
+): ProgressWriteDecision {
+    if (isProgressFinished(positionMs, durationMs) ||
+        isProgressFinished(positionMs, markerDurationMs)
+    ) {
+        return ProgressWriteDecision.Store(markerDurationMs)
     }
     if (positionMs <= 0) return ProgressWriteDecision.Skip
     return ProgressWriteDecision.Store(positionMs)
