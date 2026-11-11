@@ -1686,56 +1686,6 @@ class MediaStoreUriTest {
     }
 }
 
-class DatabaseSelfHealTest {
-
-    @Test
-    fun `malformed database message is self healable`() {
-        assertTrue(
-            isSelfHealableDatabaseFailure(
-                RuntimeException("database disk image is malformed")
-            )
-        )
-    }
-
-    @Test
-    fun `missing migration is self healable`() {
-        assertTrue(
-            isSelfHealableDatabaseFailure(
-                IllegalStateException(
-                    "A migration from 1 to 2 was required but not found. " +
-                        "Please provide the necessary Migration path."
-                )
-            )
-        )
-    }
-
-    @Test
-    fun `wrapped migration failure is self healable`() {
-        assertTrue(
-            isSelfHealableDatabaseFailure(
-                IllegalStateException(
-                    "open failed",
-                    IllegalStateException("Room cannot verify the data integrity.")
-                )
-            )
-        )
-    }
-
-    @Test
-    fun `disk full is not self healable`() {
-        assertFalse(
-            isSelfHealableDatabaseFailure(
-                RuntimeException("No space left on device")
-            )
-        )
-    }
-
-    @Test
-    fun `generic failure is not self healable`() {
-        assertFalse(isSelfHealableDatabaseFailure(IllegalStateException("Something else")))
-    }
-}
-
 class QueueDiffTest {
 
     private fun snap(uri: String, title: String = uri) = QueueItemSnapshot(uri, title)

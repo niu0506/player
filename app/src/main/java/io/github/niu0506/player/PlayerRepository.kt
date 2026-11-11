@@ -5,7 +5,6 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.content.pm.PackageManager
 import android.database.Cursor
-import android.database.sqlite.SQLiteDatabaseCorruptException
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
@@ -24,9 +23,7 @@ import androidx.room.PrimaryKey
 import androidx.room.Query
 import androidx.room.Room
 import androidx.room.RoomDatabase
-import androidx.room.migration.Migration
 import androidx.room.withTransaction
-import androidx.sqlite.db.SupportSQLiteDatabase
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
@@ -525,7 +522,7 @@ interface KvDao {
     suspend fun put(entry: KvEntity)
 }
 
-/** Room 数据库：升级版本需补 Migration 并提交 schema。 */
+/** Room 数据库：表结构变更时由破坏性迁移直接重建。 */
 @Database(
     entities = [PlaylistItemEntity::class, ProgressEntity::class, KvEntity::class],
     version = 2,
@@ -535,15 +532,6 @@ abstract class PlayerDatabase : RoomDatabase() {
     abstract fun playlistDao(): PlaylistDao
     abstract fun progressDao(): ProgressDao
     abstract fun kvDao(): KvDao
-
-    companion object {
-        /** v1→v2：playlist 新增 folder 列。 */
-        internal val MIGRATION_1_2 = object : Migration(1, 2) {
-            override fun migrate(db: SupportSQLiteDatabase) {
-                db.execSQL("ALTER TABLE playlist ADD COLUMN folder TEXT NOT NULL DEFAULT ''")
-            }
-        }
-    }
 }
 
 /** 全局仓库：内存状态为权威读取源，写库串行执行。 */
@@ -588,10 +576,6 @@ object PlayerRepository {
     /** 写代际：重置时自增；旧代际的写任务会在提交前被丢弃。 */
     @Volatile
     private var writeGeneration = 0L
-
-    /** 本进程是否已尝试过自愈，避免反复清库。 */
-    @Volatile
-    private var selfHealAttempted = false
 
     private val DB_SIDECAR_SUFFIXES = arrayOf("", "-wal", "-shm", "-journal")
 
@@ -674,7 +658,6 @@ object PlayerRepository {
                     false
                 } else {
                     synchronized(loadLock) {
-                        selfHealAttempted = false
                         lastLoadAttemptMs = 0L
                         restartLoadLocked()
                     }
@@ -918,7 +901,7 @@ object PlayerRepository {
         loadSucceeded = false
         closeDb()
         lastLoadAttemptMs = nowMs()
-        loadJob = persistScope.async { loadInternal(ctx) }
+        loadJob = persistScope.async { openAndLoad(ctx) }
     }
 
     private fun nowMs(): Long = System.nanoTime() / 1_000_000
@@ -949,23 +932,9 @@ object PlayerRepository {
         return result == true
     }
 
-    private suspend fun loadInternal(appCtx: Context) {
-        try {
-            openAndLoad(appCtx)
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            if (selfHealAttempted || !isSelfHealableDatabaseFailure(e)) throw e
-            selfHealAttempted = true
-            Log.e(TAG, "数据库损坏或迁移失败，备份旧库后重建", e)
-            if (!backupAndResetDatabaseFiles(appCtx)) throw e
-            openAndLoad(appCtx)
-        }
-    }
-
     private suspend fun openAndLoad(appCtx: Context) {
         val database = Room.databaseBuilder(appCtx, PlayerDatabase::class.java, DB_NAME)
-            .addMigrations(PlayerDatabase.MIGRATION_1_2)
+            .fallbackToDestructiveMigration(dropAllTables = true)
             .build()
         db = database
         val playlist = database.playlistDao().getAll().map {
@@ -983,66 +952,6 @@ object PlayerRepository {
         }
         loadSucceeded = true
     }
-
-    private fun backupAndResetDatabaseFiles(appCtx: Context): Boolean {
-        val dbFile = appCtx.getDatabasePath(DB_NAME)
-        val backupDir = File(appCtx.noBackupFilesDir, "db-backup-${System.currentTimeMillis()}")
-        return try {
-            closeDb("关闭损坏数据库失败")
-            if (dbFile.exists()) {
-                if (!backupDir.mkdirs() && !backupDir.isDirectory) {
-                    Log.e(TAG, "无法创建数据库备份目录: ${backupDir.absolutePath}")
-                    return false
-                }
-                for (suffix in DB_SIDECAR_SUFFIXES) {
-                    val source = File(dbFile.path + suffix)
-                    if (!source.exists()) continue
-                    try {
-                        source.copyTo(File(backupDir, source.name), overwrite = true)
-                    } catch (e: Exception) {
-                        // 主库必须备份成功；旁路文件失败可忽略
-                        if (suffix.isEmpty()) throw e
-                        Log.w(TAG, "备份数据库旁路文件失败: ${source.name}", e)
-                    }
-                }
-                Log.w(TAG, "旧数据库已备份到 ${backupDir.absolutePath}")
-            }
-            if (!deleteDatabaseFiles(appCtx, dbFile)) {
-                Log.e(TAG, "删除损坏数据库失败: ${dbFile.absolutePath}")
-                false
-            } else {
-                synchronized(stateLock) { clearMemoryStateLocked() }
-                true
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "备份或重建数据库失败", e)
-            false
-        }
-    }
-}
-
-internal fun isSelfHealableDatabaseFailure(error: Throwable): Boolean {
-    var current: Throwable? = error
-    while (current != null) {
-        val message = current.message.orEmpty().lowercase(Locale.US)
-        if (current is SQLiteDatabaseCorruptException) return true
-        if ("database disk image is malformed" in message ||
-            "file is encrypted or is not a database" in message ||
-            "database corruption" in message ||
-            "no such table: room_master_table" in message
-        ) {
-            return true
-        }
-        if (current is IllegalStateException &&
-            ("a migration from" in message ||
-                "migration didn't properly handle" in message ||
-                "room cannot verify the data integrity" in message)
-        ) {
-            return true
-        }
-        current = current.cause
-    }
-    return false
 }
 
 internal sealed interface ProgressWriteDecision {

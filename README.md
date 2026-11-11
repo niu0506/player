@@ -44,7 +44,7 @@ app/schemas/             # Room 导出 schema（需提交）
 
 ## 开发注意事项
 
-- **Room 迁移**：未启用破坏性迁移，升级必须补 `Migration` 并提交 `app/schemas/` 下的 JSON。
+- **Room 迁移**：使用破坏性迁移（`fallbackToDestructiveMigration`），表结构变更直接重建数据库，不做数据保留；`app/schemas/` 下的 JSON 仍会随构建导出，仅作结构参考。
 - **下载目标**：DownloadManager 只接受 `file://`，更新包直接落到应用专属外部目录 `Android/data/<包名>/files/updates`（`setDestinationInExternalFilesDir`），校验与安装共用这一份，不要再复制到 `filesDir`，避免出现两份安装包。
 - **签名**：优先读环境变量 `KEYSTORE_FILE` / `KEYSTORE_PASSWORD` / `KEY_ALIAS` / `KEY_PASSWORD`，其次读 `keystore.properties`；都缺失时本地输出无签名包，CI 的 `v*` tag 构建强制要求签名。
 - **发布**：`version.json` 是版本唯一来源——递增其中的 `versionCode` / `versionName` 并更新 `notes`，推送同名 `v<versionName>` tag。CI 会校验 tag、notes 与 `versionName` 一致，并核对构建出的 APK。
