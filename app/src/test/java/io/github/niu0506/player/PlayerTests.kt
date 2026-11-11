@@ -876,6 +876,41 @@ class SeekToZeroTest {
     }
 }
 
+class RestoreLastPlayedSeekTest {
+
+    @Test
+    fun `resume point is restored even for the current item`() {
+        assertTrue(shouldSeekOnRestore(hasResumePosition = true, isCurrentItem = true))
+    }
+
+    @Test
+    fun `finished current item keeps its position and memory`() {
+        // 后台播完：只留下完成标记，没有断点，条目仍是当前项 —— 不能再 seek
+        assertFalse(shouldSeekOnRestore(hasResumePosition = false, isCurrentItem = true))
+    }
+
+    @Test
+    fun `another item is always selected`() {
+        assertTrue(shouldSeekOnRestore(hasResumePosition = false, isCurrentItem = false))
+        assertTrue(shouldSeekOnRestore(hasResumePosition = true, isCurrentItem = false))
+    }
+
+    @Test
+    fun `internal seek to zero would be mistaken for an explicit restart`() {
+        val duration = 180_000L
+        // 后台播完写入的是完成标记（总时长），随后不再有可续播位置
+        assertEquals(
+            ProgressWriteDecision.Store(duration),
+            decideProgressWrite(duration, duration)
+        )
+        assertNull(resumablePositionMs(duration, duration))
+        // 这时若还 seek 回 0，服务会按「用户显式回到开头」清掉这条播放记忆
+        assertTrue(isExplicitSeekToZero(Player.DISCONTINUITY_REASON_SEEK, true, duration, 0))
+        // 所以恢复上次播放时必须跳过这次 seek
+        assertFalse(shouldSeekOnRestore(hasResumePosition = false, isCurrentItem = true))
+    }
+}
+
 class OrderedRetryTest {
 
     @Test

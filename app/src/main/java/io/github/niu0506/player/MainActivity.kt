@@ -595,11 +595,21 @@ class MainActivity : AppCompatActivity() {
         playSelectedMedia(pending)
     }
 
-    private fun seekToResume(index: Int) {
+    /**
+     * 按播放记忆定位到 [index]：有断点回到断点，无断点回到条目开头。
+     *
+     * [restoring] 为 true 表示这是界面「恢复上次播放」：无断点且该条目已是当前项时不再
+     * seek。服务侧此刻保留着真实播放位置（例如刚播完停在末尾），若强行 seek 回 0，
+     * 服务会把它当成「用户显式回到开头」而清掉该条目的播放记忆（含「已看完」标记）。
+     */
+    private fun seekToResume(index: Int, restoring: Boolean = false) {
         val ctrl = controller ?: return
         val item = playlist.getOrNull(index)
         val pos = item?.let {
             resumablePositionMs(PlayerRepository.getProgress(it.uri.toString()), it.duration)
+        }
+        if (restoring && !shouldSeekOnRestore(pos != null, ctrl.currentMediaItemIndex == index)) {
+            return
         }
         if (pos != null) ctrl.seekTo(index, pos)
         else ctrl.seekToDefaultPosition(index)
@@ -614,7 +624,7 @@ class MainActivity : AppCompatActivity() {
         val idx = indexOfUri(lastUri)
         if (idx !in playlist.indices) return
 
-        seekToResume(idx)
+        seekToResume(idx, restoring = true)
         syncAdapterPlayingState()
     }
 
@@ -1404,6 +1414,16 @@ internal fun extractPlayableUri(intent: Intent?): Uri? = when (intent?.action) {
 /** 是否媒体库文件（可通过系统删除请求删除）；外部来源的文件只能从播放列表移除。 */
 internal fun isMediaStoreMediaUri(uri: String): Boolean =
     uri.startsWith("content://${MediaStore.AUTHORITY}/", ignoreCase = true)
+
+/**
+ * 恢复上次播放时是否真的需要 seek。
+ *
+ * 有断点必须 seek 回断点；没有断点且该条目已经是当前项时必须保持不动：此时再 seek 只会
+ * 产生一次回到 0 的位置跳变，被服务判定为「用户显式回到开头」而删掉播放记忆。冷启动时
+ * 队列默认停在第一项，所以「不是当前项」仍要 seek，才能选中真正的上次播放条目。
+ */
+internal fun shouldSeekOnRestore(hasResumePosition: Boolean, isCurrentItem: Boolean): Boolean =
+    hasResumePosition || !isCurrentItem
 
 internal data class QueueItemSnapshot(val uri: String, val title: String?)
 
