@@ -465,7 +465,7 @@ data class PlaylistItemEntity(
     val name: String,
     val duration: Long,
     val sortOrder: Int,
-    @ColumnInfo(defaultValue = "''") val folder: String = "",
+    val folder: String = "",
 )
 
 @Entity(tableName = "progress")
@@ -525,8 +525,8 @@ interface KvDao {
 /** Room 数据库：表结构变更时由破坏性迁移直接重建。 */
 @Database(
     entities = [PlaylistItemEntity::class, ProgressEntity::class, KvEntity::class],
-    version = 2,
-    exportSchema = true,
+    version = 3,
+    exportSchema = false,
 )
 abstract class PlayerDatabase : RoomDatabase() {
     abstract fun playlistDao(): PlaylistDao

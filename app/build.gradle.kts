@@ -75,11 +75,6 @@ android {
     }
 }
 
-ksp {
-    // Room 导出的 schema 位置（须提交到版本库，作为迁移 diff 基准）
-    arg("room.schemaLocation", "$projectDir/schemas")
-}
-
 dependencies {
     implementation(libs.media3.exoplayer)
     implementation(libs.media3.ui)

@@ -182,9 +182,8 @@ class UpdateManager(
 
         fun cleanupUpdateApks(context: Context) = clearUpdateApkDirs(context)
 
-        /** 清理下载目录；旧版本校验后的副本在内部 filesDir，一并删除。 */
+        /** 清理下载目录中残留的安装包。 */
         private fun clearUpdateApkDirs(context: Context) {
-            File(context.filesDir, VERIFIED_APK_DIR).listFiles()?.forEach { it.delete() }
             updateDir(context)?.listFiles()?.forEach { it.delete() }
         }
     }
