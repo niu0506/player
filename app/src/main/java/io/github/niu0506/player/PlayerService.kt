@@ -148,7 +148,9 @@ class PlayerService : MediaSessionService() {
     private val progressTicker = Runnable {
         tickerScheduled = false
         if (resetting) return@Runnable
-        if (player?.isPlaying == true || progress.hasPendingRemovals()) {
+        // 只要用户还想播就继续轮询。缓冲、音频焦点暂失、小窗/息屏切换都会让 isPlaying
+        // 短暂为 false，用它当条件会让轮询就此停摆，后台播放的进度再也落不了盘。
+        if (player?.playWhenReady == true || progress.hasPendingRemovals()) {
             persistProgress()
             scheduleProgressTicker()
         }

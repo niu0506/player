@@ -879,20 +879,56 @@ class SeekToZeroTest {
 class RestoreLastPlayedSeekTest {
 
     @Test
-    fun `resume point is restored even for the current item`() {
-        assertTrue(shouldSeekOnRestore(hasResumePosition = true, isCurrentItem = true))
+    fun `resume point is restored when the current item still sits at the start`() {
+        // 队列刚重建：播放器停在开头，按记忆续播
+        assertTrue(
+            shouldSeekOnRestore(hasResumePosition = true, isCurrentItem = true, livePositionMs = 0)
+        )
+    }
+
+    @Test
+    fun `background playback is never rewound to a stale record`() {
+        // 后台已经播到 30 分钟，落盘记录还停在 10 分钟：不能 seek 回去
+        assertFalse(
+            shouldSeekOnRestore(
+                hasResumePosition = true,
+                isCurrentItem = true,
+                livePositionMs = 30 * 60_000L,
+            )
+        )
     }
 
     @Test
     fun `finished current item keeps its position and memory`() {
-        // 后台播完：只留下完成标记，没有断点，条目仍是当前项 —— 不能再 seek
-        assertFalse(shouldSeekOnRestore(hasResumePosition = false, isCurrentItem = true))
+        val duration = 180_000L
+        assertFalse(
+            shouldSeekOnRestore(
+                hasResumePosition = false,
+                isCurrentItem = true,
+                livePositionMs = duration,
+            )
+        )
+        assertFalse(
+            shouldSeekOnRestore(hasResumePosition = false, isCurrentItem = true, livePositionMs = 0)
+        )
     }
 
     @Test
     fun `another item is always selected`() {
-        assertTrue(shouldSeekOnRestore(hasResumePosition = false, isCurrentItem = false))
-        assertTrue(shouldSeekOnRestore(hasResumePosition = true, isCurrentItem = false))
+        assertTrue(
+            shouldSeekOnRestore(hasResumePosition = false, isCurrentItem = false, livePositionMs = 0)
+        )
+        assertTrue(
+            shouldSeekOnRestore(hasResumePosition = true, isCurrentItem = false, livePositionMs = 0)
+        )
+        // 播放器停在别的条目上时，即使它位置很靠后也要切回上次播放的条目
+        assertTrue(
+            shouldSeekOnRestore(
+                hasResumePosition = true,
+                isCurrentItem = false,
+                livePositionMs = 30 * 60_000L,
+            )
+        )
     }
 
     @Test
@@ -907,7 +943,60 @@ class RestoreLastPlayedSeekTest {
         // 这时若还 seek 回 0，服务会按「用户显式回到开头」清掉这条播放记忆
         assertTrue(isExplicitSeekToZero(Player.DISCONTINUITY_REASON_SEEK, true, duration, 0))
         // 所以恢复上次播放时必须跳过这次 seek
-        assertFalse(shouldSeekOnRestore(hasResumePosition = false, isCurrentItem = true))
+        assertFalse(
+            shouldSeekOnRestore(
+                hasResumePosition = false,
+                isCurrentItem = true,
+                livePositionMs = duration,
+            )
+        )
+    }
+}
+
+class SelectPlayingItemSeekTest {
+
+    @Test
+    fun `tapping the item that is already playing keeps the live position`() {
+        assertTrue(
+            shouldKeepLivePositionOnSelect(
+                isCurrentItem = true,
+                ended = false,
+                livePositionMs = 30 * 60_000L,
+            )
+        )
+    }
+
+    @Test
+    fun `tapping a finished item still restarts from the beginning`() {
+        assertFalse(
+            shouldKeepLivePositionOnSelect(
+                isCurrentItem = true,
+                ended = true,
+                livePositionMs = 180_000L,
+            )
+        )
+    }
+
+    @Test
+    fun `tapping another item resumes that item`() {
+        assertFalse(
+            shouldKeepLivePositionOnSelect(
+                isCurrentItem = false,
+                ended = false,
+                livePositionMs = 30 * 60_000L,
+            )
+        )
+    }
+
+    @Test
+    fun `item sitting at the start is positioned by its record`() {
+        assertFalse(
+            shouldKeepLivePositionOnSelect(
+                isCurrentItem = true,
+                ended = false,
+                livePositionMs = 0,
+            )
+        )
     }
 }
 

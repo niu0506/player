@@ -98,6 +98,9 @@ class MainActivity : AppCompatActivity() {
         /** 按钮内联状态的显示时长。 */
         const val INLINE_STATE_MS = 2_000L
 
+        /** 「播放中」进度文本的刷新间隔，与播放器自身的时间刷新一致。 */
+        const val PROGRESS_REFRESH_INTERVAL_MS = 1_000L
+
         const val MENU_CHECK_UPDATE = 1
         const val MENU_BRIGHTNESS_SYSTEM = 2
         const val MENU_RESET_DATA = 3
@@ -424,6 +427,41 @@ class MainActivity : AppCompatActivity() {
         return playlist.indexOfFirst { normalizeUri(it.uri) == key }
     }
 
+    /**
+     * 列表里显示的进度：正在播放的条目直接用播放器实时位置。
+     *
+     * 落盘是定时的（5 秒一次），后台还可能被打断；若只读已记录值，回到界面时就会显示
+     * 「旧的播放进度」，与播放器实际位置对不上。
+     */
+    private fun displayedProgress(uri: String): Long {
+        val ctrl = controller
+        if (ctrl != null && ctrl.currentMediaItem?.uriString == uri) {
+            val live = ctrl.currentPosition
+            if (live > 0L) return live
+        }
+        return PlayerRepository.getProgress(uri) ?: 0L
+    }
+
+    /** 播放中每秒刷新当前条目的进度文本，让它跟着播放器走。 */
+    private val progressRefreshRunnable = object : Runnable {
+        override fun run() {
+            val ctrl = controller
+            if (ctrl != null && ctrl.isPlaying) {
+                adapter.refreshProgress(ctrl.currentMediaItemIndex)
+            }
+            mainHandler.postDelayed(this, PROGRESS_REFRESH_INTERVAL_MS)
+        }
+    }
+
+    private fun scheduleProgressRefresh() {
+        mainHandler.removeCallbacks(progressRefreshRunnable)
+        mainHandler.postDelayed(progressRefreshRunnable, PROGRESS_REFRESH_INTERVAL_MS)
+    }
+
+    private fun cancelProgressRefresh() {
+        mainHandler.removeCallbacks(progressRefreshRunnable)
+    }
+
     /** 首次加载时把仓库列表合并进内存（保留加载失败期间手动扫描的条目）。 */
     private fun loadPlaylist() {
         val merged = mergePlaylistOnLoad(PlayerRepository.getPlaylist(), playlist)
@@ -447,6 +485,9 @@ class MainActivity : AppCompatActivity() {
             if (!isPlaying) {
                 // 服务侧已落盘，这里只刷新界面
                 adapter.refreshProgress(controller?.currentMediaItemIndex ?: -1)
+                cancelProgressRefresh()
+            } else {
+                scheduleProgressRefresh()
             }
         }
 
@@ -598,9 +639,9 @@ class MainActivity : AppCompatActivity() {
     /**
      * 按播放记忆定位到 [index]：有断点回到断点，无断点回到条目开头。
      *
-     * [restoring] 为 true 表示这是界面「恢复上次播放」：无断点且该条目已是当前项时不再
-     * seek。服务侧此刻保留着真实播放位置（例如刚播完停在末尾），若强行 seek 回 0，
-     * 服务会把它当成「用户显式回到开头」而清掉该条目的播放记忆（含「已看完」标记）。
+     * [restoring] 为 true 表示这是界面「恢复上次播放」。两条路径都以服务侧的实时位置为准，
+     * 不把正在播放的进度退回可能过期的落盘断点（见 [shouldSeekOnRestore] 与
+     * [shouldKeepLivePositionOnSelect]）。
      */
     private fun seekToResume(index: Int, restoring: Boolean = false) {
         val ctrl = controller ?: return
@@ -608,7 +649,12 @@ class MainActivity : AppCompatActivity() {
         val pos = item?.let {
             resumablePositionMs(PlayerRepository.getProgress(it.uri.toString()), it.duration)
         }
-        if (restoring && !shouldSeekOnRestore(pos != null, ctrl.currentMediaItemIndex == index)) {
+        val isCurrentItem = ctrl.currentMediaItemIndex == index
+        val livePosition = ctrl.currentPosition
+        val ended = ctrl.playbackState == Player.STATE_ENDED
+        if (restoring) {
+            if (!shouldSeekOnRestore(pos != null, isCurrentItem, livePosition)) return
+        } else if (shouldKeepLivePositionOnSelect(isCurrentItem, ended, livePosition)) {
             return
         }
         if (pos != null) ctrl.seekTo(index, pos)
@@ -1141,7 +1187,7 @@ class MainActivity : AppCompatActivity() {
                     .show()
             },
 
-            getProgress = { uri -> PlayerRepository.getProgress(uri) ?: 0L }
+            getProgress = { uri -> displayedProgress(uri) }
         )
         binding.recyclerPlaylist.adapter = adapter
         binding.recyclerPlaylist.layoutManager = LinearLayoutManager(this)
@@ -1289,6 +1335,10 @@ class MainActivity : AppCompatActivity() {
                 val loaded = PlayerRepository.awaitLoaded(this@MainActivity)
 
                 if (!isCurrentController(future, ctrl)) return@launch
+                // 后台播放期间定时落盘可能被打断（设备休眠 / 进程被冻结），
+                // 回到前台先按播放器实时位置补记一次，别让界面和断点停在旧进度上。
+                PlayerService.flushCurrentPosition()
+                if (ctrl.isPlaying) scheduleProgressRefresh()
                 when {
 
                     // 仓库会自动重试：用顶部内联提示说明状态，不弹底部提示
@@ -1333,6 +1383,7 @@ class MainActivity : AppCompatActivity() {
         cancelScans()
         mainHandler.removeCallbacks(savePlaylistRunnable)
         savePlaylistNow()
+        cancelProgressRefresh()
         deleteHint?.dismiss()
         commitPendingDeletion()
         mainHandler.removeCallbacks(restoreScanButton)
@@ -1353,6 +1404,7 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() {
         // 提示宿主持有 Activity，销毁时移出弱引用表并停掉待执行动画
         clearHintHost()
+        cancelProgressRefresh()
         super.onDestroy()
     }
 
@@ -1418,12 +1470,28 @@ internal fun isMediaStoreMediaUri(uri: String): Boolean =
 /**
  * 恢复上次播放时是否真的需要 seek。
  *
- * 有断点必须 seek 回断点；没有断点且该条目已经是当前项时必须保持不动：此时再 seek 只会
- * 产生一次回到 0 的位置跳变，被服务判定为「用户显式回到开头」而删掉播放记忆。冷启动时
- * 队列默认停在第一项，所以「不是当前项」仍要 seek，才能选中真正的上次播放条目。
+ * 不是当前项时必须 seek，才能选中上次播放的条目（冷启动时队列停在第一项）。已经是当前项
+ * 时以服务侧的实时位置为准：只有它停在开头（队列刚重建）才按断点续播；位置已经往前走了，
+ * 说明这就是后台播放到的位置，再 seek 只会把进度退回旧值，还会被服务判定为
+ * 「用户显式回到开头」而删掉该条目的播放记忆（含「已看完」标记）。
  */
-internal fun shouldSeekOnRestore(hasResumePosition: Boolean, isCurrentItem: Boolean): Boolean =
-    hasResumePosition || !isCurrentItem
+internal fun shouldSeekOnRestore(
+    hasResumePosition: Boolean,
+    isCurrentItem: Boolean,
+    livePositionMs: Long,
+): Boolean = !isCurrentItem || (livePositionMs <= 0L && hasResumePosition)
+
+/**
+ * 用户点选条目时是否保持播放器现状。
+ *
+ * 点的就是当前这条、而且它没播完、位置也已经往前走时，播放器位置才是权威的：此时按落盘
+ * 断点续播只会把后台播到的进度退回旧位置。已播完（用户想重播）或位置停在开头时才动位置。
+ */
+internal fun shouldKeepLivePositionOnSelect(
+    isCurrentItem: Boolean,
+    ended: Boolean,
+    livePositionMs: Long,
+): Boolean = isCurrentItem && !ended && livePositionMs > 0L
 
 internal data class QueueItemSnapshot(val uri: String, val title: String?)
 
