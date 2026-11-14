@@ -48,6 +48,7 @@ import androidx.media3.common.PlaybackException
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
 import androidx.media3.common.TrackSelectionOverride
+import androidx.media3.common.Tracks
 import androidx.media3.common.VideoSize
 import androidx.media3.common.util.RepeatModeUtil
 import androidx.media3.common.util.UnstableApi
@@ -371,10 +372,9 @@ class MainActivity : AppCompatActivity() {
         binding.playerView.keepScreenOn = ctrl.isPlayingVideo()
     }
 
-    /** 没有加载视频时禁用小窗按钮，替代一次性提示；暂停状态下仍可进入小窗。 */
+    /** 没有可用视频轨时禁用小窗按钮；暂停状态下仍可进入小窗。 */
     private fun updatePipButtonState() {
-        val videoSize = controller?.videoSize
-        val enabled = videoSize.hasVideo()
+        val enabled = controller.hasPlayableVideo()
         binding.btnPip.isEnabled = enabled
         binding.btnPip.alpha = if (enabled) 1f else 0.45f
     }
@@ -512,6 +512,12 @@ class MainActivity : AppCompatActivity() {
 
         override fun onVideoSizeChanged(videoSize: VideoSize) {
             updateKeepScreenOn()
+            updatePipButtonState()
+            fullscreenPip.refreshPipParams()
+        }
+
+        override fun onTracksChanged(tracks: Tracks) {
+            // 视频尺寸要等首帧解码，轨道信息更早可用：据此提前放行小窗
             updatePipButtonState()
             fullscreenPip.refreshPipParams()
         }

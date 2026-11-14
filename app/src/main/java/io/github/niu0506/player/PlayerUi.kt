@@ -472,6 +472,35 @@ internal fun VideoSize?.hasVideo(): Boolean =
 internal fun MediaController?.isPlayingVideo(): Boolean =
     this?.isPlaying == true && videoSize.hasVideo()
 
+/** 系统 PiP 只接受 [1/2.39, 2.39] 的宽高比，超出时 setAspectRatio 会抛异常。 */
+internal const val PIP_MIN_ASPECT_RATIO = 1.0 / 2.39
+internal const val PIP_MAX_ASPECT_RATIO = 2.39
+
+/** 视频尺寸未知（首帧未解码）或比例畸形时回退 16:9，超界时夹逼到系统允许区间。 */
+internal fun pipAspectRatio(videoSize: VideoSize?): Rational {
+    val width = videoSize?.width ?: 0
+    val height = videoSize?.height ?: 0
+    if (width <= 0 || height <= 0) return Rational(16, 9)
+    val ratio = width.toDouble() / height
+    return when {
+        ratio > PIP_MAX_ASPECT_RATIO -> Rational(239, 100)
+        ratio < PIP_MIN_ASPECT_RATIO -> Rational(100, 239)
+        else -> Rational(width, height)
+    }
+}
+
+/**
+ * 是否已具备可播放的视频轨：视频尺寸要等首帧解码后才上报，轨道信息更早可用。
+ * 纯音频与编码不受支持的文件不算在内。
+ */
+internal fun MediaController?.hasPlayableVideo(): Boolean {
+    if (this == null) return false
+    if (videoSize.hasVideo()) return true
+    return currentTracks.groups.any { group ->
+        group.type == C.TRACK_TYPE_VIDEO && (0 until group.length()).any { group.isSupported(it) }
+    }
+}
+
 /** 系统亮度（0..255）转 0..1；未知时回退 0.5。 */
 internal fun systemBrightnessToFraction(raw: Int?): Float =
     raw?.coerceIn(0, 255)?.div(255f) ?: 0.5f
@@ -701,22 +730,24 @@ class FullscreenPipHelper(
             .show(WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout())
     }
 
-    fun enterPipWhenPlayingVideo(): Boolean =
-        controllerProvider().isPlayingVideo() && enterPipMode(showError = false)
+    fun enterPipWhenPlayingVideo(): Boolean {
+        val ctrl = controllerProvider() ?: return false
+        return ctrl.isPlaying && ctrl.hasPlayableVideo() && enterPipMode(showError = false)
+    }
 
     fun enterPipMode(showError: Boolean = true): Boolean {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
             if (showError) activity.snack(R.string.toast_pip_unsupported)
             return false
         }
-        val vs = controllerProvider()?.videoSize
-        // 无视频时小窗按钮已禁用，这里只静默拒绝
-        if (vs == null || !vs.hasVideo()) return false
+        val ctrl = controllerProvider()
+        // 无可用视频轨时小窗按钮已禁用，这里只静默拒绝
+        if (ctrl == null || !ctrl.hasPlayableVideo()) return false
         val wasFullscreen = isFullscreen
         if (wasFullscreen) setFullscreen(false)
         applyVisualState(preparing = true)
         try {
-            val ratio = aspectRatioOf(vs) ?: Rational(16, 9)
+            val ratio = pipAspectRatio(ctrl.videoSize)
             if (activity.enterPictureInPictureMode(buildPipParams(ratio, autoEnter = false))) return true
         } catch (_: Exception) {
         }
@@ -726,22 +757,13 @@ class FullscreenPipHelper(
         return false
     }
 
-    private fun aspectRatioOf(videoSize: VideoSize): Rational? =
-        try {
-            Rational(videoSize.width, videoSize.height)
-        } catch (_: Exception) {
-            null
-        }
-
     fun refreshPipParams() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
         val ctrl = controllerProvider()
-        val vs = ctrl?.videoSize
-        val autoEnter = ctrl.isPlayingVideo()
-        val ratio = vs?.let(::aspectRatioOf) ?: Rational(16, 9)
+        val autoEnter = ctrl?.isPlaying == true && ctrl.hasPlayableVideo()
         try {
             activity.setPictureInPictureParams(
-                buildPipParams(ratio, autoEnter = autoEnter)
+                buildPipParams(pipAspectRatio(ctrl?.videoSize), autoEnter = autoEnter)
             )
         } catch (_: Exception) {
         }
