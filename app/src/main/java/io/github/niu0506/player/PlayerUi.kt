@@ -497,7 +497,7 @@ internal fun MediaController?.hasPlayableVideo(): Boolean {
     if (this == null) return false
     if (videoSize.hasVideo()) return true
     return currentTracks.groups.any { group ->
-        group.type == C.TRACK_TYPE_VIDEO && (0 until group.length()).any { group.isSupported(it) }
+        group.type == C.TRACK_TYPE_VIDEO && group.isSupported()
     }
 }
 
