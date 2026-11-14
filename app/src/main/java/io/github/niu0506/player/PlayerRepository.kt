@@ -85,6 +85,17 @@ internal fun findMediaItemIndexByUri(
     } ?: -1
 }
 
+/**
+ * 按归一化 uri 在列表条目中定位；找不到返回 -1。
+ *
+ * 界面列表与适配器列表都要做这件事，归一化口径必须一致，因此只保留这一份实现。
+ */
+internal fun indexOfMediaUri(items: List<MediaItemData>, uri: String?): Int {
+    if (uri == null) return -1
+    val key = normalizeUri(uri)
+    return items.indexOfFirst { normalizeUri(it.uri) == key }
+}
+
 internal fun folderKeyFromRelativePath(relativePath: String?): String =
     relativePath?.trim()?.trim('/')?.trim().orEmpty()
 
@@ -158,6 +169,24 @@ internal fun comparePlaylistItems(a: MediaItemData, b: MediaItemData): Int {
 internal fun sortPlaylist(items: List<MediaItemData>): List<MediaItemData> =
     items.sortedWith(::comparePlaylistItems)
 
+/**
+ * 把播放列表折叠成「归一化 uri → 时长」索引，只保留正时长。
+ *
+ * 归一化口径与列表去重、扫描匹配一致；同一 key 出现多次时保留先出现的那个。
+ */
+internal fun playlistDurationIndex(items: List<MediaItemData>): Map<String, Long> {
+    val index = LinkedHashMap<String, Long>(items.size)
+    // 解构顺序与 MediaItemData 的声明顺序一致：uri / name / duration / folderKey
+    for ((uri, _, duration) in items) {
+        if (duration > 0) index.putIfAbsent(normalizeUri(uri.toString()), duration)
+    }
+    return index
+}
+
+/** 按归一化 uri 在 [index] 里查列表时长；没有记录返回 0。 */
+internal fun playlistDurationFor(index: Map<String, Long>, uri: String?): Long =
+    uri?.let { index[normalizeUri(it)] } ?: 0L
+
 /** 合并数据库与扫描结果，按 URI 去重且数据库顺序优先。 */
 internal fun mergePlaylistOnLoad(
     stored: List<MediaItemData>,
@@ -229,7 +258,6 @@ internal data class ScanReconcileResult(
     val playlist: List<MediaItemData>,
     val addedCount: Int,
     val removedCount: Int,
-    val orderChanged: Boolean,
 )
 
 /** 删除消失项、追加新文件、刷新元数据并重排；手动与静默扫描都导入新文件。 */
@@ -260,7 +288,6 @@ internal fun reconcilePlaylist(
         playlist = ordered,
         addedCount = newItems.size,
         removedCount = current.size - afterPrune.size,
-        orderChanged = ordered.map { it.uri.toString() } != appended.map { it.uri.toString() },
     )
 }
 
@@ -899,9 +926,13 @@ object PlayerRepository {
         val ctx = appContext ?: return
         loadJob = null
         loadSucceeded = false
-        closeDb()
         lastLoadAttemptMs = nowMs()
-        loadJob = persistScope.async { openAndLoad(ctx) }
+        loadJob = persistScope.async {
+            // 关闭旧句柄与写任务排在同一个单并发 scope 上，才能保证不会关掉正在写入的句柄。
+            // 调用 restartLoadLocked 的可能是主线程，不能在这里直接 close。
+            closeDb()
+            openAndLoad(ctx)
+        }
     }
 
     private fun nowMs(): Long = System.nanoTime() / 1_000_000
@@ -924,7 +955,8 @@ object PlayerRepository {
         ) {
             // 拿锁后再次核对代际，避免向重建后的库写旧数据
             if (writeGeneration != generation) return@withOrderedRetry false
-            // 锁内读取，避免向已关闭的旧句柄写入
+            // 锁内读取：句柄的关闭同样排在 persistScope 上（见 restartLoadLocked），
+            // 拿锁后读到的句柄不会在本次事务期间被关掉
             val database = db ?: error("数据库尚未初始化")
             database.withTransaction { database.block() }
             true

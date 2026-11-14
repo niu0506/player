@@ -110,9 +110,6 @@ class MainActivity : AppCompatActivity() {
         const val TAG = "MainActivity"
     }
 
-    /** 撤销窗口内暂存的删除，窗口结束后才清理播放进度。 */
-    private data class PendingDeletion(val item: MediaItemData, val index: Int)
-
     private var pendingDeletion: PendingDeletion? = null
 
     private var deleteHint: HintHandle? = null
@@ -183,7 +180,7 @@ class MainActivity : AppCompatActivity() {
         if (index !in playlist.indices) return
         // 上一笔删除先落定，避免撤销窗口叠加
         deleteHint?.dismiss()
-        commitPendingDeletion()
+        pendingDeletion?.let(::commitPendingDeletion)
         val item = playlist[index]
 
         // 用 URI 定位队列项，避免列表/队列错位时误删
@@ -205,19 +202,22 @@ class MainActivity : AppCompatActivity() {
             // 文件已删除，撤销无法恢复，直接清理进度
             deleteHint = null
             pendingDeletion = null
-            PlayerService.dropProgress(item.uri.toString())
+            PlaybackSession.dropProgress(item.uri.toString())
             snackSuccess(R.string.toast_deleted)
             return
         }
-        // 进度延后清理：撤销窗口内仍可恢复，窗口结束才真正删除
-        pendingDeletion = PendingDeletion(item, index)
+        // 进度延后清理：撤销窗口内仍可恢复，窗口结束才真正删除。
+        // 关闭回调必须捕获「这一笔」而不是捕获方法：提示收起有退出动画，上一条的
+        // 回调会晚于新一笔入队才执行，捕获方法就会拿它去结算新那笔。
+        val pending = PendingDeletion(item, index)
+        pendingDeletion = pending
         deleteHint = showHint(
             message = getString(R.string.toast_deleted),
             long = true,
             kind = HintKind.SUCCESS,
             actionLabel = getString(R.string.undo),
             onAction = { undoDelete() },
-            onDismissed = { commitPendingDeletion() },
+            onDismissed = { commitPendingDeletion(pending) },
         )
     }
 
@@ -234,10 +234,16 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun commitPendingDeletion() {
-        val pending = pendingDeletion ?: return
+    /**
+     * 结算一笔待提交的删除。
+     *
+     * [dismissed] 必须是触发这次回调的那一笔：提示的关闭回调可能晚于下一笔删除执行，
+     * 靠身份校验避免把新那笔提前结算（那会让它的「撤销」静默失效）。
+     */
+    private fun commitPendingDeletion(dismissed: PendingDeletion) {
+        if (!shouldCommitPendingDeletion(pendingDeletion, dismissed)) return
         pendingDeletion = null
-        PlayerService.dropProgress(pending.item.uri.toString())
+        PlaybackSession.dropProgress(dismissed.item.uri.toString())
     }
 
     /** 删除媒体文件：Android 11+ 统一弹系统删除确认，低版本按各自规则取得授权。 */
@@ -329,7 +335,7 @@ class MainActivity : AppCompatActivity() {
         if (index >= 0) {
             removeItemFromPlaylist(index, undoable = false)
         } else {
-            PlayerService.dropProgress(uri.toString())
+            PlaybackSession.dropProgress(uri.toString())
             snackSuccess(R.string.toast_deleted)
         }
     }
@@ -399,8 +405,9 @@ class MainActivity : AppCompatActivity() {
         )
     }
 
-    private fun updateDurationAt(index: Int, duration: Long) {
-        if (index !in playlist.indices || playlist[index].duration == duration) return
+    private fun updateDurationAt(uri: String, duration: Long) {
+        val index = indexOfUri(uri)
+        if (index < 0 || playlist[index].duration == duration) return
         playlist[index] = playlist[index].copy(duration = duration)
         // 差分中或列表未同步时退回整表提交，避免被旧结果覆盖
         if (adapter.isDiffing || !adapter.updateItem(playlist[index])) submitPlaylist()
@@ -422,10 +429,7 @@ class MainActivity : AppCompatActivity() {
         PlayerRepository.savePlaylist(playlist.toList())
     }
 
-    private fun indexOfUri(uri: String): Int {
-        val key = normalizeUri(uri)
-        return playlist.indexOfFirst { normalizeUri(it.uri) == key }
-    }
+    private fun indexOfUri(uri: String): Int = indexOfMediaUri(playlist, uri)
 
     /**
      * 列表里显示的进度。
@@ -446,7 +450,7 @@ class MainActivity : AppCompatActivity() {
         override fun run() {
             val ctrl = controller
             if (ctrl != null && ctrl.isPlaying) {
-                adapter.refreshProgress(ctrl.currentMediaItemIndex)
+                adapter.refreshProgress(ctrl.currentMediaItem.uriString)
             }
             mainHandler.postDelayed(this, PROGRESS_REFRESH_INTERVAL_MS)
         }
@@ -483,7 +487,7 @@ class MainActivity : AppCompatActivity() {
             fullscreenPip.refreshPipParams()
             if (!isPlaying) {
                 // 服务侧已落盘，这里只刷新界面
-                adapter.refreshProgress(controller?.currentMediaItemIndex ?: -1)
+                adapter.refreshProgress(controller?.currentMediaItem?.uriString)
                 cancelProgressRefresh()
             } else {
                 scheduleProgressRefresh()
@@ -492,10 +496,11 @@ class MainActivity : AppCompatActivity() {
 
         override fun onPlaybackStateChanged(playbackState: Int) {
             if (playbackState == Player.STATE_READY) {
-                val index = controller?.currentMediaItemIndex ?: -1
+                // 按 uri 回填时长：队列下标在队列尚未与列表对齐时会指错条目
+                val uri = controller?.currentMediaItem?.uriString
                 val duration = controller?.duration ?: C.TIME_UNSET
-                if (duration != C.TIME_UNSET && duration > 0 && index in playlist.indices) {
-                    updateDurationAt(index, duration)
+                if (uri != null && duration != C.TIME_UNSET && duration > 0) {
+                    updateDurationAt(uri, duration)
                 }
             }
         }
@@ -535,7 +540,7 @@ class MainActivity : AppCompatActivity() {
     private fun rebuildQueueAndClearPending(ctrl: MediaController) {
         rebuildQueueIfNeeded(ctrl)
         if (queueMatchesPlaylist(ctrl)) {
-            PlayerService.clearAllPendingDrops()
+            PlaybackSession.clearAllPendingDrops()
         }
     }
 
@@ -567,7 +572,7 @@ class MainActivity : AppCompatActivity() {
             val items = playlist.map(::buildMediaItem)
             if (curIdx >= 0) {
                 // 仅在当前项仍在列表时先落盘
-                PlayerService.flushCurrentPosition()
+                PlaybackSession.flushCurrentPosition()
                 ctrl.setMediaItems(items, curIdx, curPos)
             } else {
                 ctrl.setMediaItems(items)
@@ -622,8 +627,8 @@ class MainActivity : AppCompatActivity() {
         // 队列可能还没与列表对齐（如服务重建后为空），先补齐再按下标 seek
         rebuildQueueIfNeeded(ctrl)
         if (index !in 0 until ctrl.mediaItemCount) return
-        PlayerService.resetErrorCount()
-        PlayerService.flushCurrentPosition()
+        PlaybackSession.resetErrorCount()
+        PlaybackSession.flushCurrentPosition()
         seekToResume(index)
         ctrl.play()
     }
@@ -892,7 +897,7 @@ class MainActivity : AppCompatActivity() {
             }
             return
         }
-        PlayerService.dropProgress(prune.removedUris)
+        PlaybackSession.dropProgress(prune.removedUris)
         val result = reconcilePlaylist(
             current = playlist,
             scannedVideos = scannedVideos,
@@ -1039,7 +1044,7 @@ class MainActivity : AppCompatActivity() {
         popup.setOnMenuItemClickListener { item ->
             when (item.itemId) {
                 MENU_CHECK_UPDATE -> {
-                    updateManager.checkForUpdate(manual = true)
+                    updateManager.checkForUpdate()
                     true
                 }
                 MENU_BRIGHTNESS_SYSTEM -> {
@@ -1075,7 +1080,7 @@ class MainActivity : AppCompatActivity() {
         pendingDeletion = null
         hideScanNotice()
         // 重置期间禁止服务侧写进度，避免旧进度写回
-        PlayerService.beginReset()
+        PlaybackSession.beginReset()
         controller?.stop()
         controller?.clearMediaItems()
         lifecycleScope.launch {
@@ -1083,7 +1088,7 @@ class MainActivity : AppCompatActivity() {
                 PlayerRepository.resetAllData(this@MainActivity)
             } finally {
                 // 无论成功与否都恢复落盘
-                PlayerService.endReset()
+                PlaybackSession.endReset()
             }
             if (isFinishing || isDestroyed) return@launch
             if (!ok) {
@@ -1117,14 +1122,15 @@ class MainActivity : AppCompatActivity() {
         lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
                 launch {
-                    // 保存失败由仓库自动重试，界面只记录日志，不再打扰用户
+                    // 这个信号只在仓库重试全部用尽后才发出，不会再有自动重试：
+                    // 内存已更新而磁盘未落盘，界面只记录日志，不打扰用户。
                     PlayerRepository.writeFailures.collect {
-                        Log.w(TAG, "本地数据保存失败，稍后自动重试")
+                        Log.w(TAG, "本地数据保存失败：重试已用尽，本次变更未落盘")
                     }
                 }
 
                 launch {
-                    PlayerService.errorEvents.collect { event ->
+                    PlaybackSession.errorEvents.collect { event ->
                         when {
                             // 全部失败：升级为阻断弹窗，引导重新扫描
                             event.exhausted -> showPlaybackAllFailedDialog()
@@ -1143,6 +1149,17 @@ class MainActivity : AppCompatActivity() {
                                 }
                                 snackMessage(getString(res, name), kind = HintKind.ERROR)
                             }
+                        }
+                    }
+                }
+
+                launch {
+                    // errorEvents 在界面不可见时收不到（后台播完失败正是主场景），
+                    // 这里订阅会重放当前值的致命失败，回到前台补一次弹窗并消费掉。
+                    PlaybackSession.fatalFailures.collect { event ->
+                        if (event != null) {
+                            showPlaybackAllFailedDialog()
+                            PlaybackSession.consumeFatalFailure()
                         }
                     }
                 }
@@ -1278,7 +1295,7 @@ class MainActivity : AppCompatActivity() {
         }
         if (index < 0) return
         rebuildQueueIfNeeded(ctrl)
-        PlayerService.resetErrorCount()
+        PlaybackSession.resetErrorCount()
         ctrl.seekTo(index, 0)
         ctrl.play()
         // 外部打开请求优先于列表点击
@@ -1336,7 +1353,7 @@ class MainActivity : AppCompatActivity() {
                 if (!isCurrentController(future, ctrl)) return@launch
                 // 后台播放期间定时落盘可能被打断（设备休眠 / 进程被冻结），
                 // 回到前台先按播放器实时位置补记一次，别让界面和断点停在旧进度上。
-                PlayerService.flushCurrentPosition()
+                PlaybackSession.flushCurrentPosition()
                 if (ctrl.isPlaying) scheduleProgressRefresh()
                 when {
 
@@ -1384,7 +1401,7 @@ class MainActivity : AppCompatActivity() {
         savePlaylistNow()
         cancelProgressRefresh()
         deleteHint?.dismiss()
-        commitPendingDeletion()
+        pendingDeletion?.let(::commitPendingDeletion)
         mainHandler.removeCallbacks(restoreScanButton)
         restoreScanButton.run()
         mainHandler.removeCallbacks(restoreMoreButton)
@@ -1409,7 +1426,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onPause() {
         super.onPause()
-        PlayerService.flushCurrentPosition()
+        PlaybackSession.flushCurrentPosition()
     }
 
     override fun onUserLeaveHint() {
@@ -1453,6 +1470,21 @@ class MainActivity : AppCompatActivity() {
 }
 
 // 播放队列差分：只描述增/删/移/换，不依赖 Media3，便于单测。
+
+/** 撤销窗口内暂存的删除；[index] 是删除时它在列表中的位置。 */
+internal data class PendingDeletion(val item: MediaItemData, val index: Int)
+
+/**
+ * 一次提示的关闭回调能否结算 [current] 这笔待提交删除。
+ *
+ * 提示收起带退出动画，上一条提示的关闭回调会晚于下一笔删除入队才执行；回调必须携带
+ * 产生它的那一笔，只有它仍是当前待提交项时才允许结算，否则会把新那笔提前结算掉，
+ * 使它的「撤销」静默失效、并把它的播放进度提前清除。
+ */
+internal fun shouldCommitPendingDeletion(
+    current: PendingDeletion?,
+    dismissed: PendingDeletion,
+): Boolean = current === dismissed
 
 /** 从 ACTION_VIEW / ACTION_SEND 意图中取出待播放的媒体 URI。 */
 internal fun extractPlayableUri(intent: Intent?): Uri? = when (intent?.action) {

@@ -25,7 +25,7 @@ Android 本地音视频播放器：Kotlin + 单 Activity + `MediaSessionService`
 - 随机播放与循环（关闭 / 单曲 / 全部）由控制栏切换。
 - 倍速 0.5x–3x，共 7 档：0.5 / 0.75 / 1 / 1.25 / 1.5 / 2 / 3。
 - 多音轨切换与内嵌字幕选择：字幕可「关闭 / 自动 / 指定轨道」，音轨只提供「自动 / 指定轨道」（不提供关闭，避免静音难以恢复）。
-- 播放出错自动跳到下一项；整份列表都无法播放时弹出阻断弹窗，引导重新扫描。
+- 播放出错自动跳到下一项；已到队尾但前面还有本轮没试过的条目时，回到最前面那条继续（单曲循环不回绕）。本轮所有条目都试过且都失败，才判定「整份列表都无法播放」并弹阻断弹窗引导重新扫描；该判定在后台同样记录，回到前台会补上弹窗。
 - 仅在播放视频时保持屏幕常亮；纯音频不阻止息屏。耳机拔出自动暂停，音频焦点交由 ExoPlayer 处理。
 
 ### 手势与控制栏
@@ -34,6 +34,7 @@ Android 本地音视频播放器：Kotlin + 单 Activity + `MediaSessionService`
 - 双击画面：左 1/3 快退 15 秒，中间 1/3 播放 / 暂停，右 1/3 快进 15 秒。
 - 横向滑动：拖动进度（整屏滑动约等于 1.2 倍时长），松手才真正 seek。
 - 竖向滑动：左半屏调亮度，右半屏调音量；浮层实时显示百分比，松手后隐藏。
+- 位移按每帧增量累加、方向判定带 12dp 阈值；第二根手指落下时本轮手势作废，避免指间距被当成位移。
 - 亮度会记忆在 SharedPreferences，可通过「更多 → 亮度跟随系统」恢复跟随系统。
 - 控制栏（`custom_player_control_view.xml`，不依赖 Media3 私有资源）：当前时间 / 总时长、音轨、字幕、随机、循环、倍速、全屏、更多；居中为上一项 / 播放暂停 / 下一项；全屏时左上角有返回键。快进快退只由双击手势提供，不设独立按钮。
 - 全屏顶部信息条：文件名 / 系统时间 / 电量百分比，随控制栏一起显隐，每 30 秒刷新。
@@ -68,7 +69,7 @@ Android 本地音视频播放器：Kotlin + 单 Activity + `MediaSessionService`
 - 检查 `https://api.github.com/repos/niu0506/player/releases/latest`，按 `versionName` 分段数字比较判断是否有新版本。
 - 用 `DownloadManager` 下载 `player-v<版本>-release.apk` 到应用专属外部目录 `Android/data/io.github.niu0506.player/files/updates/`。
 - 安装前校验三项：APK 包名与当前应用一致、归档 `versionName` 与检查到的版本字符串一致、文件 SHA-256 与 Release asset 的 `digest` 一致；缺少 `digest` 的包按「无法验证完整性」处理，取消安装并提示手动下载。
-- 通过 `FileProvider` 以 `content://` 交给系统安装器；Android 8+ 未授权时引导到「安装未知应用」设置页，回到前台自动续跑。升级完成后由 `PackageReplacedReceiver` 清理残留安装包。
+- 通过 `FileProvider` 以 `content://` 交给系统安装器；Android 8+ 未授权时引导到「安装未知应用」设置页。取消该引导后不再每次回到前台都重算哈希并重弹，重新触发走「检查更新」，授权完成回到前台自动续跑。升级完成后由 `PackageReplacedReceiver` 清理残留安装包。
 
 ## 环境要求
 
@@ -97,7 +98,8 @@ app/src/main/java/io/github/niu0506/player/
 ├── PlayerRepository.kt  # 数据层：MediaItemData、MediaStore 扫描、自然序排序与对账、
 │                        #   Room（playlist / progress / kv）与内存状态、缺失文件记录
 ├── PlayerService.kt     # MediaSessionService：ExoPlayer 与 MediaSession 托管、断点续播、
-│                        #   进度落盘（ProgressCache）、错误跳过与事件上报
+│                        #   进度落盘（ProgressCache）、错误跳过与事件上报；文件末尾是
+│                        #   PlaybackSession（界面访问服务的唯一入口）与播放错误事件类型
 ├── PlayerUi.kt          # 手势（GestureController）、全屏与小窗（FullscreenPipHelper）、
 │                        #   选择面板、提示胶囊（HintHost/HintHandle）、列表适配器
 └── UpdateManager.kt     # UpdateChecker + UpdateManager + PackageReplacedReceiver：
@@ -147,7 +149,7 @@ app/src/main/res/        # 布局、样式与图标：控制器 / 提示图标�
 - 时长未知或短于 5 秒的媒体不会自动入库，避免把提示音、片段混进列表。
 - 字幕仅支持视频内嵌轨道，不支持外部 `.srt` / `.ass`。
 - 前台服务通知使用 Media3 默认渠道与样式，未做自定义。
-- 进度、缺失记录与播放列表都以原始 URI 字符串为键，去查询参数 / 去尾斜杠的归一化只用于去重与扫描匹配，两处口径并不完全一致。
+- 进度、缺失记录与播放列表都以原始 URI 字符串为键；去查询参数 / 去尾斜杠的归一化用于去重、扫描匹配，以及界面定位与列表时长查询，存储层与查询层的口径并不完全一致。
 - 「选中项」部分授权（`READ_MEDIA_VISUAL_USER_SELECTED`）下扫描不做特殊提示，缺失判定会更保守地依赖 24 小时宽限期。
 - 未覆写 `onSaveInstanceState`，界面重建后的状态依赖仓库与当前 Intent。
 

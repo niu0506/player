@@ -166,6 +166,9 @@ class UpdateManager(
         private const val KEY_DOWNLOAD_VERSION = "downloadVersion"
         private const val KEY_DOWNLOAD_SHA256 = "downloadSha256"
 
+        /** 用户取消过安装授权引导：抑制自动重试，避免每次回前台都重算哈希并重弹。 */
+        private const val KEY_INSTALL_DECLINED = "installDeclined"
+
         private const val APK_MIME = "application/vnd.android.package-archive"
         private const val APK_NAME_PREFIX = "player-v"
         private const val APK_NAME_SUFFIX = "-release.apk"
@@ -277,7 +280,7 @@ class UpdateManager(
         }
     }
 
-    fun resumePendingDownload() {
+    fun resumePendingDownload(force: Boolean = false) {
         activity.lifecycleScope.launch {
             val pending = readPendingDownload() ?: return@launch
             if (pending.version.isBlank()) {
@@ -289,27 +292,36 @@ class UpdateManager(
                 clearPersistedDownload()
                 return@launch
             }
+            // 用户取消过安装授权：不要每次回到前台都重算整包哈希、重弹同一个框，
+            // 否则只有一个退不出的中间态。重新触发走「检查更新」那条显式路径。
+            if (!force && isInstallDeclined()) return@launch
             handleDownloadOutcome(pending.id)
         }
     }
 
-    /** 检查更新；manual 时提示结果。 */
-    fun checkForUpdate(manual: Boolean) {
+    /** 用户主动检查更新：失败与「已是最新」都要有反馈。 */
+    fun checkForUpdate() {
+        // 主动更新视为用户明确要求继续：解除「已取消安装授权」的抑制
+        setInstallDeclined(false)
         activity.lifecycleScope.launch(Dispatchers.IO) {
+            // 已有下载产物：直接接着走安装流程。否则 presentUpdateDialog 里的「立即更新」
+            // 会因为 hasActiveDownload() 为真而被静默跳过，用户点了没反应。
+            if (readPendingDownload() != null) {
+                withContext(Dispatchers.Main) { resumePendingDownload(force = true) }
+                return@launch
+            }
             val release = UpdateChecker.checkLatest()
             withContext(Dispatchers.Main) {
                 if (activity.isFinishing || activity.isDestroyed) return@withContext
 
                 val current = installedVersionName()
                 when {
-                    current == null || release == null -> if (manual) {
+                    current == null || release == null ->
                         activity.snackError(R.string.update_check_failed)
-                    }
-                    !UpdateChecker.isNewer(release.version, current) -> if (manual) {
+                    !UpdateChecker.isNewer(release.version, current) ->
                         // 结果内联到「更多」入口，不再弹底部提示
                         onUpToDate?.invoke()
                             ?: activity.snack(R.string.update_up_to_date_short)
-                    }
                     else -> whenResumed { presentUpdateDialog(release) }
                 }
             }
@@ -429,6 +441,18 @@ class UpdateManager(
         downloadPrefs.edit {
             remove(KEY_DOWNLOAD_ID).remove(KEY_DOWNLOAD_VERSION)
                 .remove(KEY_DOWNLOAD_SHA256)
+                // 抑制标记不能比它所属的那次下载活得更久
+                .remove(KEY_INSTALL_DECLINED)
+        }
+    }
+
+    private fun isInstallDeclined(): Boolean =
+        downloadPrefs.getBoolean(KEY_INSTALL_DECLINED, false)
+
+    private fun setInstallDeclined(declined: Boolean) {
+        downloadPrefs.edit {
+            if (declined) putBoolean(KEY_INSTALL_DECLINED, true)
+            else remove(KEY_INSTALL_DECLINED)
         }
     }
 
@@ -564,21 +588,25 @@ class UpdateManager(
         if (activity.isFinishing || activity.isDestroyed) return
         if (installPermissionDialog?.isShowing == true) return
         try {
+            // 只有点「去设置」才算接受引导；取消、返回键、点外部都记为已拒绝
+            var wentToSettings = false
             val dialog = MaterialAlertDialogBuilder(activity)
                 .setTitle(R.string.update_install_permission_title)
                 .setMessage(R.string.update_install_permission_message)
                 .setPositiveButton(R.string.update_install_permission_action) { _, _ ->
+                    wentToSettings = true
                     openInstallPermissionSettings()
                 }
                 .setNegativeButton(R.string.cancel, null)
                 .create()
             dialog.setOnDismissListener {
                 if (installPermissionDialog === dialog) installPermissionDialog = null
+                if (!wentToSettings) setInstallDeclined(true)
             }
             installPermissionDialog = dialog
             dialog.show()
         } catch (e: Exception) {
-            // 弹窗失败是内部异常，交给日志；下次回前台会重新尝试
+            // 弹窗失败是内部异常，交给日志；未记为拒绝，下次回前台会重新尝试
             Log.w(TAG, "显示安装权限提示失败", e)
         }
     }

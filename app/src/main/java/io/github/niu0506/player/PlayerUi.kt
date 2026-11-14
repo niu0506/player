@@ -54,7 +54,6 @@ import io.github.niu0506.player.databinding.DialogSelectionBinding
 import io.github.niu0506.player.databinding.ItemMediaBinding
 import io.github.niu0506.player.databinding.ItemSelectionBinding
 import java.util.Date
-import java.util.WeakHashMap
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -88,11 +87,30 @@ private class HintRequest(
     val onDismissed: (() -> Unit)?,
 )
 
-private val hintHosts = WeakHashMap<Activity, HintHost>()
+/**
+ * 提示宿主挂在 Activity 的装饰视图上，随视图树一起回收。
+ *
+ * 原先用 `WeakHashMap<Activity, HintHost>` 存放：宿主是 value 却强引用作为 key 的
+ * Activity，条目永远不会被回收，那张弱表提供不了任何兜底。改成由视图树持有，
+ * 不再需要静态表维护生命周期。
+ */
+private val HINT_HOST_TAG = R.id.tag_hint_host
 
-/** 界面销毁时释放提示宿主；宿主反向引用 Activity，不主动移除条目会常驻内存。 */
+private fun Activity.attachedHintHost(): HintHost {
+    val decor = window?.decorView
+    val existing = decor?.getTag(HINT_HOST_TAG) as? HintHost
+    if (existing != null) return existing
+    val host = HintHost(this)
+    decor?.setTag(HINT_HOST_TAG, host)
+    return host
+}
+
+/** 界面销毁时停掉待执行回调与残留视图；宿主本身随视图树回收。 */
 internal fun Activity.clearHintHost() {
-    hintHosts.remove(this)?.release()
+    val decor = window?.decorView ?: return
+    val host = decor.getTag(HINT_HOST_TAG) as? HintHost ?: return
+    decor.setTag(HINT_HOST_TAG, null)
+    host.release()
 }
 
 /** 统一的短提示入口：底部深色胶囊，串行排队、重复文案去重。 */
@@ -135,7 +153,7 @@ internal fun Activity.showHint(
     onAction: (() -> Unit)? = null,
     onDismissed: (() -> Unit)? = null,
 ): HintHandle? {
-    val host = hintHosts.getOrPut(this) { HintHost(this) }
+    val host = attachedHintHost()
     val request = HintRequest(message, long, kind, actionLabel, onAction, onDismissed)
     val handle = HintHandle()
     handle.dismisser = { host.dismiss(request) }
@@ -458,6 +476,43 @@ internal fun MediaController?.isPlayingVideo(): Boolean =
 internal fun systemBrightnessToFraction(raw: Int?): Float =
     raw?.coerceIn(0, 255)?.div(255f) ?: 0.5f
 
+/** 亮度可调下限：再低就接近全黑，用户找不回画面。 */
+internal const val MIN_SCREEN_BRIGHTNESS = 0.02f
+
+/** 横向拖动每像素对应的毫秒：整屏滑动约等于 1.2 倍时长，且有下限避免长视频过于灵敏。 */
+internal fun seekMsPerPx(durationMs: Long, widthPx: Int): Float =
+    max(300f, durationMs.toFloat() / widthPx.coerceAtLeast(1) * 1.2f)
+
+/** 横向拖动 [deltaPx]（右为正）后的目标位置。 */
+internal fun seekTargetMs(
+    startMs: Long,
+    deltaPx: Float,
+    durationMs: Long,
+    widthPx: Int,
+): Long = (startMs + deltaPx * seekMsPerPx(durationMs, widthPx))
+    .toLong()
+    .coerceIn(0L, durationMs)
+
+/** 竖向拖动 [deltaPx]（上为正）后的亮度，落在可调范围内。 */
+internal fun brightnessTarget(start: Float, deltaPx: Float, heightPx: Int): Float =
+    (start + deltaPx / heightPx.coerceAtLeast(1)).coerceIn(MIN_SCREEN_BRIGHTNESS, 1f)
+
+/** 竖向拖动 [deltaPx]（上为正）后的音量档位。 */
+internal fun volumeTarget(
+    start: Int,
+    deltaPx: Float,
+    heightPx: Int,
+    maxVolume: Int,
+): Int {
+    if (maxVolume <= 0) return 0
+    val delta = (deltaPx / heightPx.coerceAtLeast(1) * maxVolume).toInt()
+    return (start + delta).coerceIn(0, maxVolume)
+}
+
+/** 音量档位换算成百分比，用于浮层文案。 */
+internal fun volumePercent(volume: Int, maxVolume: Int): Int =
+    if (maxVolume > 0) volume * 100 / maxVolume else 0
+
 @OptIn(UnstableApi::class)
 class FullscreenPipHelper(
     private val activity: AppCompatActivity,
@@ -747,6 +802,9 @@ class GestureController(
         const val BRIGHTNESS_PREFS = "gesture_settings"
         const val KEY_BRIGHTNESS = "manual_brightness"
         const val OVERLAY_HIDE_DELAY_MS = 800L
+
+        /** 判定手势方向所需的最小累计位移，避免抖动与对角滑动在第一帧就被定型。 */
+        const val SWIPE_DIRECTION_SLOP_DP = 12f
     }
 
     /** 本轮手势类型；IGNORED 表示忽略本轮。 */
@@ -764,6 +822,19 @@ class GestureController(
     }
 
     private var gestureMode = Gesture.NONE
+
+    /** 本轮手势跟踪的指针；多指介入时用来判断该收尾还是该作废。 */
+    private var activePointerId = MotionEvent.INVALID_POINTER_ID
+
+    /** 按下点的横坐标，用于判定左半屏调亮度 / 右半屏调音量。 */
+    private var downX = 0f
+
+    /** 累计横向位移（右为正）。用增量累加而不是每次减按下点：指针切换时不会跳变。 */
+    private var seekDeltaPx = 0f
+
+    /** 累计竖向位移（上为正）。 */
+    private var swipeDeltaPx = 0f
+
     private var seekStartPosition = 0L
     private var seekTargetPosition = 0L
     private var brightnessStart = 0f
@@ -824,19 +895,34 @@ class GestureController(
             override fun onScroll(
                 e1: MotionEvent?, e2: MotionEvent, dX: Float, dY: Float
             ): Boolean {
-                val start = e1 ?: return false
                 val ctrl = controllerProvider() ?: return false
+                if (gestureMode == Gesture.IGNORED) return true
 
-                // 首次滑动：按主轴方向与起点位置判定本次手势类型
+                // 累计每帧增量，而不是每次都减最初的按下点：多指介入或跟踪指针切换时，
+                // 从原点重算会把指间距当成位移，亮度/音量/进度会瞬间跳一大截。
+                seekDeltaPx -= dX
+                swipeDeltaPx += dY
+
+                // 位移足够大之前不判定方向，避免抖动和对角滑动被第一帧定型
                 if (gestureMode == Gesture.NONE) {
+                    val slop = SWIPE_DIRECTION_SLOP_DP *
+                        playerView.resources.displayMetrics.density
+                    if (max(abs(seekDeltaPx), abs(swipeDeltaPx)) < slop) return true
+                    val width = playerView.width
+                    val height = playerView.height
+                    if (width <= 0 || height <= 0) {
+                        // 尚未布局：没有可用的换算基准，本轮作废
+                        gestureMode = Gesture.IGNORED
+                        return true
+                    }
                     if (playerView.isControllerFullyVisible) {
                         playerView.hideController()
                     }
-                    gestureMode = if (abs(e2.x - start.x) > abs(e2.y - start.y)) {
+                    gestureMode = if (abs(seekDeltaPx) > abs(swipeDeltaPx)) {
                         seekStartPosition = ctrl.currentPosition
                         seekTargetPosition = seekStartPosition
                         Gesture.SEEK
-                    } else if (start.x < playerView.width / 2f) {
+                    } else if (downX < width / 2f) {
                         brightnessStart = currentBrightness()
                         Gesture.BRIGHTNESS
                     } else {
@@ -851,10 +937,12 @@ class GestureController(
                             gestureMode = Gesture.IGNORED
                             return true
                         }
-                        // 每像素对应的毫秒：让整屏滑动约等于 1.2 倍时长
-                        val msPerPx = max(300f, duration / playerView.width * 1.2f)
-                        val target = (seekStartPosition + (e2.x - start.x) * msPerPx)
-                            .toLong().coerceIn(0L, duration)
+                        val target = seekTargetMs(
+                            startMs = seekStartPosition,
+                            deltaPx = seekDeltaPx,
+                            durationMs = duration,
+                            widthPx = playerView.width,
+                        )
                         seekTargetPosition = target
                         val deltaSec = (target - seekStartPosition) / 1000
                         val actionRes = if (deltaSec >= 0) R.string.gesture_seek_forward_action
@@ -870,8 +958,10 @@ class GestureController(
                         )
                     }
                     Gesture.BRIGHTNESS -> {
-                        val delta = (start.y - e2.y) / playerView.height.coerceAtLeast(1)
-                        applyBrightness(brightnessStart + delta, persist = false)
+                        applyBrightness(
+                            brightnessTarget(brightnessStart, swipeDeltaPx, playerView.height),
+                            persist = false,
+                        )
                         showGestureOverlay(
                             activity.getString(
                                 R.string.gesture_brightness, (currentBrightness() * 100).toInt()
@@ -881,12 +971,18 @@ class GestureController(
                     Gesture.VOLUME -> {
                         val maxVolume =
                             audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
-                        val delta =
-                            ((start.y - e2.y) / playerView.height.coerceAtLeast(1) * maxVolume).toInt()
-                        val target = (volumeStart + delta).coerceIn(0, maxVolume)
+                        val target = volumeTarget(
+                            start = volumeStart,
+                            deltaPx = swipeDeltaPx,
+                            heightPx = playerView.height,
+                            maxVolume = maxVolume,
+                        )
                         audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, target, 0)
-                        val pct = if (maxVolume > 0) target * 100 / maxVolume else 0
-                        showGestureOverlay(activity.getString(R.string.gesture_volume, pct))
+                        showGestureOverlay(
+                            activity.getString(
+                                R.string.gesture_volume, volumePercent(target, maxVolume)
+                            )
+                        )
                     }
                     Gesture.NONE, Gesture.IGNORED -> Unit
                 }
@@ -897,11 +993,30 @@ class GestureController(
         playerView.setOnTouchListener { _, event ->
             detector.onTouchEvent(event)
 
-            // 抬手 / 取消时结束手势（seek 与亮度持久化在此提交）
-            if (event.actionMasked == MotionEvent.ACTION_UP
-                || event.actionMasked == MotionEvent.ACTION_CANCEL
-            ) {
-                endGesture()
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    activePointerId = event.getPointerId(0)
+                    downX = event.x
+                    seekDeltaPx = 0f
+                    swipeDeltaPx = 0f
+                    gestureMode = Gesture.NONE
+                }
+                MotionEvent.ACTION_POINTER_DOWN -> {
+                    // 第二根手指落下：指间距无法与单指位移区分，本轮作废，
+                    // 否则亮度/音量会跟着指间距跳变
+                    gestureMode = Gesture.IGNORED
+                }
+                MotionEvent.ACTION_POINTER_UP -> {
+                    val lifted = event.getPointerId(event.actionIndex)
+                    if (lifted == activePointerId) {
+                        // 跟踪的那根抬起，手势到此为止（seek 与亮度持久化在此提交）
+                        endGesture()
+                    } else {
+                        // 抬起的是别的手指：剩下的不是被跟踪的指针，本轮作废
+                        gestureMode = Gesture.IGNORED
+                    }
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> endGesture()
             }
             true
         }
@@ -929,6 +1044,9 @@ class GestureController(
             Gesture.NONE, Gesture.VOLUME, Gesture.IGNORED -> Unit
         }
         gestureMode = Gesture.NONE
+        activePointerId = MotionEvent.INVALID_POINTER_ID
+        seekDeltaPx = 0f
+        swipeDeltaPx = 0f
     }
 
     private fun currentBrightness(): Float {
@@ -942,7 +1060,7 @@ class GestureController(
 
     private fun applyBrightness(value: Float, persist: Boolean) {
         val lp = activity.window.attributes
-        lp.screenBrightness = value.coerceIn(0.02f, 1f)
+        lp.screenBrightness = value.coerceIn(MIN_SCREEN_BRIGHTNESS, 1f)
         activity.window.attributes = lp
         if (persist) brightnessPrefs.edit {
             putFloat(KEY_BRIGHTNESS, lp.screenBrightness)
@@ -991,9 +1109,12 @@ class MediaListAdapter(
         get() = diffJob?.isActive == true
 
     fun submitList(list: List<MediaItemData>) {
+        // 必须先取消在途差分再比较：items 只在本轮差分应用时才更新，若先比较，
+        // 「提交 L2 尚未应用 → 又提交 L1」会因为 items 仍等于 L1 而提前返回，
+        // 让 L2 的差分晚一步把列表覆盖成过期内容。
+        diffJob?.cancel()
         if (items == list) return
         val oldItems = ArrayList(items)
-        diffJob?.cancel()
         diffJob = diffScope.launch {
             val myJob = coroutineContext[Job]
             val diff = DiffUtil.calculateDiff(object : DiffUtil.Callback() {
@@ -1019,11 +1140,7 @@ class MediaListAdapter(
         }
     }
 
-    private fun indexOfUri(uri: String?): Int {
-        if (uri == null) return -1
-        val key = normalizeUri(uri)
-        return items.indexOfFirst { normalizeUri(it.uri) == key }
-    }
+    private fun indexOfUri(uri: String?): Int = indexOfMediaUri(items, uri)
 
     /** 单条更新；false 表示需整表提交。 */
     fun updateItem(item: MediaItemData): Boolean {
@@ -1048,8 +1165,10 @@ class MediaListAdapter(
         for (index in affected) notifyItemChanged(index)
     }
 
-    fun refreshProgress(index: Int) {
-        if (index in items.indices) notifyItemChanged(index, progressPayload)
+    /** 按 uri 刷新单条进度：调用方手里是队列下标，位置口径未必与列表一致。 */
+    fun refreshProgress(uri: String?) {
+        val index = indexOfUri(uri)
+        if (index >= 0) notifyItemChanged(index, progressPayload)
     }
 
     fun refreshAllProgress() {

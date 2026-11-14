@@ -182,6 +182,15 @@ class ProgressDecisionTest {
     }
 
     @Test
+    fun `long media finishes inside the tail window`() {
+        // 时长足够长时，决定边界的是 5 秒尾巴而不是 10%
+        val duration = 10 * PROGRESS_FINISH_TAIL_MS
+
+        assertFalse(isProgressFinished(duration - PROGRESS_FINISH_TAIL_MS - 1, duration))
+        assertTrue(isProgressFinished(duration - PROGRESS_FINISH_TAIL_MS, duration))
+    }
+
+    @Test
     fun `resumable position ignores missing zero and finished entries`() {
         assertEquals(60_000L, resumablePositionMs(60_000, duration))
         assertNull(resumablePositionMs(null, duration))
@@ -1153,12 +1162,22 @@ class ScanReconcileTest {
 
     @Test
     fun `short clips are not imported`() {
-        val scanned = listOf(item("content://video/short", "提示音.mp4", 4_999))
+        val scanned = listOf(item("content://video/short", "提示音.mp4", MIN_SCAN_DURATION_MS - 1))
 
         val result = reconcilePlaylist(emptyList(), scanned, null, emptySet())
 
         assertEquals(0, result.addedCount)
         assertTrue(result.playlist.isEmpty())
+    }
+
+    @Test
+    fun `clip exactly at the minimum duration is imported`() {
+        val scanned = listOf(item("content://video/exact", "刚好.mp4", MIN_SCAN_DURATION_MS))
+
+        val result = reconcilePlaylist(emptyList(), scanned, null, emptySet())
+
+        assertEquals(1, result.addedCount)
+        assertEquals(1, result.playlist.size)
     }
 
     @Test
@@ -1209,16 +1228,16 @@ class ScanReconcileTest {
     }
 
     @Test
-    fun `existing metadata is refreshed without reporting a reorder`() {
+    fun `existing metadata is refreshed without adding or removing items`() {
         val current = listOf(item("content://video/1", "旧名.mp4", 10_000, "剧A"))
         val scanned = listOf(item("content://video/1", "新名.mp4", 20_000, "剧A"))
 
         val result = reconcilePlaylist(current, scanned, null, emptySet())
 
-        assertEquals("新名.mp4", result.playlist.single().name)
+        assertEquals(listOf("新名.mp4"), result.playlist.map { it.name })
         assertEquals(20_000L, result.playlist.single().duration)
-        assertFalse(result.orderChanged)
         assertEquals(0, result.addedCount)
+        assertEquals(0, result.removedCount)
     }
 
     @Test
@@ -1235,7 +1254,6 @@ class ScanReconcileTest {
         val result = reconcilePlaylist(current, scanned, null, emptySet())
 
         assertEquals(listOf("A.mp4", "Z.mp4"), result.playlist.map { it.name })
-        assertTrue(result.orderChanged)
     }
 
     @Test
@@ -1258,7 +1276,7 @@ class PruneDecisionTest {
 
     private val videoPrefix = "content://media/external/video/media/"
     private val audioPrefix = "content://media/external/audio/media/"
-    private val graceMs = 24 * 60 * 60 * 1000L
+    private val graceMs = PlayerRepository.MISSING_DELETE_GRACE_MS
 
     @Test
     fun `confirmed deletion removes the item immediately`() {
@@ -1464,7 +1482,7 @@ class ProgressCacheTest {
     @Test
     fun `failed persist keeps pending changes for the retry ticker`() {
         val progress = newCache()
-        progress.markPersisted(progress.snapshot(), emptySet())
+        progress.markPersisted(progress.snapshot(), emptyMap())
         progress.cache("u", 20_000, 60_000)
 
         progress.markFailed()
@@ -1506,7 +1524,7 @@ class ProgressCacheTest {
     @Test
     fun `writes skip positions already persisted`() {
         val progress = newCache()
-        progress.markPersisted(progress.snapshot(), emptySet())
+        progress.markPersisted(progress.snapshot(), emptyMap())
 
         assertTrue(progress.writes().isEmpty())
 
@@ -1525,19 +1543,35 @@ class ProgressCacheTest {
     }
 
     @Test
+    fun `removal re-created during in flight write survives the callback`() {
+        val progress = newCache()
+        progress.clear("u")
+        // 提交这一版删除（快照带着它的版本号）
+        val submitted = progress.pendingRemovals()
+
+        // 提交之后同一个 uri 又被清了一次（例如用户再次显式回到开头）
+        progress.clear("u")
+        progress.markPersisted(progress.snapshot(), submitted)
+
+        // 旧回调只能清掉它提交时那一版，不能吃掉新的这笔删除，
+        // 否则磁盘上仍留着进度、重启后复活
+        assertEquals(setOf("u"), progress.pendingRemovals().keys)
+    }
+
+    @Test
     fun `failed persist keeps removals for a retry`() {
         val progress = newCache()
         progress.clear("u")
 
         progress.markFailed()
 
-        assertEquals(setOf("u"), progress.pendingRemovals())
+        assertEquals(setOf("u"), progress.pendingRemovals().keys)
     }
 
     @Test
     fun `drop removes cached value and snapshot entry`() {
         val progress = newCache()
-        progress.markPersisted(progress.snapshot(), emptySet())
+        progress.markPersisted(progress.snapshot(), emptyMap())
         progress.drop(listOf("u"), currentUri = null)
 
         progress.cache("u", 20_000, 60_000)
@@ -1560,7 +1594,7 @@ class ProgressCacheTest {
         val snapshot = progress.snapshot()
 
         progress.drop(listOf("u"), currentUri = null)
-        progress.markPersisted(snapshot, emptySet())
+        progress.markPersisted(snapshot, emptyMap())
         progress.cache("u", 10_000, 60_000)
 
         assertEquals(mapOf("u" to 10_000L), progress.writes())
@@ -1572,7 +1606,7 @@ class ProgressCacheTest {
         val snapshot = progress.snapshot()
 
         progress.clear("u")
-        progress.markPersisted(snapshot, emptySet())
+        progress.markPersisted(snapshot, emptyMap())
         progress.cache("u", 10_000, 60_000)
 
         assertEquals(mapOf("u" to 10_000L), progress.writes())
@@ -1581,7 +1615,7 @@ class ProgressCacheTest {
     @Test
     fun `clearAll removes every cached state`() {
         val progress = newCache()
-        progress.markPersisted(progress.snapshot(), emptySet())
+        progress.markPersisted(progress.snapshot(), emptyMap())
         progress.clearAll()
 
         assertTrue(progress.writes().isEmpty())
@@ -1823,5 +1857,237 @@ class QueueDiffTest {
             listOf(snap("a"), snap("a")),
             currentUri = "a",
         )
+    }
+}
+
+/** 「提示关闭回调只结算产生它的那一笔删除」的回归测试。 */
+class PendingDeletionCommitTest {
+
+    private fun pending(uri: String, index: Int) = PendingDeletion(item(uri), index)
+
+    @Test
+    fun `dismiss callback of the previous deletion cannot settle the new one`() {
+        val first = pending("a", 0)
+        val second = pending("b", 1)
+
+        // 连删两条：上一条提示的关闭回调晚到，此时待提交项已经是新的那一笔
+        assertFalse(shouldCommitPendingDeletion(current = second, dismissed = first))
+        // 新一笔自己的回调仍然有效
+        assertTrue(shouldCommitPendingDeletion(current = second, dismissed = second))
+    }
+
+    @Test
+    fun `dismiss callback settles the deletion it was created for`() {
+        val only = pending("a", 0)
+
+        assertTrue(shouldCommitPendingDeletion(current = only, dismissed = only))
+    }
+
+    @Test
+    fun `undo clears the pending deletion so a late dismiss is a no-op`() {
+        val pending = pending("a", 0)
+
+        // 撤销把待提交项置空后，提示收起时的回调不应再清理进度
+        assertFalse(shouldCommitPendingDeletion(current = null, dismissed = pending))
+    }
+}
+
+/** 「整份列表都无法播放」判定与出错跳项的回归测试。 */
+class ErrorSkipPlanTest {
+
+    @Test
+    fun `list is exhausted only after every item has been attempted`() {
+        assertFalse(isPlaylistExhausted(itemCount = 5, attemptedCount = 3, attempts = 3))
+        assertFalse(isPlaylistExhausted(itemCount = 5, attemptedCount = 4, attempts = 4))
+        assertTrue(isPlaylistExhausted(itemCount = 5, attemptedCount = 5, attempts = 5))
+    }
+
+    @Test
+    fun `attempt bound converges when no uri can be collected`() {
+        // uri 为 null 时集合不增长，靠尝试次数收敛，避免无限跳项
+        assertFalse(isPlaylistExhausted(itemCount = 3, attemptedCount = 0, attempts = 2))
+        assertTrue(isPlaylistExhausted(itemCount = 3, attemptedCount = 0, attempts = 3))
+    }
+
+    @Test
+    fun `empty queue is never exhausted`() {
+        assertFalse(isPlaylistExhausted(itemCount = 0, attemptedCount = 0, attempts = 0))
+    }
+
+    @Test
+    fun `skip follows the queue forward while items remain`() {
+        assertEquals(
+            4,
+            planErrorSkip(
+                exhausted = false,
+                hasNext = true,
+                nextIndex = 4,
+                repeatOne = false,
+                untriedIndex = 0,
+            ),
+        )
+    }
+
+    @Test
+    fun `skip wraps to the first untried item at the end of the queue`() {
+        // 从列表中间开始播、后面全失败时回到前面没试过的条目继续：
+        // 否则「整份列表都无法播放」永远不成立，阻断弹窗不会出现
+        assertEquals(
+            0,
+            planErrorSkip(
+                exhausted = false,
+                hasNext = false,
+                nextIndex = -1,
+                repeatOne = false,
+                untriedIndex = 0,
+            ),
+        )
+    }
+
+    @Test
+    fun `repeat one never wraps to another item`() {
+        assertEquals(
+            -1,
+            planErrorSkip(
+                exhausted = false,
+                hasNext = false,
+                nextIndex = -1,
+                repeatOne = true,
+                untriedIndex = 0,
+            ),
+        )
+    }
+
+    @Test
+    fun `exhausted list stops skipping`() {
+        assertEquals(
+            -1,
+            planErrorSkip(
+                exhausted = true,
+                hasNext = true,
+                nextIndex = 4,
+                repeatOne = false,
+                untriedIndex = 0,
+            ),
+        )
+    }
+
+    @Test
+    fun `first untried index skips attempted items`() {
+        assertEquals(0, firstUntriedIndex(listOf("a", "b"), emptySet()))
+        assertEquals(1, firstUntriedIndex(listOf("a", "b"), setOf("a")))
+        assertEquals(1, firstUntriedIndex(listOf("a", "b", "c"), setOf("a", "c")))
+        assertEquals(-1, firstUntriedIndex(listOf("a", "b"), setOf("a", "b")))
+        assertEquals(-1, firstUntriedIndex(emptyList(), emptySet()))
+    }
+
+    @Test
+    fun `item without uri still counts as untried`() {
+        // 拿不到 uri 的条目仍需尝试，否则永远无法计入失败覆盖
+        assertEquals(1, firstUntriedIndex(listOf("a", null), setOf("a")))
+    }
+}
+
+/** 列表时长索引 / 查询的回归测试。 */
+class PlaylistDurationIndexTest {
+
+    @Test
+    fun `index keeps only positive durations`() {
+        val index = playlistDurationIndex(
+            listOf(
+                item("content://video/1", "第1集.mp4", 60_000),
+                item("content://video/2", "第2集.mp4", 0),
+            )
+        )
+
+        assertEquals(60_000L, playlistDurationFor(index, "content://video/1"))
+        assertEquals(0L, playlistDurationFor(index, "content://video/2"))
+        assertEquals(0L, playlistDurationFor(index, "content://video/3"))
+        assertEquals(0L, playlistDurationFor(index, null))
+    }
+
+    @Test
+    fun `lookup normalizes query and trailing slash like the rest of the app`() {
+        val index = playlistDurationIndex(listOf(item("content://video/1", "第1集.mp4", 60_000)))
+
+        // 播放器给出的 uri 可能带查询参数 / 尾斜杠，查询口径必须与去重、扫描匹配一致
+        assertEquals(60_000L, playlistDurationFor(index, "content://video/1?foo=1"))
+        assertEquals(60_000L, playlistDurationFor(index, "content://video/1/"))
+    }
+
+    @Test
+    fun `duplicate keys keep the first positive duration`() {
+        val index = playlistDurationIndex(
+            listOf(
+                item("content://video/1", "a.mp4", 60_000),
+                item("content://video/1?x=1", "b.mp4", 90_000),
+            )
+        )
+
+        assertEquals(60_000L, playlistDurationFor(index, "content://video/1"))
+    }
+}
+
+/** 手势换算的回归测试：多指/指针切换之所以会跳变，根因就在这几处换算上。 */
+class GestureMathTest {
+
+    @Test
+    fun `seek maps a full width swipe to a bit more than the duration`() {
+        val duration = 1_000_000L
+        val width = 1_000
+
+        assertEquals(1_200f, seekMsPerPx(duration, width), 0.001f)
+        // 整屏滑动约等于 1.2 倍时长，超出部分被夹回总时长
+        assertEquals(duration, seekTargetMs(0L, width.toFloat(), duration, width))
+    }
+
+    @Test
+    fun `seek has a floor so short media is not over sensitive`() {
+        // 时长很短时 duration/width 很小，需要下限兜底
+        assertEquals(300f, seekMsPerPx(10_000L, 1_000), 0.001f)
+    }
+
+    @Test
+    fun `seek target stays inside the media range`() {
+        val duration = 60_000L
+
+        assertEquals(0L, seekTargetMs(1_000L, -10_000f, duration, 1_000))
+        assertEquals(duration, seekTargetMs(duration - 1_000L, 10_000f, duration, 1_000))
+    }
+
+    @Test
+    fun `seek tolerates an unmeasured view width`() {
+        // 宽度为 0 时不能除零、也不能把 NaN/无穷传下去
+        val target = seekTargetMs(5_000L, 100f, 60_000L, 0)
+
+        assertTrue(target in 0L..60_000L)
+    }
+
+    @Test
+    fun `a full height drag covers the whole range`() {
+        assertEquals(1f, brightnessTarget(0.5f, 500f, 1_000), 0.0001f)
+        assertEquals(100, volumeTarget(50, 500f, 1_000, 100))
+    }
+
+    @Test
+    fun `vertical targets are clamped to their range`() {
+        assertEquals(MIN_SCREEN_BRIGHTNESS, brightnessTarget(0.5f, -10_000f, 1_000), 0.0001f)
+        assertEquals(1f, brightnessTarget(0.5f, 10_000f, 1_000), 0.0001f)
+        assertEquals(0, volumeTarget(50, -10_000f, 1_000, 100))
+        assertEquals(100, volumeTarget(50, 10_000f, 1_000, 100))
+    }
+
+    @Test
+    fun `volume survives a device without audio output`() {
+        assertEquals(0, volumeTarget(3, 100f, 1_000, 0))
+        assertEquals(0, volumePercent(3, 0))
+        assertEquals(50, volumePercent(50, 100))
+    }
+
+    @Test
+    fun `upward drag increases brightness and volume`() {
+        // 上为正：向上滑应该变亮、变响（与原来的 start.y - e2.y 同号）
+        assertTrue(brightnessTarget(0.4f, 200f, 1_000) > 0.4f)
+        assertTrue(volumeTarget(40, 200f, 1_000, 100) > 40)
     }
 }

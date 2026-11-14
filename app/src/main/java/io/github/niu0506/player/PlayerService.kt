@@ -20,7 +20,10 @@ import androidx.media3.session.MediaSessionService
 import com.google.common.util.concurrent.Futures
 import com.google.common.util.concurrent.ListenableFuture
 import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 
 internal val MediaItem?.uriString: String?
     get() = this?.localConfiguration?.uri?.toString()
@@ -36,7 +39,15 @@ class PlayerService : MediaSessionService() {
 
     private var destroyed = false
 
-    private var consecutiveErrorCount = 0
+    /** 本轮失败 run 中已经试过并失败的条目 uri；成功播放或被显式重置时清空。 */
+    private val attemptedUris = mutableSetOf<String>()
+
+    /** 本轮失败 run 的尝试次数，作为 uri 缺失时无法靠集合收敛的兜底。 */
+    private var errorRunAttempts = 0
+
+    /** 列表时长索引缓存：源列表实例被仓库替换时才重建。 */
+    private var durationIndexSource: List<MediaItemData>? = null
+    private var durationIndex: Map<String, Long> = emptyMap()
 
     private val progress = ProgressCache()
 
@@ -62,7 +73,7 @@ class PlayerService : MediaSessionService() {
                 // 暂停立即落盘，ticker 不再续排
                 persistProgress()
             } else {
-                consecutiveErrorCount = 0
+                clearErrorRun()
                 scheduleProgressTicker()
             }
         }
@@ -119,30 +130,70 @@ class PlayerService : MediaSessionService() {
                 PlayerRepository.recordMissing(errorUri)
             }
 
-            consecutiveErrorCount++
-            // 错误次数达到队列长度，视为整份列表都失败
-            val exhausted = player.mediaItemCount in 1..consecutiveErrorCount
-            val hasNext = !exhausted && player.hasNextMediaItem()
+            // 按「本轮已经试过哪些条目」判定整份列表失败：从列表中间开始播时，
+            // 连续错误次数永远达不到队列长度，那个口径会漏掉大多数场景。
+            errorUri?.let(attemptedUris::add)
+            errorRunAttempts++
+            val itemUris = playerItemUris(player)
+            val exhausted = isPlaylistExhausted(
+                itemCount = player.mediaItemCount,
+                // 只统计仍在当前队列里的条目，避免队列变短时把旧 uri 算进覆盖
+                attemptedCount = itemUris.count { it != null && it in attemptedUris },
+                attempts = errorRunAttempts,
+            )
+            val nextIndex = planErrorSkip(
+                exhausted = exhausted,
+                hasNext = player.hasNextMediaItem(),
+                nextIndex = player.nextMediaItemIndex,
+                repeatOne = player.repeatMode == Player.REPEAT_MODE_ONE,
+                untriedIndex = firstUntriedIndex(itemUris, attemptedUris),
+            )
+            val hasNext = nextIndex >= 0
 
             if (hasNext) {
-                player.seekToNextMediaItem()
+                // 位置交给默认续播策略（C.TIME_UNSET），与 seekToNextMediaItem 一致
+                player.seekTo(nextIndex, C.TIME_UNSET)
                 player.prepare()
                 player.play()
             } else {
                 player.pause()
             }
 
-            errorEventsInternal.tryEmit(
-                PlaybackErrorEvent(errorUri, exhausted, hasNext, error.errorCode)
-            )
+            val event = PlaybackErrorEvent(errorUri, exhausted, hasNext, error.errorCode)
+            PlaybackSession.onPlaybackError(event)
         }
     }
+
+    internal fun clearErrorRun() {
+        attemptedUris.clear()
+        errorRunAttempts = 0
+        // 已经能正常播放，之前记下的致命失败不必再补弹窗
+        PlaybackSession.consumeFatalFailure()
+    }
+
+    /** 供 [PlaybackSession] 使用：抑制当前项被 ticker 重新缓存。 */
+    internal fun dropProgressForSession(keys: Set<String>) {
+        progress.drop(keys, player?.currentMediaItem?.uriString)
+    }
+
+    /** 供 [PlaybackSession] 使用。 */
+    internal fun clearPendingDropsForSession() {
+        progress.clearAllPendingDrops()
+    }
+
+    /** 供 [PlaybackSession] 使用。 */
+    internal fun persistProgressNow() {
+        persistProgress()
+    }
+
+    private fun playerItemUris(player: Player): List<String?> =
+        (0 until player.mediaItemCount).map { player.getMediaItemAt(it).uriString }
 
     private var tickerScheduled = false
 
     private val progressTicker = Runnable {
         tickerScheduled = false
-        if (resetting) return@Runnable
+        if (PlaybackSession.isResetting) return@Runnable
         // 只要用户还想播、或还有没落盘的进度就继续轮询。缓冲、音频焦点暂失、小窗/息屏
         // 切换都会让 isPlaying 短暂为 false，用它当条件会让轮询就此停摆，后台播放的进度
         // 再也落不了盘；保留待落盘项也让暂停/播完后的失败写库能继续重试。
@@ -153,7 +204,7 @@ class PlayerService : MediaSessionService() {
     }
 
     private fun scheduleProgressTicker() {
-        if (destroyed || resetting || mediaSession == null) return
+        if (destroyed || PlaybackSession.isResetting || mediaSession == null) return
         if (tickerScheduled) return
         tickerScheduled = true
         mainHandler.postDelayed(progressTicker, PROGRESS_TICKER_INTERVAL_MS)
@@ -165,7 +216,7 @@ class PlayerService : MediaSessionService() {
         mainHandler.removeCallbacks(progressTicker)
     }
 
-    private fun clearProgressForReset() {
+    internal fun clearProgressForReset() {
         cancelProgressTicker()
         progress.clearAll()
         lastPlayedUri = null
@@ -174,7 +225,7 @@ class PlayerService : MediaSessionService() {
     @OptIn(UnstableApi::class)
     override fun onCreate() {
         super.onCreate()
-        instance = this
+        PlaybackSession.attach(this)
 
         val player = ExoPlayer.Builder(this)
             .setAudioAttributes(
@@ -276,13 +327,20 @@ class PlayerService : MediaSessionService() {
         return if (finished) playlistMs else playerDurationMs
     }
 
-    /** 列表（扫描）时长；没有记录时返回 0。 */
-    private fun playlistDurationMs(uri: String?): Long = uri
-        ?.let { key ->
-            PlayerRepository.getPlaylist().firstOrNull { it.uri.toString() == key }?.duration
+    /**
+     * 列表（扫描）时长；没有记录时返回 0。
+     *
+     * 仓库整表替换列表实例，用身份判断即可命中缓存，避免 ticker 每 5 秒在主线程全表扫描。
+     */
+    private fun playlistDurationMs(uri: String?): Long {
+        if (uri == null) return 0L
+        val items = PlayerRepository.getPlaylist()
+        if (durationIndexSource !== items) {
+            durationIndexSource = items
+            durationIndex = playlistDurationIndex(items)
         }
-        ?.takeIf { it > 0 }
-        ?: 0L
+        return playlistDurationFor(durationIndex, uri)
+    }
 
     private fun restoreResumePosition(mediaItem: MediaItem?, reason: Int) {
         val player = this.player ?: return
@@ -310,7 +368,7 @@ class PlayerService : MediaSessionService() {
 
     private fun persistProgress() {
         // 重置期间不写库
-        if (resetting) return
+        if (PlaybackSession.isResetting) return
         val player = this.player ?: return
         // URI 离开队列后解除抑制，避免集合无限增长
         if (progress.hasPendingDrops()) {
@@ -326,12 +384,12 @@ class PlayerService : MediaSessionService() {
         writeToDisk(writes, removals)
     }
 
-    private fun writeToDisk(writes: Map<String, Long>, removals: Set<String>) {
+    private fun writeToDisk(writes: Map<String, Long>, removals: Map<String, Long>) {
         val snapshot = progress.snapshot()
-        PlayerRepository.applyProgressUpdates(writes, removals) { persisted ->
+        PlayerRepository.applyProgressUpdates(writes, removals.keys) { persisted ->
             mainHandler.post {
                 // 重置已开始，不再更新
-                if (resetting) return@post
+                if (PlaybackSession.isResetting) return@post
                 if (persisted) {
                     progress.markPersisted(snapshot, removals)
                 } else {
@@ -356,7 +414,7 @@ class PlayerService : MediaSessionService() {
             release()
         }
         mediaSession = null
-        instance = null
+        PlaybackSession.detach(this)
 
         super.onDestroy()
     }
@@ -367,60 +425,122 @@ class PlayerService : MediaSessionService() {
         private const val PROGRESS_TICKER_INTERVAL_MS = 5000L
 
         private const val RESUME_START_TOLERANCE_MS = 1_000L
+    }
+}
 
-        @Volatile
-        private var instance: PlayerService? = null
+/** 一次播放失败的上报；[exhausted] 表示整份列表都已试过且都失败。 */
+internal data class PlaybackErrorEvent(
+    val uri: String?,
+    val exhausted: Boolean,
+    val hasNext: Boolean,
+    val errorCode: Int,
+)
 
-        /** 重置进行中：禁止进度写库。 */
-        @Volatile
-        private var resetting = false
+/**
+ * 进程内的播放会话：持有服务实例，并对外提供界面需要的命令与事件。
+ *
+ * 这些操作原先散落在 [PlayerService] 的 companion 上，谁都能直接摸到服务实例，
+ * 而「服务不在时会发生什么」没有任何地方交代。现在服务实例只由本对象持有，
+ * 每个命令的注释都写明服务缺席时的语义。
+ *
+ * 注意这条通道不是 `MediaController`/`MediaSession`：这些命令必须在控制器释放
+ * 之后（onStop / onPause）依然有效，所以要靠进程内的直接引用。
+ */
+internal object PlaybackSession {
 
-        data class PlaybackErrorEvent(
-            val uri: String?,
-            val exhausted: Boolean,
-            val hasNext: Boolean,
-            val errorCode: Int,
-        )
+    /** 服务实例；onCreate 时注册、onDestroy 时注销。 */
+    @Volatile
+    private var service: PlayerService? = null
 
-        private val errorEventsInternal = MutableSharedFlow<PlaybackErrorEvent>(
-            extraBufferCapacity = 16
-        )
-        val errorEvents: SharedFlow<PlaybackErrorEvent> = errorEventsInternal
+    /** 重置进行中：服务侧禁止写进度。 */
+    @Volatile
+    var isResetting = false
+        private set
 
-        fun resetErrorCount() {
-            instance?.consecutiveErrorCount = 0
-        }
+    private val errorEventsInternal = MutableSharedFlow<PlaybackErrorEvent>(
+        extraBufferCapacity = 16
+    )
 
-        fun dropProgress(uris: Collection<String>) {
-            if (uris.isEmpty()) return
-            val keys = uris.toSet()
-            PlayerRepository.applyProgressUpdates(emptyMap(), keys)
-            val svc = instance ?: return
-            // 只有当前项会被 ticker 重新缓存
-            val currentUri = svc.player?.currentMediaItem?.uriString
-            // 当前项进入 pendingDrops，离开队列后才允许重新缓存
-            svc.progress.drop(keys, currentUri)
-        }
+    /** 播放错误事件；界面不可见时会丢弃，致命失败另见 [fatalFailures]。 */
+    val errorEvents: SharedFlow<PlaybackErrorEvent> = errorEventsInternal
 
-        fun dropProgress(uri: String) = dropProgress(listOf(uri))
+    /**
+     * 最近一次「整份列表都无法播放」的失败。
+     *
+     * [errorEvents] 没有重放能力，界面不可见时事件直接丢弃；后台播完失败是主场景，
+     * 因此把致命失败另存一份，界面进入 STARTED 后取到并消费。
+     */
+    private val fatalFailureState = MutableStateFlow<PlaybackErrorEvent?>(null)
+    val fatalFailures: StateFlow<PlaybackErrorEvent?> = fatalFailureState.asStateFlow()
 
-        fun clearAllPendingDrops() {
-            instance?.progress?.clearAllPendingDrops()
-        }
+    // ---- 服务生命周期 ----
 
-        fun flushCurrentPosition() {
-            instance?.persistProgress()
-        }
+    fun attach(target: PlayerService) {
+        service = target
+    }
 
-        fun beginReset() {
-            resetting = true
-            instance?.clearProgressForReset()
-        }
+    fun detach(target: PlayerService) {
+        // 只在仍是自己时注销，避免旧的 onDestroy 把新实例清掉
+        if (service === target) service = null
+    }
 
-        fun endReset() {
-            instance?.clearProgressForReset()
-            resetting = false
-        }
+    // ---- 服务侧上报 ----
+
+    fun onPlaybackError(event: PlaybackErrorEvent) {
+        // 记下致命失败：界面不可见时 errorEvents 会丢，回到前台要能补上弹窗
+        if (event.exhausted) fatalFailureState.value = event
+        errorEventsInternal.tryEmit(event)
+    }
+
+    /** 消费掉致命失败，避免回到前台反复弹窗。 */
+    fun consumeFatalFailure() {
+        fatalFailureState.value = null
+    }
+
+    // ---- 界面侧命令 ----
+
+    /**
+     * 删除若干条目的播放进度。
+     *
+     * 写库不依赖服务实例（服务不在也要真的把进度删掉）；只有「抑制当前项被 ticker
+     * 重新缓存」这一步需要服务在场 —— 服务不在就没有队列，也就没有立即回写的风险。
+     */
+    fun dropProgress(uris: Collection<String>) {
+        if (uris.isEmpty()) return
+        val keys = uris.toSet()
+        PlayerRepository.applyProgressUpdates(emptyMap(), keys)
+        service?.dropProgressForSession(keys)
+    }
+
+    fun dropProgress(uri: String) = dropProgress(listOf(uri))
+
+    /** 释放所有「不得重新缓存」的抑制；服务不在时无事可做。 */
+    fun clearAllPendingDrops() {
+        service?.clearPendingDropsForSession()
+    }
+
+    /** 立刻把当前播放位置落盘；服务不在时无事可做。 */
+    fun flushCurrentPosition() {
+        service?.persistProgressNow()
+    }
+
+    /** 重新开始统计播放错误。 */
+    fun resetErrorCount() {
+        service?.clearErrorRun()
+        // 服务实例尚未建立时上面那行不会执行，这里补一次
+        consumeFatalFailure()
+    }
+
+    /** 进入重置：禁止服务侧写进度。 */
+    fun beginReset() {
+        isResetting = true
+        service?.clearProgressForReset()
+    }
+
+    /** 退出重置：无论成功与否都要恢复落盘。 */
+    fun endReset() {
+        service?.clearProgressForReset()
+        isResetting = false
     }
 }
 
@@ -429,7 +549,15 @@ internal class ProgressCache {
 
     private val cached = mutableMapOf<String, Long>()
 
-    private val removals = mutableSetOf<String>()
+    /**
+     * uri → 删除操作的版本号。
+     *
+     * 版本用来区分「某次提交时的那一笔删除」与提交之后重新产生的同名删除：落盘回调只能
+     * 清掉前者，否则新产生的那笔删除会被吃掉，磁盘上留着进度、重启后复活。
+     */
+    private val removalVersions = mutableMapOf<String, Long>()
+
+    private var removalSeq = 0L
 
     /** 已删除但仍在队列中的 uri，不得重新缓存。 */
     private val pendingDrops = mutableSetOf<String>()
@@ -460,7 +588,7 @@ internal class ProgressCache {
         cached.remove(uri)
         // 先从快照移除，避免落盘回调把进度复活
         lastPersisted = lastPersisted - uri
-        removals.add(uri)
+        removalVersions[uri] = ++removalSeq
     }
 
     fun drop(uris: Collection<String>, currentUri: String?) {
@@ -478,17 +606,21 @@ internal class ProgressCache {
     fun hasPendingDrops(): Boolean = pendingDrops.isNotEmpty()
 
     /** 是否还有未落盘的进度（待删除项或值有变化的写入）。 */
-    fun hasPendingChanges(): Boolean = removals.isNotEmpty() || writes().isNotEmpty()
+    fun hasPendingChanges(): Boolean = removalVersions.isNotEmpty() || writes().isNotEmpty()
 
-    fun pendingRemovals(): Set<String> = removals.toSet()
+    /** 待删除项及其版本；落盘时把版本一并带过去，回调才知道能清哪一版。 */
+    fun pendingRemovals(): Map<String, Long> = removalVersions.toMap()
 
     fun writes(): Map<String, Long> =
         cached.filter { (uri, position) -> lastPersisted[uri] != position }
 
     fun snapshot(): Map<String, Long> = cached.toMap()
 
-    fun markPersisted(snapshot: Map<String, Long>, writtenRemovals: Set<String>) {
-        removals.removeAll(writtenRemovals)
+    fun markPersisted(snapshot: Map<String, Long>, writtenRemovals: Map<String, Long>) {
+        // 只清掉「提交时就是这一版」的删除：期间的重新删除必须留着，见 removalVersions
+        for ((uri, version) in writtenRemovals) {
+            if (removalVersions[uri] == version) removalVersions.remove(uri)
+        }
         // 不借旧快照复活写入期间被 clear/drop 的 key。
         lastPersisted = snapshot.filterKeys { it in cached }
     }
@@ -504,7 +636,7 @@ internal class ProgressCache {
 
     fun clearAll() {
         cached.clear()
-        removals.clear()
+        removalVersions.clear()
         pendingDrops.clear()
         lastPersisted = emptyMap()
     }
@@ -531,6 +663,46 @@ internal fun isExplicitSeekToZero(
 internal fun shouldCacheOldItemOnDiscontinuity(reason: Int): Boolean =
     reason == Player.DISCONTINUITY_REASON_SEEK ||
         reason == Player.DISCONTINUITY_REASON_AUTO_TRANSITION
+
+/**
+ * 本轮失败 run 是否已经覆盖整个队列。
+ *
+ * 用「试过的条目数」而不是「连续错误次数」：从列表中间开始播时，错误次数永远达不到
+ * 队列长度。[attempts] 只在拿不到 uri、集合无法增长时负责收敛。
+ */
+internal fun isPlaylistExhausted(
+    itemCount: Int,
+    attemptedCount: Int,
+    attempts: Int,
+): Boolean = itemCount > 0 && (attemptedCount >= itemCount || attempts >= itemCount)
+
+/**
+ * 出错后下一个要尝试的条目下标；返回 -1 表示不再自动跳过。
+ *
+ * 顺着队列往前后若前面还有没试过的条目，就回到最前面那一条继续，这样「整份列表都
+ * 无法播放」才可能真正达成；单曲循环不做这个回绕，保持原有语义。
+ */
+internal fun planErrorSkip(
+    exhausted: Boolean,
+    hasNext: Boolean,
+    nextIndex: Int,
+    repeatOne: Boolean,
+    untriedIndex: Int,
+): Int = when {
+    exhausted -> -1
+    hasNext -> nextIndex
+    repeatOne -> -1
+    else -> untriedIndex
+}
+
+/** 队列中第一条本轮还没试过的条目下标；都试过则为 -1。 */
+internal fun firstUntriedIndex(itemUris: List<String?>, attempted: Set<String>): Int {
+    for (index in itemUris.indices) {
+        val uri = itemUris[index]
+        if (uri == null || uri !in attempted) return index
+    }
+    return -1
+}
 
 internal fun shouldRestoreResume(
     reason: Int,
